@@ -8,6 +8,7 @@ import {
   can,
   requirePermission,
   requireBusinesses,
+  requireAnyBusiness,
 } from "../authorization.js";
 import { assert } from "../errors.js";
 import { objectId } from "../services/filters.js";
@@ -60,9 +61,7 @@ r.get(
   async (req, res) => {
     const f = {};
     if (req.user.role !== "SUPER_ADMIN")
-      f.businesses = {
-        $not: { $elemMatch: { $nin: req.user.businessAccess } },
-      };
+      f.businesses = { $in: req.user.businessAccess };
     if (req.query.business) {
       const businesses =
         req.query.business === "PARTNERSHIP"
@@ -78,7 +77,7 @@ r.get(
 r.param("id", async (req, _res, next, id) => {
   req.agency = await DeliveryAgency.findById(objectId(id));
   assert(req.agency, "Agency not found", 404);
-  requireBusinesses(req.user, req.agency.businesses);
+  requireAnyBusiness(req.user, req.agency.businesses);
   next();
 });
 r.get("/:id", requirePermission(P.deliveryAgencies.view), (req, res) =>
@@ -86,16 +85,23 @@ r.get("/:id", requirePermission(P.deliveryAgencies.view), (req, res) =>
 );
 async function save(req, existing) {
   const data = schema.parse({ ...existing?.toObject(), ...req.body });
-  requireBusinesses(req.user, data.businesses);
-  if (
+  const businessesChanged =
     !existing ||
-    JSON.stringify(data.businesses) !== JSON.stringify(existing.businesses)
-  )
+    data.businesses.length !== existing.businesses.length ||
+    data.businesses.some((business) => !existing.businesses.includes(business));
+  if (businessesChanged) {
+    requireBusinesses(
+      req.user,
+      existing
+        ? [...new Set([...existing.businesses, ...data.businesses])]
+        : data.businesses,
+    );
     assert(
       can(req.user, P.deliveryAgencies.assignBusinesses),
       "Business assignment permission required",
       403,
     );
+  }
   if (existing && data.active !== existing.active)
     assert(
       can(req.user, P.deliveryAgencies.disable),

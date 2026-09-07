@@ -981,6 +981,142 @@ test("migration creates one ABEX agency and per-Wilaya rates idempotently", asyn
   assert.ok(await AuditLog.exists({ action: "USER_CREATED" }));
 });
 
+test("delivery agency viewing uses any assigned business while assignments require all", async () => {
+  const agencies = {};
+  for (const [key, businesses] of [
+    ["logix", ["LOGIX"]],
+    ["tamqo", ["TAMQO"]],
+    ["shared", ["LOGIX", "TAMQO"]],
+  ]) {
+    agencies[key] = expectOk(
+      await apiAgent.post("/api/delivery-agencies").send({
+        name: `${key} access courier`,
+        code: `${key.toUpperCase()}_ACCESS_COURIER`,
+        businesses,
+        integrationType: "MANUAL",
+      }),
+    );
+    expectOk(
+      await apiAgent
+        .post(`/api/delivery-agencies/${agencies[key]._id}/rates`)
+        .send({
+          wilayaId: String(wilaya._id),
+          homePrice: 600,
+          deskPrice: 400,
+          active: true,
+        }),
+    );
+  }
+
+  async function employeeAgentFor(name, businessAccess, permissions) {
+    const email = `${name.toLowerCase()}-agency-access@example.com`;
+    const employee = expectOk(
+      await apiAgent.post("/api/users").send({
+        name: `${name} Agency Employee`,
+        email,
+        password: "employee-password",
+        businessAccess,
+        permissions,
+      }),
+    );
+    const agent = supertest.agent(app);
+    expectOk(
+      await agent.post("/api/auth/login").send({
+        email,
+        password: "employee-password",
+      }),
+    );
+    return { employee, agent };
+  }
+
+  const logix = await employeeAgentFor(
+    "Logix",
+    ["LOGIX"],
+    [P.deliveryAgencies.view],
+  );
+  const tamqo = await employeeAgentFor(
+    "Tamqo",
+    ["TAMQO"],
+    [P.deliveryAgencies.view],
+  );
+  const shared = await employeeAgentFor(
+    "Shared",
+    ["LOGIX", "TAMQO"],
+    [P.deliveryAgencies.view, P.deliveryAgencies.assignBusinesses],
+  );
+
+  const visibleCodes = async (agent) =>
+    expectOk(await agent.get("/api/delivery-agencies")).map(
+      (agency) => agency.code,
+    );
+  const logixCodes = await visibleCodes(logix.agent);
+  assert.ok(logixCodes.includes(agencies.logix.code));
+  assert.ok(logixCodes.includes(agencies.shared.code));
+  assert.equal(logixCodes.includes(agencies.tamqo.code), false);
+  const tamqoCodes = await visibleCodes(tamqo.agent);
+  assert.ok(tamqoCodes.includes(agencies.tamqo.code));
+  assert.ok(tamqoCodes.includes(agencies.shared.code));
+  assert.equal(tamqoCodes.includes(agencies.logix.code), false);
+  const sharedCodes = await visibleCodes(shared.agent);
+  assert.ok(
+    [agencies.logix.code, agencies.tamqo.code, agencies.shared.code].every(
+      (code) => sharedCodes.includes(code),
+    ),
+  );
+
+  for (const { agent, allowed, denied } of [
+    {
+      agent: logix.agent,
+      allowed: [agencies.logix, agencies.shared],
+      denied: agencies.tamqo,
+    },
+    {
+      agent: tamqo.agent,
+      allowed: [agencies.tamqo, agencies.shared],
+      denied: agencies.logix,
+    },
+  ]) {
+    for (const agency of allowed) {
+      expectOk(await agent.get(`/api/delivery-agencies/${agency._id}`));
+      const rates = expectOk(
+        await agent.get(`/api/delivery-agencies/${agency._id}/rates`),
+      );
+      assert.equal(rates.length, 1);
+    }
+    assert.equal(
+      (await agent.get(`/api/delivery-agencies/${denied._id}`)).status,
+      403,
+    );
+    assert.equal(
+      (await agent.get(`/api/delivery-agencies/${denied._id}/rates`)).status,
+      403,
+    );
+  }
+
+  await apiAgent.patch(`/api/users/${logix.employee._id}`).send({
+    permissions: [P.deliveryAgencies.view, P.deliveryAgencies.assignBusinesses],
+  });
+  const refreshedSession = expectOk(await logix.agent.get("/api/auth/session"));
+  assert.ok(
+    refreshedSession.user.permissions.includes(
+      P.deliveryAgencies.assignBusinesses,
+    ),
+  );
+  assert.equal(
+    (
+      await logix.agent
+        .patch(`/api/delivery-agencies/${agencies.shared._id}`)
+        .send({ businesses: ["LOGIX"] })
+    ).status,
+    403,
+  );
+  expectOk(
+    await shared.agent
+      .patch(`/api/delivery-agencies/${agencies.tamqo._id}`)
+      .send({ businesses: ["LOGIX", "TAMQO"] }),
+  );
+});
+
 test("agency assignment, rates, manual shipments, snapshots and credentials are safe", async () => {
   const manual = expectOk(
     await apiAgent.post("/api/delivery-agencies").send({

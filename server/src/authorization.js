@@ -26,6 +26,16 @@ export function requireBusinesses(user, businesses) {
     403,
   );
 }
+export function requireAnyBusiness(user, businesses) {
+  assert(
+    businesses.length > 0 &&
+      businesses.some(
+        (b) => BUSINESSES.includes(b) && hasBusinessAccess(user, b),
+      ),
+    "Business access denied",
+    403,
+  );
+}
 export const orderBusinesses = (order) => [
   ...new Set(order.items.map((i) => i.business)),
 ];

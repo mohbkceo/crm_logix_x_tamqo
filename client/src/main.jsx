@@ -615,7 +615,22 @@ class ErrorBoundary extends React.Component {
 }
 function App() {
   const session = useApi("/auth/session");
-  if (session.loading) return <Loading />;
+  const userId = session.data?.user?._id;
+  useEffect(() => {
+    if (!userId) return;
+    const refresh = () => {
+      if (!document.hidden) session.reload();
+    };
+    const interval = window.setInterval(refresh, 15000);
+    window.addEventListener("focus", refresh);
+    document.addEventListener("visibilitychange", refresh);
+    return () => {
+      window.clearInterval(interval);
+      window.removeEventListener("focus", refresh);
+      document.removeEventListener("visibilitychange", refresh);
+    };
+  }, [userId, session.reload]);
+  if (session.loading && !session.data) return <Loading />;
   if (session.error)
     return (
       <div className="fatal">
