@@ -30,7 +30,7 @@ export function ErrorBox({ error }) {
 export function Loading() {
   return (
     <div className="loading" role="status">
-      <LoaderCircle size={20} className="spin" />
+      <LoaderCircle size={16} className="spin" />
       Loading workspace data…
     </div>
   );
@@ -43,7 +43,7 @@ export function Empty({
   return (
     <div className="empty">
       <div className="empty-icon">
-        <Inbox size={25} />
+        <Inbox size={20} />
       </div>
       <h3>{title}</h3>
       <p>{text}</p>
@@ -190,12 +190,19 @@ export function DataTable({
       />
     );
   return (
-    <div className="table-wrap">
+    <div
+      className="table-wrap"
+      role="region"
+      aria-label="Scrollable records"
+      tabIndex={0}
+    >
       <table>
         <thead>
           <tr>
             {columns.map((c) => (
-              <th key={c.key}>{c.label}</th>
+              <th key={c.key} scope="col">
+                {c.label}
+              </th>
             ))}
           </tr>
         </thead>
@@ -246,6 +253,7 @@ export function Pagination({ page, limit, total, onChange }) {
 }
 export function Modal({ title, children, onClose, wide = false }) {
   const dialog = useRef();
+  const titleId = useId();
   useEffect(() => {
     dialog.current.showModal();
     return () => dialog.current?.close();
@@ -253,6 +261,7 @@ export function Modal({ title, children, onClose, wide = false }) {
   return (
     <dialog
       ref={dialog}
+      aria-labelledby={titleId}
       className={wide ? "wide" : ""}
       onCancel={(e) => {
         e.preventDefault();
@@ -260,7 +269,7 @@ export function Modal({ title, children, onClose, wide = false }) {
       }}
     >
       <header>
-        <h2>{title}</h2>
+        <h2 id={titleId}>{title}</h2>
         <button
           className="icon-button"
           aria-label="Close dialog"

@@ -89,35 +89,35 @@ function Trend({ rows }) {
       >
         <defs>
           <linearGradient id="sales-fill" x1="0" y1="0" x2="0" y2="1">
-            <stop offset="0%" stopColor="#267d60" stopOpacity={0.17} />
-            <stop offset="100%" stopColor="#267d60" stopOpacity={0} />
+            <stop offset="0%" stopColor="#27272a" stopOpacity={0.17} />
+            <stop offset="100%" stopColor="#27272a" stopOpacity={0} />
           </linearGradient>
         </defs>
         <CartesianGrid
           strokeDasharray="3 4"
           vertical={false}
-          stroke="#e9ede9"
+          stroke="#e4e4e7"
         />
         <XAxis
           dataKey="name"
           tickFormatter={(v) => v.slice(5)}
           axisLine={false}
           tickLine={false}
-          tick={{ fontSize: 11, fill: "#819087" }}
+          tick={{ fontSize: 11, fill: "#71717a" }}
         />
         <YAxis
           tickFormatter={(v) => (v >= 1000 ? `${v / 1000}k` : v)}
           width={45}
           axisLine={false}
           tickLine={false}
-          tick={{ fontSize: 11, fill: "#819087" }}
+          tick={{ fontSize: 11, fill: "#71717a" }}
         />
         <Tooltip formatter={(v) => money(v)} />
         <Area
           type="monotone"
           dataKey="grossSales"
           name="Gross sales"
-          stroke="#b4c8bb"
+          stroke="#a1a1aa"
           fill="none"
           strokeWidth={2}
           strokeDasharray="4 4"
@@ -126,7 +126,7 @@ function Trend({ rows }) {
           type="monotone"
           dataKey="netSales"
           name="Net sales"
-          stroke="#267d60"
+          stroke="#27272a"
           fill="url(#sales-fill)"
           strokeWidth={2.5}
         />
@@ -424,10 +424,10 @@ export function Reports({ scope }) {
                             <i
                               style={{
                                 background: [
-                                  "#d8b377",
-                                  "#7fa6a1",
-                                  "#8f9ebe",
-                                  "#d59b91",
+                                  "#a1a1aa",
+                                  "#71717a",
+                                  "#52525b",
+                                  "#b91c1c",
                                 ][i],
                               }}
                             />
@@ -848,13 +848,13 @@ export function Reports({ scope }) {
                         hours: m[k],
                       }))}
                     >
-                      <CartesianGrid vertical={false} stroke="#edf0ed" />
+                      <CartesianGrid vertical={false} stroke="#e4e4e7" />
                       <XAxis dataKey="name" tick={{ fontSize: 11 }} />
                       <YAxis />
                       <Tooltip />
                       <Bar
                         dataKey="hours"
-                        fill="#267d60"
+                        fill="#27272a"
                         radius={[4, 4, 0, 0]}
                       />
                     </BarChart>

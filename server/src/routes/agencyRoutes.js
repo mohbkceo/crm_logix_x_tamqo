@@ -289,14 +289,36 @@ r.post(
   "/:id/test",
   requirePermission(P.deliveryAgencies.testConnection),
   async (req, res) => {
+    // Manual agencies do not have an external API connection.
+    if (req.agency.integrationType === "MANUAL") {
+      return res.json({
+        success: true,
+        integrationType: "MANUAL",
+        message: "Manual agency requires no API connection.",
+      });
+    }
+
+    assert(
+      req.agency.apiProvider === "PROCOLIS",
+      "Unsupported API provider",
+      400,
+    );
+
+    assert(
+      req.agency.credentialsConfigured,
+      "API credentials are not configured",
+      400,
+    );
+
     const provider = await providerFor(req.agency._id);
+
     await provider.testCredentials();
+
     res.json({
       success: true,
-      message:
-        req.agency.integrationType === "MANUAL"
-          ? "Manual agency requires no API connection."
-          : "Endpoint responded; verify credential acceptance with the provider because its success format is undocumented.",
+      integrationType: "API",
+      provider: "PROCOLIS",
+      message: "Procolis API connection and credentials verified successfully.",
     });
   },
 );

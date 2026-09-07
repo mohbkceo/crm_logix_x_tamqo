@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { createRoot } from "react-dom/client";
 import {
   BrowserRouter,
@@ -24,6 +24,7 @@ import {
   Command,
   Radio,
   Handshake,
+  X,
 } from "lucide-react";
 import { api, useApi, ConfigContext } from "./api";
 import { ErrorBox, Loading, Field } from "./components";
@@ -73,13 +74,17 @@ function Login({ reload }) {
   }
   return (
     <div className="login">
-      <form className="panel" onSubmit={submit}>
+      <form className="panel" onSubmit={submit} aria-busy={busy}>
         <div className="brand-symbol">
           <Command />
         </div>
         <div className="eyebrow">TAMQO × LOGIX</div>
-        <h1>Welcome back.</h1>
-        <p>Sign in to your business workspace.</p>
+        <h1>{register ? "Join your workspace." : "Welcome back."}</h1>
+        <p>
+          {register
+            ? "Create your account with an authorized registration key."
+            : "Sign in to your business workspace."}
+        </p>
         <ErrorBox error={error} />
         {register && (
           <>
@@ -131,8 +136,49 @@ function Login({ reload }) {
 }
 function Workspace({ user, logout }) {
   const configuration = useApi("/config"),
-    [collapsed, setCollapsed] = useState(() => window.innerWidth < 760),
+    [collapsed, setCollapsed] = useState(() => window.innerWidth <= 760),
     location = useLocation();
+  const [mobile, setMobile] = useState(() => window.innerWidth <= 760);
+  const sidebarRef = useRef(null);
+  const toggleRef = useRef(null);
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 760px)");
+    const sync = () => {
+      setMobile(media.matches);
+      if (media.matches) setCollapsed(true);
+    };
+    media.addEventListener("change", sync);
+    return () => media.removeEventListener("change", sync);
+  }, []);
+  useEffect(() => {
+    if (!mobile || collapsed) return;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    const sidebar = sidebarRef.current;
+    sidebar.querySelector("button, a")?.focus();
+    const handleKey = (event) => {
+      if (event.key === "Escape") setCollapsed(true);
+      if (event.key !== "Tab") return;
+      const focusable = [
+        ...sidebar.querySelectorAll("a[href], button:not([disabled])"),
+      ];
+      const first = focusable[0],
+        last = focusable.at(-1);
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last?.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first?.focus();
+      }
+    };
+    document.addEventListener("keydown", handleKey);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", handleKey);
+      toggleRef.current?.focus();
+    };
+  }, [mobile, collapsed]);
   const section = location.pathname.split("/")[1] || "Overview";
   const links = [
     [
@@ -154,7 +200,36 @@ function Workspace({ user, logout }) {
     <UserContext.Provider value={user}>
       <ConfigContext.Provider value={configuration}>
         <div className={`app-shell ${collapsed ? "collapsed" : ""}`}>
-          <aside className="sidebar">
+          <a className="skip-link" href="#workspace-content">
+            Skip to content
+          </a>
+          {mobile && !collapsed && (
+            <button
+              className="nav-backdrop"
+              aria-label="Dismiss navigation"
+              tabIndex={-1}
+              onClick={() => setCollapsed(true)}
+            />
+          )}
+          <aside
+            className="sidebar"
+            id="workspace-navigation"
+            ref={sidebarRef}
+            aria-label="Workspace navigation"
+            role={mobile && !collapsed ? "dialog" : undefined}
+            aria-modal={mobile && !collapsed ? true : undefined}
+            inert={collapsed}
+            onClick={(event) => {
+              if (mobile && event.target.closest("a")) setCollapsed(true);
+            }}
+          >
+            <button
+              className="icon-button nav-close"
+              aria-label="Close navigation"
+              onClick={() => setCollapsed(true)}
+            >
+              <X size={18} />
+            </button>
             <Link to="/" className="brand">
               <div className="brand-symbol">
                 <Command size={22} />
@@ -163,7 +238,7 @@ function Workspace({ user, logout }) {
                 <strong>
                   tamqo<span> × </span>logix
                 </strong>
-                <small>BUSINESS WORKSPACE</small>
+                <small>Business workspace</small>
               </div>
             </Link>
             <div className="workspace-switch">
@@ -174,7 +249,7 @@ function Workspace({ user, logout }) {
               </div>
               <ChevronsUpDown size={14} />
             </div>
-            <div className="nav-label">WORKSPACE</div>
+            <div className="nav-label">Workspace</div>
             <nav>
               {links
                 .filter((l) => l[3].some((p) => can(user, p)))
@@ -192,7 +267,7 @@ function Workspace({ user, logout }) {
                   </NavLink>
                 ))}
             </nav>
-            <div className="nav-label">BUSINESSES</div>
+            <div className="nav-label">Businesses</div>
             <nav>
               {hasBusinessAccess(user, "TAMQO") && (
                 <>
@@ -203,7 +278,7 @@ function Workspace({ user, logout }) {
                       P.analytics.viewGlobal,
                     ]}
                   >
-                    <NavLink to="/tamqo">
+                    <NavLink to="/tamqo" end>
                       <span className="business-icon tamqo">t</span>
                       <span>Tamqo</span>
                       <span className="nav-note">AI</span>
@@ -226,7 +301,7 @@ function Workspace({ user, logout }) {
                       P.analytics.viewGlobal,
                     ]}
                   >
-                    <NavLink to="/logix">
+                    <NavLink to="/logix" end>
                       <span className="business-icon logix">l</span>
                       <span>Logix</span>
                       <span className="nav-note">NFC</span>
@@ -257,7 +332,7 @@ function Workspace({ user, logout }) {
               </div>
               <nav>
                 <Can permission={P.settings.view}>
-                  <NavLink to="/settings">
+                  <NavLink to="/settings" end>
                     <SettingsIcon size={18} />
                     <span>Settings</span>
                   </NavLink>
@@ -294,13 +369,16 @@ function Workspace({ user, logout }) {
               </div>
             </div>
           </aside>
-          <div className="main-shell">
+          <div className="main-shell" inert={mobile && !collapsed}>
             <header className="topbar">
               <div>
                 <button
                   className="icon-button"
                   onClick={() => setCollapsed(!collapsed)}
                   aria-label="Toggle navigation"
+                  ref={toggleRef}
+                  aria-expanded={!collapsed}
+                  aria-controls="workspace-navigation"
                 >
                   {collapsed ? (
                     <PanelLeftOpen size={18} />
@@ -326,7 +404,7 @@ function Workspace({ user, logout }) {
                 </Can>
               </div>
             </header>
-            <main>
+            <main id="workspace-content" tabIndex={-1}>
               <ErrorBox error={configuration.error} />
               {configuration.loading && !configuration.data ? (
                 <Loading />
