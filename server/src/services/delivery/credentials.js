@@ -7,7 +7,6 @@ function key() {
     "Configure a 32-byte hexadecimal delivery encryption key",
     503,
   );
-  console.log(value);
   return Buffer.from(value, "hex");
 }
 export function encryptCredentials(value) {

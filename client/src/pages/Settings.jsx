@@ -333,27 +333,14 @@ export function Settings() {
                   : "Unverified"}
               </Badge>
             </div>
-            <div className="integration-status">
-              <span>Latest-updates endpoint</span>
-              <Badge>
-                {delivery.data?.latestUpdatesConfigured
-                  ? "Configured"
-                  : "Unverified"}
-              </Badge>
-            </div>
             <p>
               Set courier credentials in the server environment. The browser
               never receives the token or API key.
             </p>
             <p>
-              The supplied documentation leaves response formats and status
-              codes unspecified. A shipment may require reconciliation until
-              those fields have been verified with ABEX.
-            </p>
-            <p>
-              The documentation labels GET /tarification as latest updates and
-              POST /tarification as pricing. Latest-update retrieval stays
-              disabled until its route is confirmed.
+              Procolis credentials are valid only when GET /token returns the
+              activated access status. Unknown parcel status values are kept for
+              review without changing the CRM order status.
             </p>
             <ErrorBox error={delivery.error} />
             <div className="row-actions">

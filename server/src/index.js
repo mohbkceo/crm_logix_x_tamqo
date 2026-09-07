@@ -6,7 +6,7 @@ import { migrate } from "./migrate.js";
 validateConfig();
 await mongoose.connect(config.mongoUri, { serverSelectionTimeoutMS: 10000 });
 await migrate();
-const server = app.listen(config.port, "127.0.0.1", () =>
+const server = app.listen(config.port, "0.0.0.0", () =>
   console.log(`Workspace API: http://127.0.0.1:${config.port}`),
 );
 let timer,

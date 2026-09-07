@@ -304,15 +304,15 @@ r.post(
       400,
     );
 
-    assert(
-      req.agency.credentialsConfigured,
-      "API credentials are not configured",
-      400,
-    );
-
+    // The provider validates per-agency credentials or the supported ABEX
+    // environment fallback; credentialsConfigured alone excludes legacy setups.
     const provider = await providerFor(req.agency._id);
 
-    await provider.testCredentials();
+    assert(
+      await provider.testCredentials(),
+      "Procolis credentials are not activated",
+      422,
+    );
 
     res.json({
       success: true,

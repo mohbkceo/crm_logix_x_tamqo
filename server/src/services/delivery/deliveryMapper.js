@@ -1,42 +1,53 @@
-export function mapOrderToPackage(
-  order,
-  { tracking = "", confirmed = false } = {},
-) {
+export function mapOrderToPackage(order, { confirmed = false } = {}) {
   return {
-    Package: [
+    Colis: [
       {
-        Tracking: tracking,
-        DeliveryType: order.delivery.type === "HOME" ? "0" : "1",
+        Tracking: String(order.orderNumber),
+        TypeLivraison: order.delivery.type === "HOME" ? "0" : "1",
         TypeColis: order.delivery.exchange ? "1" : "0",
-        Confirmed: confirmed ? "1" : "",
+        Confrimee: confirmed ? "1" : "0",
         Client: order.customer.name,
         MobileA: order.customer.phoneA,
         MobileB: order.customer.phoneB || "",
-        Address: order.location.address,
+        Adresse: order.location.address,
         IDWilaya: String(order.location.agencyId),
         Commune: order.location.commune,
         Total: String(order.payment.amountToCollect),
         Note: order.note || "",
-        Product: order.items.map((i) => `${i.name} × ${i.quantity}`).join(", "),
-        id_Externe: order.orderNumber,
-        Source: order.source.name,
+        TProduit: order.items
+          .map((i) => `${i.name} × ${i.quantity}`)
+          .join(", "),
+        id_Externe: String(order.orderNumber),
+        Source: order.source?.name || "",
       },
     ],
   };
 }
-export function sanitizeProviderData(value, depth = 0) {
+export function sanitizeProviderData(value, depth = 0, secrets = []) {
   if (depth > 10) return "[truncated]";
   if (typeof value === "string") {
-    let s = value.slice(0, 5000);
+    let s = value;
     for (const secret of [
       process.env.DELIVERY_API_TOKEN,
       process.env.DELIVERY_API_KEY,
+      ...secrets,
     ])
       if (secret) s = s.split(secret).join("[redacted]");
-    return s;
+    return s
+      .replace(
+        /(?:authorization|set-cookie|cookies?)\s*[:=]\s*[^\r\n]*/gi,
+        "[redacted header]",
+      )
+      .replace(
+        /((?:token|key|authorization|cookie|secret|password)\s*[=:]\s*)(?:"[^"]*"|[^\s,;]+)/gi,
+        "$1[redacted]",
+      )
+      .slice(0, 5000);
   }
   if (Array.isArray(value))
-    return value.slice(0, 200).map((x) => sanitizeProviderData(x, depth + 1));
+    return value
+      .slice(0, 200)
+      .map((x) => sanitizeProviderData(x, depth + 1, secrets));
   if (value && typeof value === "object")
     return Object.fromEntries(
       Object.entries(value)
@@ -44,40 +55,63 @@ export function sanitizeProviderData(value, depth = 0) {
           ([k]) => !/token|key|authorization|cookie|secret|password/i.test(k),
         )
         .slice(0, 100)
-        .map(([k, v]) => [k, sanitizeProviderData(v, depth + 1)]),
+        .map(([k, v]) => [k, sanitizeProviderData(v, depth + 1, secrets)]),
     );
   return value;
 }
-export function readPath(value, path) {
-  return String(path)
-    .split(".")
-    .reduce((v, k) => (v && Object.hasOwn(v, k) ? v[k] : undefined), value);
+export function extractColis(raw) {
+  if (Array.isArray(raw?.Colis)) return raw.Colis;
+  if (Array.isArray(raw)) return raw;
+  if (raw && typeof raw === "object" && raw.Tracking) return [raw];
+  return [];
+}
+function validTracking(value) {
+  return (
+    typeof value === "string" &&
+    value.trim() &&
+    value.length <= 150 &&
+    ![...value].some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)
+  );
 }
 export function parsePackages(raw) {
-  // These field paths are configurable conventions, NOT a verified response contract.
-  const data = readPath(
-    raw,
-    process.env.DELIVERY_RESPONSE_PACKAGES_PATH || "Package",
-  );
-  if (!Array.isArray(data)) return [];
-  return data
-    .filter((v) => v && typeof v === "object")
+  return extractColis(raw)
+    .filter(
+      (v) =>
+        v &&
+        validTracking(v.Tracking) &&
+        (!v.MessageRetour || v.MessageRetour === "Good"),
+    )
     .map((v) => ({
-      tracking: readPath(
-        v,
-        process.env.DELIVERY_RESPONSE_TRACKING_FIELD || "Tracking",
-      ),
-      providerStatus: readPath(
-        v,
-        process.env.DELIVERY_RESPONSE_STATUS_FIELD || "Status",
-      ),
-      raw: sanitizeProviderData(v),
-    }))
-    .filter((v) => typeof v.tracking === "string" && v.tracking.trim())
-    .map((v) => ({
-      ...v,
-      tracking: v.tracking.trim(),
+      tracking: v.Tracking.trim(),
+      externalId: typeof v.id_Externe === "string" ? v.id_Externe : null,
       providerStatus:
-        v.providerStatus == null ? null : String(v.providerStatus),
+        typeof v.Statut === "string" || typeof v.Statut === "number"
+          ? String(v.Statut)
+          : null,
+      messageRetour:
+        typeof v.MessageRetour === "string" ? v.MessageRetour : null,
+      raw: sanitizeProviderData(v),
     }));
+}
+export function parseCreationResult(raw, orderNumber) {
+  const rows = extractColis(raw);
+  const colis = rows.length === 1 ? rows[0] : null;
+  const messageRetour =
+    typeof colis?.MessageRetour === "string" ? colis.MessageRetour : null;
+  const providerAccepted = messageRetour === "Good";
+  const parcel =
+    providerAccepted && (!colis.id_Externe || colis.id_Externe === orderNumber)
+      ? parsePackages({
+          Colis: [
+            { ...colis, Tracking: colis.Tracking || String(orderNumber) },
+          ],
+        })[0] || null
+      : null;
+  return {
+    providerAccepted,
+    duplicate: messageRetour === "Double Tracking",
+    messageRetour,
+    trackingFound: Boolean(parcel),
+    parcel,
+  };
 }

@@ -1,7 +1,4 @@
-@import "tailwindcss";
-@theme {
-  --font-sans: "Inter", "Segoe UI", sans-serif;
-}
+
 :root {
   font-family: var(--font-sans);
   color: #18181b;
@@ -2628,5 +2625,701 @@ fieldset {
   }
   .spin {
     animation-duration: 2s;
+  }
+}
+
+/* ========================================================================== 
+   Responsive hardening layer
+   Keeps the existing desktop design intact while making every layout primitive
+   safe down to narrow mobile viewports and across touch/tablet sizes.
+   ========================================================================== */
+
+html,
+body,
+#root {
+  width: 100%;
+  max-width: 100%;
+  min-width: 0;
+}
+
+html,
+body {
+  overflow-x: hidden;
+  overflow-x: clip;
+}
+
+img,
+video {
+  display: block;
+  max-width: 100%;
+  height: auto;
+}
+
+main,
+.main-shell,
+.page-heading,
+.page-heading > *,
+.page-actions,
+.report-toolbar,
+.report-toolbar > *,
+.period-filter,
+.toolbar-right,
+.metrics-grid,
+.metric,
+.panel,
+.panel-head,
+.panel-head > *,
+.overview-charts,
+.overview-charts > *,
+.two-columns,
+.two-columns > *,
+.filter-grid,
+.form-grid,
+.order-form-layout,
+.order-form-layout > *,
+.item-section,
+.item-row,
+.item-row > *,
+.business-selection,
+.summary-strip,
+.summary-lines,
+.metric-rows,
+.definitions,
+.list-toolbar,
+.search-input,
+.field,
+.integration-status,
+.tracking-row,
+.modal-body,
+.permission-grid,
+.profile > div,
+.pipeline-list a > span,
+.pipeline-list b {
+  min-width: 0;
+}
+
+.page-heading p,
+.panel-head p,
+.detail-body,
+.note,
+.error,
+.success,
+.empty,
+.integration-status,
+.profile b,
+.profile small,
+.summary-lines,
+.metric-rows,
+.pipeline-list a,
+.pipeline-link,
+.text-link,
+.back-link {
+  overflow-wrap: anywhere;
+}
+
+.table-wrap {
+  width: 100%;
+  max-width: 100%;
+  overflow-x: auto;
+  overflow-y: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior-inline: contain;
+  scrollbar-width: thin;
+}
+
+.table-wrap table {
+  min-width: 100%;
+}
+
+.tabs {
+  max-width: 100%;
+  -webkit-overflow-scrolling: touch;
+  scrollbar-width: thin;
+  overscroll-behavior-inline: contain;
+}
+
+.tabs button {
+  flex: 0 0 auto;
+}
+
+.recharts-responsive-container,
+.recharts-wrapper,
+.chart-container {
+  max-width: 100% !important;
+  min-width: 0 !important;
+}
+
+/* Tablet / compact desktop ------------------------------------------------ */
+@media (max-width: 1024px) {
+  .overview-charts {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .two-columns {
+    grid-template-columns: minmax(0, 1fr);
+    gap: 0;
+  }
+
+  .filter-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .definitions {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .report-toolbar {
+    flex-wrap: wrap;
+  }
+
+  .toolbar-right {
+    flex-wrap: wrap;
+  }
+}
+
+@media (max-width: 960px) {
+  .metrics-grid,
+  .expense-metrics {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .order-form-layout {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .order-summary {
+    position: static;
+  }
+
+  .page-actions {
+    flex-wrap: wrap;
+  }
+}
+
+/* Mobile ------------------------------------------------------------------ */
+@media (max-width: 760px) {
+  .app-shell,
+  .app-shell.collapsed {
+    width: 100%;
+    min-height: 100dvh;
+    padding: 0;
+    gap: 0;
+    grid-template-columns: 0 minmax(0, 1fr);
+  }
+
+  .main-shell {
+    width: 100%;
+    grid-column: 2;
+  }
+
+  .sidebar {
+    max-width: calc(100vw - 16px);
+    overflow-x: hidden;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  .collapsed .nav-backdrop {
+    display: none;
+    pointer-events: none;
+  }
+
+  .topbar {
+    max-width: calc(100vw - 16px);
+  }
+
+  .topbar > div {
+    max-width: 100%;
+  }
+
+  main {
+    width: 100%;
+    padding-inline-start: max(16px, env(safe-area-inset-left));
+    padding-inline-end: max(16px, env(safe-area-inset-right));
+  }
+
+  .page-heading {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .page-heading h1 {
+    font-size: clamp(26px, 8vw, 30px);
+    overflow-wrap: anywhere;
+  }
+
+  .page-actions {
+    width: 100%;
+    justify-content: flex-start;
+  }
+
+  .page-actions > button,
+  .page-actions > a {
+    flex: 1 1 auto;
+    max-width: 100%;
+  }
+
+  .report-toolbar {
+    flex-direction: column;
+    align-items: stretch;
+    width: 100%;
+  }
+
+  .period-filter,
+  .toolbar-right {
+    width: 100%;
+    max-width: none;
+  }
+
+  .period-filter {
+    display: flex;
+    flex-wrap: wrap;
+  }
+
+  .period-filter > select,
+  .period-filter > input {
+    flex: 1 1 145px;
+    width: auto;
+    max-width: none;
+    min-width: 0;
+  }
+
+  .toolbar-right {
+    justify-content: flex-start;
+    gap: 8px;
+  }
+
+  .toolbar-right > button,
+  .toolbar-right > a {
+    flex: 0 1 auto;
+  }
+
+  .form-grid,
+  .filter-grid,
+  dialog .form-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .span-2,
+  .form-grid .span-2 {
+    grid-column: 1 / -1;
+  }
+
+  .business-selection {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .item-row {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: end;
+    gap: 12px;
+  }
+
+  .item-row > .icon-button {
+    grid-column: 2;
+    justify-self: end;
+    align-self: end;
+  }
+
+  .item-subtotal {
+    grid-column: auto;
+  }
+
+  .renewal {
+    grid-column: 1 / -1;
+  }
+
+  .list-toolbar {
+    align-items: stretch;
+  }
+
+  .search-input {
+    flex: 1 0 100%;
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .list-toolbar > select {
+    flex: 1 1 140px;
+    width: auto;
+    max-width: 100%;
+  }
+
+  .list-toolbar > button {
+    flex: 0 1 auto;
+  }
+
+  .panel-head {
+    align-items: flex-start;
+  }
+
+  .panel-head > div {
+    min-width: 0;
+  }
+
+  .metric-rows {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .summary-strip {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: start;
+  }
+
+  .summary-strip > div {
+    min-width: 0;
+  }
+
+  .summary-lines > div,
+  .metric-rows > div {
+    align-items: flex-start;
+  }
+
+  .summary-lines > div > :last-child,
+  .metric-rows > div > :last-child {
+    text-align: end;
+  }
+
+  .share-bar {
+    flex-wrap: wrap;
+    overflow: visible;
+  }
+
+  .share-bar span {
+    flex: 1 1 120px;
+    min-width: 0;
+  }
+
+  .integration-status,
+  .tracking-row {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    gap: 10px;
+  }
+
+  .integration-status > :first-child,
+  .tracking-row > :first-child {
+    min-width: 0;
+    flex: 1 1 220px;
+  }
+
+  .row-actions,
+  .order-actions,
+  .modal-actions {
+    max-width: 100%;
+    flex-wrap: wrap;
+  }
+
+  .timeline {
+    padding-inline: 18px;
+  }
+
+  .fatal {
+    width: 100%;
+    max-width: 100%;
+    padding: 32px 20px;
+  }
+
+  dialog,
+  dialog.wide {
+    width: min(calc(100vw - 16px), 1000px);
+    max-width: calc(100vw - 16px);
+    max-height: calc(100dvh - 16px);
+  }
+
+  dialog > header {
+    gap: 12px;
+    padding: 16px;
+  }
+
+  .modal-body {
+    max-width: 100%;
+  }
+
+  button,
+  a.primary,
+  .page-actions > a:not(.primary) {
+    white-space: normal;
+    line-height: 1.25;
+  }
+}
+
+/* Narrow phones ----------------------------------------------------------- */
+@media (max-width: 560px) {
+  .metrics-grid,
+  .expense-metrics {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .metric-value {
+    font-size: clamp(22px, 7vw, 27px);
+  }
+
+  .page-actions > button,
+  .page-actions > a,
+  .toolbar-right > button,
+  .toolbar-right > a {
+    min-width: 0;
+  }
+
+  .pipeline-list a {
+    gap: 12px;
+    align-items: flex-start;
+  }
+
+  .pipeline-list b {
+    gap: 8px;
+    flex-shrink: 0;
+  }
+
+  .pagination {
+    align-items: stretch;
+  }
+
+  .pagination > div {
+    margin-inline-start: auto;
+  }
+
+  .login {
+    padding-inline-start: max(16px, env(safe-area-inset-left));
+    padding-inline-end: max(16px, env(safe-area-inset-right));
+  }
+
+  .login form {
+    width: 100%;
+    max-width: 440px;
+  }
+}
+
+@media (max-width: 480px) {
+  .topbar {
+    margin: 6px;
+    max-width: calc(100vw - 12px);
+    padding-inline: 6px;
+    border-radius: 16px;
+  }
+
+  .topbar > div {
+    gap: 4px;
+  }
+
+  main {
+    padding-top: 16px;
+    padding-inline-start: max(12px, env(safe-area-inset-left));
+    padding-inline-end: max(12px, env(safe-area-inset-right));
+  }
+
+  .page-heading {
+    margin-bottom: 18px;
+  }
+
+  .page-heading h1 {
+    font-size: clamp(25px, 8.5vw, 29px);
+  }
+
+  .page-actions > button,
+  .page-actions > a {
+    flex-basis: 100%;
+    width: 100%;
+  }
+
+  .panel {
+    border-radius: 18px;
+  }
+
+  .panel-head,
+  .form-grid,
+  .business-selection,
+  .item-section,
+  .form-padding,
+  .detail-body,
+  .summary-lines,
+  .metric-rows,
+  .definitions,
+  .list-toolbar {
+    padding-inline: 14px;
+  }
+
+  .chart-summary,
+  .pipeline-list,
+  .pipeline-total,
+  .pipeline-link,
+  .share-bar {
+    margin-inline: 14px;
+  }
+
+  .pipeline-list {
+    padding-inline: 0;
+  }
+
+  .pipeline-total {
+    padding-inline: 0;
+  }
+
+  .pipeline-link {
+    width: auto;
+  }
+
+  .period-filter {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .period-filter > select,
+  .period-filter > input {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .toolbar-right > button,
+  .toolbar-right > a {
+    flex: 1 1 auto;
+  }
+
+  .list-toolbar > select,
+  .list-toolbar > button {
+    flex: 1 1 100%;
+    width: 100%;
+    max-width: 100%;
+  }
+
+  .summary-strip {
+    padding-inline: 14px;
+  }
+
+  .integration-status {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .integration-status > :first-child {
+    flex-basis: auto;
+  }
+
+  .integration-status button,
+  .integration-status a {
+    width: 100%;
+  }
+
+  .order-actions {
+    width: 100%;
+  }
+
+  .order-actions button,
+  .order-actions a {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+
+  .pagination {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .pagination > div {
+    width: 100%;
+    margin-inline-start: 0;
+    justify-content: space-between;
+  }
+
+  dialog,
+  dialog.wide {
+    width: calc(100vw - 12px);
+    max-width: calc(100vw - 12px);
+    max-height: calc(100dvh - 12px);
+    border-radius: 18px;
+  }
+
+  dialog > header,
+  .modal-body {
+    padding: 14px;
+  }
+
+  .modal-actions {
+    flex-direction: column-reverse;
+    align-items: stretch;
+  }
+
+  .modal-actions button,
+  .modal-actions a {
+    width: 100%;
+  }
+
+  .login form {
+    padding: 22px 18px;
+    border-radius: 22px;
+  }
+
+  .login h1 {
+    font-size: clamp(28px, 9vw, 32px);
+  }
+
+  .fatal {
+    padding: 24px 16px;
+  }
+}
+
+@media (max-width: 360px) {
+  .summary-strip {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .item-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .item-row > .icon-button,
+  .item-subtotal {
+    grid-column: 1;
+  }
+
+  .item-row > .icon-button {
+    justify-self: end;
+  }
+
+  .renewal {
+    grid-column: 1;
+  }
+
+  .topbar .icon-button,
+  .profile button,
+  .pagination button {
+    min-width: 40px;
+    min-height: 40px;
+  }
+}
+
+/* Short mobile landscape -------------------------------------------------- */
+@media (max-width: 760px) and (max-height: 520px) {
+  .sidebar {
+    inset-block: 4px;
+    height: calc(100dvh - 8px);
+    border-radius: 18px;
+  }
+
+  .workspace-switch {
+    margin-block: 14px;
+  }
+
+  .sidebar nav {
+    margin-bottom: 14px;
+  }
+
+  .topbar {
+    height: 54px;
+  }
+}
+
+/* Touch input: keep controls comfortably tappable without desktop bloat. */
+@media (hover: none) and (pointer: coarse) {
+  button,
+  a.primary,
+  .page-actions > a:not(.primary),
+  .sidebar nav a,
+  .text-link,
+  .back-link,
+  .pipeline-link {
+    min-height: 44px;
   }
 }

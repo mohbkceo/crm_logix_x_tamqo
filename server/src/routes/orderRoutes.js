@@ -26,6 +26,7 @@ import {
   orderScope,
 } from "../authorization.js";
 import { deliveryService } from "../services/delivery/deliveryService.js";
+import { DeliveryAgency } from "../models/delivery.js";
 const router = Router();
 router.use(async (req, _res, next) => {
   const parts = req.path.split("/").filter(Boolean),
@@ -77,9 +78,16 @@ router.use(async (req, _res, next) => {
   }
   next();
 });
-router.post("/", async (req, res) =>
-  res.status(201).json(await createOrder(req.body, req.actor)),
-);
+router.post("/", async (req, res) => {
+  const order = await createOrder(req.body, req.actor);
+  const delivery = await deliveryService.createAutomatically(order, req.actor);
+  // Reload revision/status changed by shipment synchronization, with the committed
+  // order as fallback if the database becomes unavailable after creation.
+  const current = await Order.findById(order._id)
+    .lean()
+    .catch(() => null);
+  res.status(201).json({ ...(current || order.toObject()), ...delivery });
+});
 router.get("/", async (req, res) => {
   const filter = {
       $and: [
@@ -131,9 +139,13 @@ router.get("/:id", async (req, res) => {
       .lean(),
   ]);
   assert(order, "Order not found", 404);
+  const deliveryAgency = await DeliveryAgency.findById(order.delivery.agencyId)
+    .select("integrationType capabilities")
+    .lean();
   res.json({
     ...order,
     shipment,
+    deliveryAgency,
     allowedStatuses: STATUSES.filter((s) =>
       canTransition(order.status, s, order.businessType),
     ),

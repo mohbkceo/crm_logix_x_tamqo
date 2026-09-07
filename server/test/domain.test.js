@@ -10,7 +10,9 @@ import {
   mapOrderToPackage,
   sanitizeProviderData,
   parsePackages,
+  parseCreationResult,
 } from "../src/services/delivery/deliveryMapper.js";
+import { DeliveryClient } from "../src/services/delivery/deliveryClient.js";
 import { buildReport, isRealized } from "../src/services/analyticsService.js";
 const items = [
   {
@@ -124,24 +126,24 @@ test("courier mapping uses exact documented fields and collection amount", () =>
         amountPaidOnline: 11000,
       }),
     }),
-    p = mapOrderToPackage(order).Package[0];
+    p = mapOrderToPackage(order).Colis[0];
   assert.equal(p.Total, "500");
   assert.equal(p.id_Externe, "ORD-2026-000123");
-  assert.equal(p.DeliveryType, "0");
+  assert.equal(p.TypeLivraison, "0");
   assert.equal(p.TypeColis, "0");
   assert.equal(p.Source, "Messages");
-  assert.equal(p.Confirmed, "");
+  assert.equal(p.Confrimee, "0");
   order.delivery = { type: "STOP_DESK", exchange: true };
   assert.equal(
-    mapOrderToPackage(order, { confirmed: true }).Package[0].DeliveryType,
+    mapOrderToPackage(order, { confirmed: true }).Colis[0].TypeLivraison,
     "1",
   );
   assert.equal(
-    mapOrderToPackage(order, { confirmed: true }).Package[0].TypeColis,
+    mapOrderToPackage(order, { confirmed: true }).Colis[0].TypeColis,
     "1",
   );
   assert.equal(
-    mapOrderToPackage(order, { confirmed: true }).Package[0].Confirmed,
+    mapOrderToPackage(order, { confirmed: true }).Colis[0].Confrimee,
     "1",
   );
 });
@@ -234,4 +236,147 @@ test("transitions reject lifecycle regressions and allow digital completion", ()
   assert.equal(canTransition("NEW", "DELIVERED", "LOGIX_ONLY"), false);
   assert.equal(canTransition("RETURNED", "SHIPPED", "LOGIX_ONLY"), false);
   assert.equal(canTransition("CONFIRMED", "DELIVERED", "TAMQO_ONLY"), true);
+});
+
+test("legacy Colis parser preserves status and rejects invented aliases", () => {
+  const parcel = {
+    Tracking: "ORD-1",
+    Statut: "unknown",
+    MessageRetour: "Good",
+    extra: 42,
+  };
+  for (const raw of [{ Colis: [parcel] }, [parcel], parcel]) {
+    assert.equal(parseCreationResult(raw, "ORD-1").trackingFound, true);
+    assert.equal(parsePackages(raw)[0].providerStatus, "unknown");
+    assert.equal(parsePackages(raw)[0].raw.extra, 42);
+  }
+  for (const raw of [
+    null,
+    "OK",
+    { Package: [parcel] },
+    { data: { Colis: [parcel] } },
+    { Tracking: {} },
+    { Tracking: 123 },
+    { Tracking: " " },
+    { Tracking: "X".repeat(151) },
+    { Tracking: "X\nY" },
+  ]) {
+    assert.deepEqual(parsePackages(raw), []);
+  }
+  assert.equal(
+    parseCreationResult({ Colis: [{ MessageRetour: "Good" }] }, "ORD-1").parcel
+      .tracking,
+    "ORD-1",
+  );
+  assert.equal(
+    parseCreationResult(
+      { Colis: [{ MessageRetour: "Double Tracking" }] },
+      "ORD-1",
+    ).duplicate,
+    true,
+  );
+  assert.equal(
+    parseCreationResult({ Colis: [{ MessageRetour: "Rejected" }] }, "ORD-1")
+      .providerAccepted,
+    false,
+  );
+  assert.deepEqual(
+    parsePackages({
+      Colis: [{ Tracking: "ORD-1", MessageRetour: "Not found" }],
+    }),
+    [],
+  );
+});
+test("prepaid collection uses local wilaya agency ID and deterministic tracking", () => {
+  const order = fixture({
+    ...calculateFinancials(items, 500, {
+      method: "ONLINE",
+      amountPaidOnline: 11500,
+    }),
+  });
+  const payload = mapOrderToPackage(order);
+  assert.deepEqual(Object.keys(payload), ["Colis"]);
+  const parcel = payload.Colis[0];
+  assert.equal(parcel.Total, "0");
+  assert.equal(parcel.IDWilaya, "16");
+  assert.equal(parcel.Confrimee, "0");
+  assert.equal(parcel.Tracking, order.orderNumber);
+  assert.equal(parcel.id_Externe, order.orderNumber);
+  assert.equal(parcel.Adresse, order.location.address);
+  assert.equal(parcel.TProduit, "3 Months \u00d7 1, 20cm Plaque \u00d7 2");
+  for (const key of ["DeliveryType", "Confirmed", "Address", "Product"])
+    assert.equal(key in parcel, false);
+});
+
+test("delivery client uses only the verified legacy Procolis methods and Colis bodies", async () => {
+  const client = new DeliveryClient({
+    credentials: { token: "token", key: "key" },
+  });
+  assert.equal(client.http.defaults.baseURL, "https://procolis.com/api_v1");
+  const calls = [];
+  client.request = async (method, path, body) => {
+    calls.push({ method, path, body });
+    if (path === "/token") return { Statut: "Acc\u00e8s activ\u00e9" };
+    if (path === "/tarification")
+      return [
+        { IDWilaya: "31", Wilaya: "Oran", Domicile: "500", Stopdesk: "300" },
+      ];
+    return { Colis: [] };
+  };
+
+  assert.equal(await client.testCredentials(), true);
+  await client.createPackages({ Colis: [{ Tracking: "ORD-001" }] });
+  await client.readPackages(["ORD-001", "ORD-002"]);
+  await client.readyPackages(["ORD-001", "ORD-002"]);
+  assert.equal((await client.getPricing())[0].IDWilaya, "31");
+  assert.deepEqual(calls, [
+    { method: "GET", path: "/token", body: undefined },
+    {
+      method: "POST",
+      path: "/add_colis",
+      body: { Colis: [{ Tracking: "ORD-001" }] },
+    },
+    {
+      method: "POST",
+      path: "/lire",
+      body: {
+        Colis: [{ Tracking: "ORD-001" }, { Tracking: "ORD-002" }],
+      },
+    },
+    {
+      method: "POST",
+      path: "/pret",
+      body: {
+        Colis: [{ Tracking: "ORD-001" }, { Tracking: "ORD-002" }],
+      },
+    },
+    { method: "POST", path: "/tarification", body: undefined },
+  ]);
+
+  client.request = async () => ({ Statut: "Acc\u00e8s refus\u00e9" });
+  assert.equal(await client.testCredentials(), false);
+});
+
+test("sanitization redacts per-agency echoes before truncating strings", () => {
+  const secret = "per-agency-secret";
+  const clean = sanitizeProviderData(
+    {
+      message: "x".repeat(4995) + secret,
+      details: "Authorization: Bearer sensitive-value\nCookie: session=private",
+      nested: { token: secret, message: secret },
+    },
+    0,
+    [secret],
+  );
+  assert.equal(clean.message.endsWith("per-a"), false);
+  assert.equal(JSON.stringify(clean).includes("sensitive-value"), false);
+  assert.equal(JSON.stringify(clean).includes("private"), false);
+  assert.deepEqual(clean.nested, { message: "[redacted]" });
+  assert.equal(
+    parseCreationResult(
+      { Package: [{ Tracking: "X" }, { error: "invalid" }] },
+      "ORD",
+    ).trackingFound,
+    false,
+  );
 });

@@ -194,6 +194,7 @@ export const Shipment = create("Shipment", {
   externalId: String,
   status: String,
   providerStatus: String,
+  messageRetour: String,
   syncStatus: {
     type: String,
     enum: ["PENDING", "SYNCED", "ERROR"],
@@ -205,6 +206,7 @@ export const Shipment = create("Shipment", {
   lastError: String,
   sanitizedProviderData: Schema.Types.Mixed,
   creationAttemptedAt: Date,
+  providerAccepted: { type: Boolean, default: false },
   uncertain: { type: Boolean, default: false },
   lockUntil: Date,
 });

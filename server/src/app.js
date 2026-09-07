@@ -211,7 +211,6 @@ app.get(
       configured: Boolean(
         process.env.DELIVERY_API_TOKEN && process.env.DELIVERY_API_KEY,
       ),
-      latestUpdatesConfigured: Boolean(process.env.DELIVERY_LATEST_PATH),
       statusMappingConfigured:
         process.env.DELIVERY_STATUS_MAP !== "{}" &&
         Boolean(process.env.DELIVERY_STATUS_MAP),
@@ -226,10 +225,13 @@ app.post(
       "Use agency-specific connection tests",
       403,
     );
-    await deliveryClient.testCredentials();
+    assert(
+      await deliveryClient.testCredentials(),
+      "Procolis credentials are not activated",
+      422,
+    );
     res.json({
-      message:
-        "Courier endpoint responded. Verify credential validity with the provider: its success response format is undocumented.",
+      message: "Procolis API connection and credentials verified successfully.",
     });
   },
 );

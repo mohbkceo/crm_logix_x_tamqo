@@ -17,6 +17,7 @@
     "lint": "eslint .",
     "admin:password": "node scripts/password.js",
     "test:browser": "node scripts/browser-check.js",
+    "test:delivery-browser": "node scripts/delivery-browser-check.js",
     "format": "prettier --write \"client/src/**/*.{js,jsx,css}\" \"server/**/*.js\" \"scripts/*.js\"",
     "migrate": "node server/src/migrate.js"
   },

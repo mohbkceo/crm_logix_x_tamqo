@@ -2,6 +2,7 @@ import { useEffect, useState } from "react";
 import {
   Link,
   useNavigate,
+  useLocation,
   useParams,
   useSearchParams,
 } from "react-router-dom";
@@ -500,7 +501,9 @@ export function OrderForm() {
         method: id ? "PATCH" : "POST",
         body,
       });
-      navigate("/orders/" + order._id);
+      navigate("/orders/" + order._id, {
+        state: { shipmentSync: order.shipmentSync },
+      });
     } catch (e) {
       setError(e.message);
     } finally {
@@ -991,7 +994,12 @@ export function OrderForm() {
                   <ArrowRight size={16} />
                 </button>
                 <p className="small-note">
-                  The order is saved before you create a courier shipment.
+                  {eligible.find((a) => a._id === form.delivery.agencyId)
+                    ?.integrationType === "API" &&
+                  eligible.find((a) => a._id === form.delivery.agencyId)
+                    ?.capabilities?.createShipment
+                    ? "Saving this order automatically creates a courier parcel. Tracking or synchronization details will appear on the order."
+                    : "Save this order, then handle its shipment manually."}
                 </p>
               </div>
             </Panel>
@@ -1009,6 +1017,7 @@ export function OrderForm() {
 }
 export function OrderDetails() {
   const user = useUser();
+  const location = useLocation();
   const { id } = useParams(),
     order = useApi("/orders/" + id),
     timeline = useApi(`/orders/${id}/timeline`),
@@ -1039,6 +1048,7 @@ export function OrderDetails() {
   if (order.loading && !o) return <Loading />;
   if (!o) return <ErrorBox error={order.error} />;
   const s = o.shipment,
+    agency = o.deliveryAgency,
     canEdit =
       ["NEW", "CONFIRMED", "PREPARING"].includes(o.status) &&
       !s &&
@@ -1059,6 +1069,9 @@ export function OrderDetails() {
         {canEdit && <Link to={`/orders/${id}/edit`}>Edit order</Link>}
       </PageHeader>
       <ErrorBox error={error || order.error} />
+      {!s && location.state?.shipmentSync?.error && (
+        <ErrorBox error={`Order saved. ${location.state.shipmentSync.error}`} />
+      )}
       {message && (
         <div className="success" role="status">
           <Check size={16} />
@@ -1099,7 +1112,12 @@ export function OrderDetails() {
               Mark ready to ship
             </button>
           )}
-        {["CONFIRMED", "PREPARING", "READY_TO_SHIP"].includes(o.status) &&
+        {(o.status === "NEW"
+          ? agency?.integrationType === "API"
+          : ["CONFIRMED", "PREPARING", "READY_TO_SHIP"].includes(o.status)) &&
+          agency?.capabilities?.createShipment &&
+          s?.provider !== "MANUAL" &&
+          !s?.uncertain &&
           !s?.tracking &&
           !s?.creationAttemptedAt &&
           can(user, P.orders.createShipment) && (
@@ -1108,12 +1126,13 @@ export function OrderDetails() {
               {s ? "Retry shipment" : "Create shipment"}
             </button>
           )}
-        {s?.tracking && can(user, P.orders.refreshTracking) && (
-          <button disabled={busy} onClick={() => action("shipment/refresh")}>
-            <RefreshCw size={15} />
-            Refresh tracking
-          </button>
-        )}
+        {(s?.tracking || s?.uncertain) &&
+          can(user, P.orders.refreshTracking) && (
+            <button disabled={busy} onClick={() => action("shipment/refresh")}>
+              <RefreshCw size={15} />
+              Refresh tracking
+            </button>
+          )}
         {o.items.some((i) => i.business === "TAMQO") &&
           !o.tamqoActivatedAt &&
           (can(user, P.orders.updateAll) ||
@@ -1231,6 +1250,18 @@ export function OrderDetails() {
                   <p>
                     External reference: <b>{s.externalId}</b>
                   </p>
+                  <p role="status">
+                    {s.messageRetour === "Double Tracking" &&
+                    s.syncStatus !== "SYNCED"
+                      ? "Duplicate tracking found \u2014 reconciling"
+                      : s.syncStatus === "ERROR"
+                        ? "Shipment synchronization failed"
+                        : s.uncertain
+                          ? "Shipment awaiting verification"
+                          : s.syncStatus === "SYNCED"
+                            ? "Shipment synchronized"
+                            : "Shipment awaiting verification"}
+                  </p>
                   <p>Provider status: {s.providerStatus || "Not reported"}</p>
                   <p>
                     Last sync:{" "}
@@ -1244,25 +1275,28 @@ export function OrderDetails() {
                   {s.uncertain && (
                     <div className="note">
                       <AlertCircle size={17} />
-                      Verify this order number in the courier portal before
+                      Refresh tracking to verify this order with Procolis before
                       retrying creation.
                     </div>
                   )}
-                  {!s.tracking && (
-                    <button
-                      disabled={busy}
-                      onClick={() => setDialog("reconcile")}
-                    >
-                      Reconcile shipment
-                    </button>
-                  )}
+                  {!s.tracking &&
+                    (s.provider === "MANUAL" || s.creationAttemptedAt) &&
+                    can(user, P.orders.refreshTracking) && (
+                      <button
+                        disabled={busy}
+                        onClick={() => setDialog("reconcile")}
+                      >
+                        Reconcile shipment
+                      </button>
+                    )}
                 </>
               ) : (
                 <>
                   <p>No shipment has been created for this order.</p>
                   <p className="muted">
-                    Confirm the order to send its delivery details to the
-                    courier.
+                    {agency?.integrationType === "API"
+                      ? "Use Create shipment to attempt courier synchronization."
+                      : "Confirm the order, then create its manual shipment."}
                   </p>
                 </>
               )}
@@ -1453,20 +1487,24 @@ export function OrderDetails() {
                 Link verified tracking
               </button>
             </div>
-            <hr />
-            <p>
-              If you verified that no parcel exists, unlock one new creation
-              attempt.
-            </p>
-            <button
-              className="danger-text"
-              disabled={busy}
-              onClick={() =>
-                action("shipment/reconcile", { absentConfirmed: true })
-              }
-            >
-              I verified that no parcel exists
-            </button>
+            {s?.provider !== "MANUAL" && (
+              <>
+                <hr />
+                <p>
+                  If you verified that no parcel exists, unlock one new creation
+                  attempt.
+                </p>
+                <button
+                  className="danger-text"
+                  disabled={busy}
+                  onClick={() =>
+                    action("shipment/reconcile", { absentConfirmed: true })
+                  }
+                >
+                  I verified that no parcel exists
+                </button>
+              </>
+            )}
           </div>
         </Modal>
       )}

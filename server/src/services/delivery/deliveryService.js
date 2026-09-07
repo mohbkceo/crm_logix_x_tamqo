@@ -4,7 +4,8 @@ import { audit } from "../../models/security.js";
 import { providerFor } from "./deliveryProviderFactory.js";
 import { DeliverySyncService } from "./deliverySyncService.js";
 import { transaction, transition } from "../orderService.js";
-import { assert } from "../../errors.js";
+import { assert, AppError } from "../../errors.js";
+import { sanitizeProviderData } from "./deliveryMapper.js";
 async function context(id, capability, creating = false) {
   const order = await Order.findById(id);
   assert(order, "Order not found", 404);
@@ -44,6 +45,60 @@ async function event(id, actor, message) {
   await audit(actor, "ORDER_SHIPMENT_UPDATED", "Order", id);
 }
 export const deliveryService = {
+  // Called only after createOrder's transaction has committed. Courier failure
+  // is a shipment outcome, never an unsuccessful local order creation.
+  async createAutomatically(order, actor) {
+    let shipment = null;
+    let shipmentSync = { attempted: false, success: null };
+    try {
+      const agency = await DeliveryAgency.findById(order.delivery.agencyId);
+      if (
+        agency?.integrationType !== "API" ||
+        !agency.capabilities?.createShipment
+      )
+        return { shipment, shipmentSync };
+      shipmentSync.attempted = true;
+      shipment = await this.create(order._id, actor);
+      shipmentSync = {
+        attempted: true,
+        success: shipment.syncStatus === "SYNCED",
+        providerAccepted: shipment.providerAccepted,
+        trackingFound: Boolean(shipment.tracking),
+        error: shipment.lastError || null,
+      };
+    } catch (error) {
+      shipmentSync.success = false;
+      shipmentSync.error = sanitizeProviderData(
+        error instanceof AppError
+          ? error.message
+          : "Courier synchronization failed. Inspect the shipment before retrying.",
+      );
+      // Configuration/factory failures may happen before the sync service creates
+      // its record. Never overwrite an existing attempt or unlock its reservation.
+      try {
+        shipment = await Shipment.findOneAndUpdate(
+          { orderId: order._id },
+          {
+            $setOnInsert: {
+              agencyId: order.delivery.agencyId,
+              agencyName: order.delivery.agencyName,
+              provider: "PROCOLIS",
+              externalId: order.orderNumber,
+              status: order.status,
+              syncStatus: "ERROR",
+              lastError: shipmentSync.error,
+            },
+          },
+          { upsert: true, new: true },
+        );
+      } catch {
+        /* Preserve the committed order response even if diagnostics cannot be saved. */
+      }
+    }
+    const publicShipment = shipment?.toObject ? shipment.toObject() : shipment;
+    if (publicShipment) delete publicShipment.sanitizedProviderData;
+    return { shipment: publicShipment, shipmentSync };
+  },
   async create(id, actor, input = {}) {
     const { order, agency, service } = await context(
       id,
@@ -86,7 +141,13 @@ export const deliveryService = {
         await o.save({ session });
         return shipment;
       });
-    await event(id, actor, "Shipment created or linked");
+    await event(
+      id,
+      actor,
+      result.syncStatus === "SYNCED"
+        ? "Shipment created or linked"
+        : "Shipment synchronization requires attention",
+    );
     return result;
   },
   async ready(id, actor) {

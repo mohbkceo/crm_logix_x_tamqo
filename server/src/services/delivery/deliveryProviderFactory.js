@@ -16,21 +16,6 @@ export async function providerFor(id, capability) {
   if (agency.integrationType === "MANUAL")
     return {
       async testCredentials() {
-        const response = await fetch(`${this.baseUrl}/token`, {
-          method: "GET",
-          headers: {
-            token: this.credentials.token,
-            key: this.credentials.key,
-            Accept: "application/json",
-          },
-        });
-
-        assert(
-          response.ok,
-          `Procolis authentication failed (${response.status})`,
-          502,
-        );
-
         return true;
       },
     };

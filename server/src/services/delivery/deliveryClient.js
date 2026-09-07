@@ -1,5 +1,6 @@
 import axios from "axios";
 import { AppError, assert } from "../../errors.js";
+import { sanitizeProviderData } from "./deliveryMapper.js";
 export class DeliveryClient {
   constructor(options = {}) {
     this.credentials = options.credentials || {
@@ -27,59 +28,79 @@ export class DeliveryClient {
   async request(method, url, data) {
     this.ensureConfigured();
     try {
-      return (
-        await this.http.request({
-          method,
-          url,
-          data,
-          headers: {
-            token: this.credentials.token,
-            key: this.credentials.key,
-          },
-        })
-      ).data;
+      const response = await this.http.request({
+        method,
+        url,
+        data,
+        headers: {
+          "Content-Type": "application/json",
+          token: this.credentials.token,
+          key: this.credentials.key,
+        },
+      });
+      const body = this.sanitize(response.data);
+      this.lastResponseStatus = response.status;
+      this.lastResponse = this.sanitize({
+        status: response.status,
+        statusText: response.statusText,
+        body,
+      });
+      return body;
     } catch (error) {
-      throw new AppError(
+      const diagnostics = this.sanitize({
+        endpoint: url,
+        status: error.response?.status,
+        statusText: error.response?.statusText,
+        body: error.response?.data,
+      });
+      const body = diagnostics.body;
+      const detail =
+        typeof body === "string"
+          ? body
+          : [
+              body?.Colis?.[0]?.MessageRetour,
+              body?.Statut,
+              body?.message,
+              body?.Message,
+              body?.error?.message,
+              body?.error,
+              body?.Error,
+            ].find((v) => typeof v === "string");
+      const failure = new AppError(
         error.code === "ECONNABORTED"
           ? "Courier request timed out; verify the parcel before retrying."
-          : `Courier request failed${error.response?.status ? ` (HTTP ${error.response.status})` : ""}. Verify the parcel before retrying.`,
+          : `Courier request failed${diagnostics.status ? ` (HTTP ${diagnostics.status})` : ""}${detail ? `: ${detail.slice(0, 1000)}` : "."} Verify the parcel before retrying.`,
         502,
         "DELIVERY_ERROR",
       );
+      failure.providerData = diagnostics;
+      throw failure;
     }
   }
-  testCredentials() {
-    return this.request("GET", "/token");
+  sanitize(value) {
+    return sanitizeProviderData(value, 0, Object.values(this.credentials));
+  }
+  async testCredentials() {
+    const response = await this.request("GET", "/token");
+    return response?.Statut === "Acc\u00e8s activ\u00e9";
   }
   createPackages(payload) {
     return this.request("POST", "/add_colis", payload);
   }
   readPackages(trackings) {
     return this.request("POST", "/lire", {
-      Package: trackings.map((Tracking) => ({ Tracking })),
+      Colis: trackings.map((Tracking) => ({ Tracking })),
     });
   }
   readyPackages(trackings) {
     return this.request("POST", "/pret", {
-      Package: trackings.map((Tracking) => ({ Tracking })),
+      Colis: trackings.map((Tracking) => ({ Tracking })),
     });
   }
-  getPricing() {
-    return this.request("POST", "/tarification");
-  }
-  getLatestUpdatedPackages() {
-    // Supplied HTML labels GET /tarification as updates, but POST /tarification as pricing.
-    // No alternate endpoint is assumed. Enable only after confirmation from ABEX.
-    const path = process.env.DELIVERY_LATEST_PATH,
-      method = process.env.DELIVERY_LATEST_METHOD || "GET";
-    assert(
-      path &&
-        /^\/[a-z0-9_/-]+$/i.test(path) &&
-        ["GET", "POST"].includes(method),
-      "Latest-updates endpoint is unverified; configure it after provider confirmation.",
-      503,
-    );
-    return this.request(method, path);
+  async getPricing() {
+    const rows = await this.request("POST", "/tarification");
+    assert(Array.isArray(rows), "Unexpected Procolis pricing response", 502);
+    return rows;
   }
 }
 export const deliveryClient = new DeliveryClient();

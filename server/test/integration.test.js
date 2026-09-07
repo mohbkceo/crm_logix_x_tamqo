@@ -30,17 +30,40 @@ import {
 import { DeliveryAgency, DeliveryRate } from "../src/models/delivery.js";
 import { migrate } from "../src/migrate.js";
 import { P } from "../../shared/permissions.js";
+import { createServer } from "node:http";
+import { encryptCredentials } from "../src/services/delivery/credentials.js";
+import { providerFor } from "../src/services/delivery/deliveryProviderFactory.js";
 let replica, plan, product, source, wilaya, apiAgent;
 const request = () => apiAgent;
 before(
   async () => {
+    // Automatic order shipping must never use a developer's live credentials.
+    delete process.env.DELIVERY_API_TOKEN;
+    delete process.env.DELIVERY_API_KEY;
     replica = await MongoMemoryReplSet.create({
       replSet: { count: 1, storageEngine: "wiredTiger" },
     });
     await mongoose.connect(replica.getUri("test_workspace"));
     await Promise.all(Object.values(mongoose.models).map((m) => m.init()));
     await seed();
+    // Production seed now owns only Wilaya rates. Domain fixtures belong here.
+    await TamqoPlan.create([
+      { name: "3 Months", price: 4000, durationDays: 90 },
+      { name: "6 Months", price: 7000, durationDays: 180 },
+    ]);
+    await LogixProduct.create({ name: "20cm Plaque", price: 3500 });
+    await OrderSource.create({ name: "Messages", isDefault: true });
+    await ExpenseCategory.create([
+      { business: "LOGIX", name: "Materials" },
+      { business: "TAMQO", name: "Software" },
+    ]);
     await migrate();
+    const abex = await DeliveryAgency.findOne({ code: "ABEX" });
+    const testWilaya = await Wilaya.findOne({ agencyId: "16" });
+    await DeliveryRate.updateOne(
+      { agencyId: abex._id, wilayaId: testWilaya._id },
+      { homePrice: 500, deskPrice: 300 },
+    );
     const passwordHash = await bcrypt.hash("test-only-password", 4);
     await User.create({
       name: "Test Super Admin",
@@ -105,8 +128,8 @@ const expectOk = (r) => {
   assert.ok(r.status < 300, JSON.stringify(r.body));
   return r.body;
 };
-test("seeds exactly three Wilayas and one active default", async () => {
-  assert.equal(await Wilaya.countDocuments(), 3);
+test("seeds 58 Wilayas and fixtures provide one active default", async () => {
+  assert.equal(await Wilaya.countDocuments(), 58);
   assert.equal(
     await OrderSource.countDocuments({ active: true, isDefault: true }),
     1,
@@ -313,7 +336,7 @@ test("optimistic revisions reject stale editing and edits are audited", async ()
     "Test order",
   );
 });
-test("courier failure preserves the order, stores error, and prohibits duplicate creation", async () => {
+test("courier failure preserves the order and retries with lire only", async () => {
   const o = await createOrder(input());
   await transition(o._id, "CONFIRMED");
   let calls = 0;
@@ -329,7 +352,9 @@ test("courier failure preserves the order, stores error, and prohibits duplicate
   const s = await Shipment.findOne({ orderId: o._id });
   assert.equal(s.syncStatus, "ERROR");
   assert.equal(s.uncertain, true);
-  await assert.rejects(service.create(o._id), /already attempted/);
+  const retry = await service.create(o._id);
+  assert.equal(retry.syncStatus, "PENDING");
+  assert.equal(retry.uncertain, true);
   assert.equal(calls, 1);
 });
 test("missing credentials allow safe retry without an external creation attempt", async () => {
@@ -359,10 +384,18 @@ test("shipment tracking refresh updates mapped status once and retains unknown v
     ensureConfigured() {},
     async createPackages() {
       calls++;
-      return { Package: [{ Tracking: "AAA001", Status: providerStatus }] };
+      return {
+        Colis: [
+          { MessageRetour: "Good", Tracking: "AAA001", Statut: providerStatus },
+        ],
+      };
     },
     async readPackages() {
-      return { Package: [{ Tracking: "AAA001", Status: providerStatus }] };
+      return {
+        Colis: [
+          { MessageRetour: "Good", Tracking: "AAA001", Statut: providerStatus },
+        ],
+      };
     },
   };
   const service = new DeliverySyncService(client);
@@ -583,7 +616,7 @@ test("concurrent shipment creation sends exactly one external request", async ()
     async createPackages() {
       calls++;
       await new Promise((resolve) => setTimeout(resolve, 40));
-      return { Package: [{ Tracking: "CONCURRENT-1" }] };
+      return { Colis: [{ MessageRetour: "Good", Tracking: "CONCURRENT-1" }] };
     },
   });
   await Promise.allSettled([
@@ -605,10 +638,18 @@ test("provider forward jumps record only observed statuses and cannot reopen a t
     const service = new DeliverySyncService({
       ensureConfigured() {},
       async createPackages() {
-        return { Package: [{ Tracking: "FORWARD-1", Status: status }] };
+        return {
+          Colis: [
+            { MessageRetour: "Good", Tracking: "FORWARD-1", Statut: status },
+          ],
+        };
       },
       async readPackages() {
-        return { Package: [{ Tracking: "FORWARD-1", Status: status }] };
+        return {
+          Colis: [
+            { MessageRetour: "Good", Tracking: "FORWARD-1", Statut: status },
+          ],
+        };
       },
     });
     await service.create(order._id);
@@ -629,12 +670,13 @@ test("provider forward jumps record only observed statuses and cannot reopen a t
     delete process.env.DELIVERY_STATUS_MAP;
   }
 });
-test("ready calls require tracking and verify the returned mapped status", async () => {
+test("ready calls only pret and transitions the prepared order", async () => {
   const order = await createOrder(input());
   await transition(order._id, "CONFIRMED");
   await transition(order._id, "PREPARING");
   let readyCalls = 0,
-    providerStatus = "preparing";
+    providerStatus = "preparing",
+    readCalls = 0;
   process.env.DELIVERY_STATUS_MAP = JSON.stringify({
     preparing: "PREPARING",
     ready: "READY_TO_SHIP",
@@ -643,19 +685,38 @@ test("ready calls require tracking and verify the returned mapped status", async
     const service = new DeliverySyncService({
       ensureConfigured() {},
       async createPackages() {
-        return { Package: [{ Tracking: "READY-1", Status: providerStatus }] };
+        return {
+          Colis: [
+            {
+              MessageRetour: "Good",
+              Tracking: "READY-1",
+              Statut: providerStatus,
+            },
+          ],
+        };
       },
       async readPackages() {
-        return { Package: [{ Tracking: "READY-1", Status: providerStatus }] };
+        readCalls++;
+        return {
+          Colis: [
+            {
+              MessageRetour: "Good",
+              Tracking: "READY-1",
+              Statut: providerStatus,
+            },
+          ],
+        };
       },
       async readyPackages() {
         readyCalls++;
         providerStatus = "ready";
+        return { Colis: [{ Tracking: "READY-1", MessageRetour: "Good" }] };
       },
     });
     await service.create(order._id);
     await service.ready(order._id);
     assert.equal(readyCalls, 1);
+    assert.equal(readCalls, 0);
     assert.equal((await Order.findById(order._id)).status, "READY_TO_SHIP");
   } finally {
     delete process.env.DELIVERY_STATUS_MAP;
@@ -1061,4 +1122,402 @@ test("customer updates require permission and preserve order snapshots", async (
   const historical = await Order.findById(order._id);
   assert.equal(historical.customer.name, "Test Customer");
   assert.equal(historical.customer.normalizedPhone, "+213550123456");
+});
+
+// Real HTTP boundary with per-agency encrypted credentials, never live ABEX.
+async function courierFixture(
+  t,
+  reply,
+  { manual = false, enabled = true, timeout = 1000 } = {},
+) {
+  const previousKey = process.env.DELIVERY_CREDENTIALS_ENCRYPTION_KEY;
+  const previousTimeout = process.env.DELIVERY_TIMEOUT_MS;
+  process.env.DELIVERY_CREDENTIALS_ENCRYPTION_KEY = "a1".repeat(32);
+  process.env.DELIVERY_TIMEOUT_MS = String(timeout);
+  const calls = [];
+  const server = createServer(async (req, res) => {
+    let text = "";
+    for await (const chunk of req) text += chunk;
+    const body = text ? JSON.parse(text) : null;
+    const committed = body?.Colis?.[0]?.id_Externe
+      ? await Order.findOne({ orderNumber: body.Colis[0].id_Externe }).lean()
+      : null;
+    calls.push({
+      method: req.method,
+      url: req.url,
+      headers: req.headers,
+      body,
+      committed,
+    });
+    reply(req, res, calls.length, body);
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const agency = await DeliveryAgency.create({
+    name: "HTTP test courier",
+    code: "HTTP_TEST",
+    businesses: ["LOGIX", "TAMQO"],
+    integrationType: manual ? "MANUAL" : "API",
+    apiProvider: manual ? "MANUAL" : "PROCOLIS",
+    capabilities: {
+      createShipment: enabled,
+      tracking: true,
+      readyToShip: true,
+      pricing: true,
+    },
+    config: { baseUrl: `http://127.0.0.1:${server.address().port}` },
+    encryptedCredentials: manual
+      ? undefined
+      : encryptCredentials({
+          token: "agency-token-private",
+          key: "agency-key-private",
+        }),
+    credentialsConfigured: !manual,
+  });
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise((resolve) => server.close(resolve));
+    await DeliveryAgency.deleteOne({ _id: agency._id });
+    if (previousKey === undefined)
+      delete process.env.DELIVERY_CREDENTIALS_ENCRYPTION_KEY;
+    else process.env.DELIVERY_CREDENTIALS_ENCRYPTION_KEY = previousKey;
+    if (previousTimeout === undefined) delete process.env.DELIVERY_TIMEOUT_MS;
+    else process.env.DELIVERY_TIMEOUT_MS = previousTimeout;
+  });
+  return {
+    agency,
+    calls,
+    input: input("LOGIX_ONLY", {
+      delivery: { agencyId: String(agency._id), type: "HOME", exchange: false },
+      deliveryCharged: 500,
+    }),
+  };
+}
+function jsonReply(res, status, body) {
+  res.writeHead(status, { "Content-Type": "application/json" });
+  res.end(JSON.stringify(body));
+}
+
+test("API order automatically creates one unconfirmed parcel after local commit", async (t) => {
+  const f = await courierFixture(t, (_req, res) =>
+    jsonReply(res, 200, {
+      Colis: [{ Tracking: "AUTO-001", MessageRetour: "Good" }],
+      metadata: { token: "private" },
+    }),
+  );
+  const response = await apiAgent.post("/api/orders").send(f.input);
+  assert.equal(response.status, 201);
+  const o = response.body,
+    s = await Shipment.findOne({ orderId: o._id });
+  assert.equal(o.status, "NEW");
+  assert.equal(o.shipment.tracking, "AUTO-001");
+  assert.equal(o.shipmentSync.success, true);
+  assert.equal(s.syncStatus, "SYNCED");
+  assert.equal(s.uncertain, false);
+  assert.equal(s.providerAccepted, true);
+  assert.deepEqual(s.sanitizedProviderData, {
+    Colis: [{ Tracking: "AUTO-001", MessageRetour: "Good" }],
+    metadata: {},
+  });
+  assert.equal(f.calls.length, 1);
+  const call = f.calls[0],
+    parcel = call.body.Colis[0];
+  assert.equal(call.method, "POST");
+  assert.equal(call.url, "/add_colis");
+  assert.equal(call.headers.token, "agency-token-private");
+  assert.equal(call.headers.key, "agency-key-private");
+  assert.match(call.headers["content-type"], /^application\/json/);
+  assert.equal(String(call.committed._id), o._id);
+  assert.equal(call.committed.status, "NEW");
+  assert.equal(parcel.Confrimee, "0");
+  assert.equal(parcel.IDWilaya, "16");
+  assert.equal(parcel.Total, "7500");
+  assert.equal(parcel.id_Externe, o.orderNumber);
+  assert.equal(parcel.Tracking, o.orderNumber);
+  assert.equal(call.headers.authorization, undefined);
+  assert.equal("Package" in call.body, false);
+  assert.equal(o.revision, (await Order.findById(o._id)).revision);
+  expectOk(await apiAgent.post(`/api/orders/${o._id}/shipment`));
+  assert.equal(f.calls.length, 1);
+  assert.equal(
+    (
+      await apiAgent
+        .patch(`/api/orders/${o._id}`)
+        .send({ ...f.input, revision: o.revision })
+    ).status,
+    409,
+  );
+  assert.equal(
+    (await apiAgent.post(`/api/orders/${o._id}/cancel`).send({})).status,
+    409,
+  );
+});
+
+test("manual and capability-disabled agencies do not automatically send parcels", async (t) => {
+  const f = await courierFixture(t, (_req, res) => jsonReply(res, 500, {}), {
+    manual: true,
+  });
+  let o = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  assert.equal(o.shipment, null);
+  assert.equal(o.shipmentSync.attempted, false);
+  assert.equal(await (await providerFor(f.agency._id)).testCredentials(), true);
+  expectOk(await apiAgent.post(`/api/orders/${o._id}/confirm`));
+  assert.equal(
+    expectOk(await apiAgent.post(`/api/orders/${o._id}/shipment`).send({}))
+      .provider,
+    "MANUAL",
+  );
+  await DeliveryAgency.updateOne(
+    { _id: f.agency._id },
+    {
+      integrationType: "API",
+      apiProvider: "PROCOLIS",
+      "capabilities.createShipment": false,
+    },
+  );
+  o = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  assert.equal(o.shipment, null);
+  assert.equal(f.calls.length, 0);
+});
+
+test("unknown success is pending and retries only read deterministic tracking", async (t) => {
+  const f = await courierFixture(t, (req, res, _n, body) =>
+    jsonReply(
+      res,
+      200,
+      req.url === "/add_colis"
+        ? { result: "received agency-token-private" }
+        : { Colis: [{ Tracking: body.Colis[0].Tracking, Statut: "unknown" }] },
+    ),
+  );
+  const o = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  assert.equal(o.shipment.syncStatus, "PENDING");
+  assert.equal(o.shipment.providerAccepted, false);
+  const linked = expectOk(
+    await apiAgent.post("/api/orders/" + o._id + "/shipment"),
+  );
+  assert.equal(linked.tracking, o.orderNumber);
+  assert.equal(linked.uncertain, false);
+  assert.equal(linked.syncStatus, "SYNCED");
+  assert.deepEqual(
+    f.calls.map((c) => c.url),
+    ["/add_colis", "/lire"],
+  );
+  assert.deepEqual(f.calls[1].body, { Colis: [{ Tracking: o.orderNumber }] });
+  assert.equal(await Order.countDocuments(), 1);
+});
+
+for (const status of [400, 401, 500])
+  test(`HTTP ${status} preserves order and sanitized provider diagnostics`, async (t) => {
+    const f = await courierFixture(t, (_req, res) =>
+      jsonReply(res, status, {
+        message: "Invalid parcel agency-token-private agency-key-private",
+        token: "secret",
+        cookies: "secret",
+      }),
+    );
+    const response = await apiAgent.post("/api/orders").send(f.input);
+    assert.equal(response.status, 201);
+    const o = response.body,
+      s = await Shipment.findOne({ orderId: o._id });
+    assert.equal(await Order.countDocuments(), 1);
+    assert.equal(o.shipmentSync.success, false);
+    assert.equal(s.syncStatus, "ERROR");
+    assert.equal(s.providerAccepted, false);
+    assert.match(s.lastError, /Invalid parcel/);
+    assert.equal(s.sanitizedProviderData.status, status);
+    assert.equal(s.sanitizedProviderData.endpoint, "/add_colis");
+    assert.equal(JSON.stringify(s).includes("private"), false);
+    assert.equal(JSON.stringify(s).includes("secret"), false);
+    assert.equal(
+      (await apiAgent.post(`/api/orders/${o._id}/shipment`)).status,
+      200,
+    );
+    assert.equal(f.calls.length, 2);
+    assert.equal(f.calls[1].url, "/lire");
+  });
+
+test("HTTP timeout keeps one recoverable order and retries with lire", async (t) => {
+  const f = await courierFixture(t, () => {}, { timeout: 100 });
+  const response = await apiAgent.post("/api/orders").send(f.input);
+  assert.equal(response.status, 201);
+  const o = response.body;
+  assert.equal(await Order.countDocuments(), 1);
+  assert.equal(o.shipment.syncStatus, "ERROR");
+  assert.equal(o.shipment.uncertain, true);
+  assert.match(o.shipment.lastError, /timed out/);
+  assert.equal(
+    (await apiAgent.post(`/api/orders/${o._id}/shipment`)).status,
+    200,
+  );
+  assert.equal(f.calls.length, 2);
+  assert.equal(f.calls[1].url, "/lire");
+});
+
+test("credential test uses GET token with agency headers and validates activated Statut", async (t) => {
+  const f = await courierFixture(t, (_req, res) =>
+    jsonReply(res, 200, { Statut: "Acc\u00e8s activ\u00e9" }),
+  );
+  expectOk(await apiAgent.post(`/api/delivery-agencies/${f.agency._id}/test`));
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].method, "GET");
+  assert.equal(f.calls[0].url, "/token");
+  assert.equal(f.calls[0].headers.token, "agency-token-private");
+  assert.equal(f.calls[0].headers.key, "agency-key-private");
+});
+
+test("credential test rejects an explicit non-activated HTTP 200 response", async (t) => {
+  const f = await courierFixture(t, (_req, res) =>
+    jsonReply(res, 200, { Statut: "Acc\u00e8s refus\u00e9" }),
+  );
+  const response = await apiAgent.post(
+    `/api/delivery-agencies/${f.agency._id}/test`,
+  );
+  assert.equal(response.status, 422);
+  assert.equal(f.calls.length, 1);
+  assert.equal(f.calls[0].url, "/token");
+});
+
+test("Double Tracking reconciles with lire and never repeats add_colis", async (t) => {
+  const f = await courierFixture(t, (req, res, _n, body) =>
+    jsonReply(
+      res,
+      200,
+      req.url === "/add_colis"
+        ? {
+            Colis: [
+              {
+                Tracking: body.Colis[0].Tracking,
+                MessageRetour: "Double Tracking",
+              },
+            ],
+          }
+        : {
+            Colis: [
+              {
+                Tracking: body.Colis[0].Tracking,
+                Statut: "existing",
+              },
+            ],
+          },
+    ),
+  );
+  const order = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  assert.equal(order.shipment.syncStatus, "SYNCED");
+  assert.equal(order.shipment.uncertain, false);
+  assert.equal(order.shipment.tracking, order.orderNumber);
+  assert.equal(order.shipment.messageRetour, "Double Tracking");
+  assert.deepEqual(
+    f.calls.map((call) => call.url),
+    ["/add_colis", "/lire"],
+  );
+  assert.equal(f.calls.filter((call) => call.url === "/add_colis").length, 1);
+  assert.deepEqual(f.calls[1].body, {
+    Colis: [{ Tracking: order.orderNumber }],
+  });
+});
+
+test("explicit provider rejection on HTTP success remains a recoverable error", async (t) => {
+  const f = await courierFixture(t, (_req, res) =>
+    jsonReply(res, 200, {
+      Colis: [{ MessageRetour: "Some provider error" }],
+    }),
+  );
+  const o = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  const shipment = await Shipment.findOne({ orderId: o._id }).lean();
+  assert.equal(shipment.syncStatus, "ERROR");
+  assert.equal(shipment.providerAccepted, false);
+  assert.equal(shipment.lastError, "Some provider error");
+  assert.equal(shipment.sanitizedProviderData.status, 200);
+  assert.equal(shipment.sanitizedProviderData.statusText, "OK");
+  assert.equal(
+    shipment.sanitizedProviderData.body.Colis[0].MessageRetour,
+    "Some provider error",
+  );
+  assert.equal(
+    (await apiAgent.post(`/api/orders/${o._id}/shipment`)).status,
+    409,
+  );
+  assert.equal(f.calls.length, 1);
+});
+
+test("uncertain parcel can be linked with documented tracking lookup and then refreshed", async (t) => {
+  let externalId;
+  const f = await courierFixture(t, (req, res) =>
+    jsonReply(
+      res,
+      200,
+      req.url === "/add_colis"
+        ? { received: true }
+        : { Colis: [{ Tracking: "LINK-001", id_Externe: externalId }] },
+    ),
+  );
+  const o = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  externalId = "WRONG-ORDER";
+  assert.equal(
+    (
+      await apiAgent
+        .post(`/api/orders/${o._id}/shipment/reconcile`)
+        .send({ tracking: "LINK-001" })
+    ).status,
+    409,
+  );
+  externalId = o.orderNumber;
+  const linked = expectOk(
+    await apiAgent
+      .post(`/api/orders/${o._id}/shipment/reconcile`)
+      .send({ tracking: "LINK-001" }),
+  );
+  assert.equal(linked.tracking, "LINK-001");
+  assert.equal(linked.uncertain, false);
+  assert.equal(linked.syncStatus, "SYNCED");
+  expectOk(await apiAgent.post(`/api/orders/${o._id}/shipment/refresh`));
+  assert.equal(f.calls.filter((c) => c.url === "/add_colis").length, 1);
+  assert.ok(f.calls.slice(1).every((c) => c.url === "/lire"));
+});
+
+test("stale tracking reconciliation cannot replace a new in-flight reservation", async () => {
+  const o = await createOrder(input());
+  let releaseLookup,
+    lookupStarted,
+    releaseCreate,
+    createStarted,
+    calls = 0;
+  const lookupReady = new Promise((resolve) => {
+    lookupStarted = resolve;
+  });
+  const createReady = new Promise((resolve) => {
+    createStarted = resolve;
+  });
+  const service = new DeliverySyncService({
+    ensureConfigured() {},
+    async createPackages() {
+      calls++;
+      if (calls === 1) return {};
+      createStarted();
+      return new Promise((resolve) => {
+        releaseCreate = resolve;
+      });
+    },
+    async readPackages() {
+      lookupStarted();
+      return new Promise((resolve) => {
+        releaseLookup = resolve;
+      });
+    },
+  });
+  await service.create(o._id);
+  const lookup = service.reconcile(o._id, "OLD-TRACKING");
+  await lookupReady;
+  await service.reconcile(o._id, undefined, true);
+  const retry = service.create(o._id);
+  await createReady;
+  releaseLookup({ Tracking: "OLD-TRACKING" });
+  await assert.rejects(lookup, /Shipment changed/);
+  await assert.rejects(
+    service.reconcile(o._id, undefined, true),
+    /still in progress/,
+  );
+  releaseCreate({ Tracking: "CURRENT-TRACKING", MessageRetour: "Good" });
+  assert.equal((await retry).tracking, "CURRENT-TRACKING");
+  assert.equal(calls, 2);
 });
