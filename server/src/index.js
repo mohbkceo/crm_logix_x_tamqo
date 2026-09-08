@@ -11,7 +11,7 @@ const server = app.listen(config.port, "0.0.0.0", () =>
 );
 let timer,
   busy = false;
-const interval = Number(process.env.DELIVERY_SYNC_INTERVAL_MS || 0);
+const interval = Number(process.env.DELIVERY_SYNC_INTERVAL_MS || 60000);
 if (interval >= 60000)
   timer = setInterval(async () => {
     if (busy) return;
