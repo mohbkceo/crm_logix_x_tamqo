@@ -1,8 +1,8 @@
-import { P, can, analyticsScope } from "../authorization.js";
-import { Order, Expense } from "../models/index.js";
+import { P, can, analyticsScope, saleScope } from "../authorization.js";
+import { Order, Expense, Sale } from "../models/index.js";
 import { round } from "../domain/order.js";
 import { dateKey, reportingRange, dayStart } from "../domain/period.js";
-import { orderFilter } from "./filters.js";
+import { objectId, orderFilter } from "./filters.js";
 export const ratio = (a, b) => (b ? round((a / b) * 100) : 0);
 export const average = (values) =>
   values.length ? round(values.reduce((s, x) => s + x, 0) / values.length) : 0;
@@ -224,6 +224,30 @@ export function summarize(orders, scope) {
     ),
   };
 }
+const scopedSales = (sales, scope) =>
+  scope === "PARTNERSHIP"
+    ? []
+    : sales.filter(
+        (sale) =>
+          !["TAMQO", "LOGIX"].includes(scope) || sale.business === scope,
+      );
+function addDirectSales(metrics, sales, scope) {
+  const rows = scopedSales(sales, scope),
+    revenue = sum(rows, (sale) => sale.amount),
+    units = sum(rows, (sale) => sale.quantity);
+  Object.assign(metrics, {
+    directSalesCount: rows.length,
+    directSalesRevenue: revenue,
+    directSalesUnits: units,
+    grossSales: round(metrics.grossSales + revenue),
+    netSales: round(metrics.netSales + revenue),
+    revenue: round(metrics.revenue + revenue),
+    totalUnitsSold: metrics.totalUnitsSold + units,
+  });
+  return metrics;
+}
+export const summarizePerformance = (orders, sales, scope) =>
+  addDirectSales(summarize(orders, scope), sales, scope);
 function group(orders, scope, key) {
   const groups = new Map();
   for (const o of orders) {
@@ -235,9 +259,44 @@ function group(orders, scope, key) {
     .map(([name, rows]) => ({ name, ...summarize(rows, scope) }))
     .sort((a, b) => b.netSales - a.netSales || b.totalOrders - a.totalOrders);
 }
-export function buildReport(orders, previous, history, scope, range) {
-  const metrics = summarize(orders, scope),
-    prior = summarize(previous, scope);
+function performanceGroup(orders, sales, scope, orderKey, saleKey = orderKey) {
+  const groups = new Map();
+  for (const order of orders) {
+    const name = orderKey(order),
+      row = groups.get(name) || { orders: [], sales: [] };
+    row.orders.push(order);
+    groups.set(name, row);
+  }
+  for (const sale of scopedSales(sales, scope)) {
+    const name = saleKey(sale),
+      row = groups.get(name) || { orders: [], sales: [] };
+    row.sales.push(sale);
+    groups.set(name, row);
+  }
+  return [...groups]
+    .map(([name, rows]) => ({
+      name,
+      ...summarizePerformance(rows.orders, rows.sales, scope),
+    }))
+    .sort(
+      (a, b) =>
+        b.netSales - a.netSales ||
+        b.totalOrders - a.totalOrders ||
+        b.directSalesCount - a.directSalesCount,
+    );
+}
+export function buildReport(
+  orders,
+  previous,
+  history,
+  scope,
+  range,
+  sales = [],
+  previousSales = [],
+) {
+  const metrics = summarizePerformance(orders, sales, scope),
+    prior = summarizePerformance(previous, previousSales, scope),
+    orderMetrics = summarize(orders, scope);
   const customerGroups = new Map(),
     selectedCustomers = new Map();
   for (const order of orders) {
@@ -294,7 +353,7 @@ export function buildReport(orders, previous, history, scope, range) {
       ? round(metrics.totalOrders / metrics.totalCustomers)
       : 0,
     revenuePerCustomer: metrics.totalCustomers
-      ? round(metrics.netSales / metrics.totalCustomers)
+      ? round(orderMetrics.netSales / metrics.totalCustomers)
       : 0,
     customerLifetimeRevenue: round(
       topCustomers.reduce((s, c) => s + c.customerLifetimeRevenue, 0),
@@ -327,6 +386,18 @@ export function buildReport(orders, previous, history, scope, range) {
       p.units += i.quantity;
       products.set(key, p);
     }
+  for (const sale of scopedSales(sales, scope)) {
+    const key = String(sale.catalogItemId) + "|" + sale.itemName;
+    const product = products.get(key) || {
+      name: sale.itemName,
+      business: sale.business,
+      revenue: 0,
+      units: 0,
+    };
+    product.revenue = round(product.revenue + sale.amount);
+    product.units += sale.quantity;
+    products.set(key, product);
+  }
   const productRows = [...products.values()]
     .map((p) => ({
       ...p,
@@ -372,21 +443,33 @@ export function buildReport(orders, previous, history, scope, range) {
     range,
     metrics,
     previousMetrics: prior,
-    trend: group(orders, scope, (o) => dateKey(o.createdAt)).sort((a, b) =>
-      a.name.localeCompare(b.name),
-    ),
+    trend: performanceGroup(
+      orders,
+      sales,
+      scope,
+      (order) => dateKey(order.createdAt),
+      (sale) => dateKey(sale.saleDate),
+    ).sort((a, b) => a.name.localeCompare(b.name)),
     sources,
     wilayas,
     communes,
     products: productRows,
-    employees: group(orders, scope, (o) =>
-      String(o.createdBy?.userId || "legacy"),
+    employees: performanceGroup(
+      orders,
+      sales,
+      scope,
+      (order) => String(order.createdBy?.userId || "legacy"),
+      (sale) => String(sale.createdBy?.userId || "legacy"),
     ).map((row) => ({
       ...row,
       userId: row.name,
       name:
         orders.find((o) => String(o.createdBy?.userId || "legacy") === row.name)
-          ?.createdBy?.name || "Legacy / Unknown",
+          ?.createdBy?.name ||
+        sales.find(
+          (sale) => String(sale.createdBy?.userId || "legacy") === row.name,
+        )?.createdBy?.name ||
+        "Legacy / Unknown",
     })),
     agencies: group(orders, scope, (o) =>
       String(o.delivery.agencyId || "legacy"),
@@ -406,12 +489,12 @@ export function buildReport(orders, previous, history, scope, range) {
       currency: "DZD",
       timeZone: "Africa/Algiers",
       grossSales:
-        "Product value of orders that reached CONFIRMED, excluding cancelled orders. Returns remain in gross sales.",
+        "Product value of orders that reached CONFIRMED, excluding cancelled orders, plus direct sales. Returns remain in gross sales.",
       netSales:
-        "Delivered physical orders; confirmed Tamqo-only orders activated, delivered or paid for products. Cancelled, returning and returned orders excluded.",
+        "Realized order product revenue plus direct sales. Cancelled, returning and returned orders are excluded.",
       averageOrderValue:
         "Product value of all selected orders / selected order count.",
-      totalUnitsSold: "Units on realized orders.",
+      totalUnitsSold: "Units on realized orders plus direct-sale quantities.",
       deliverySuccessRate:
         "Delivered orders / orders that reached SHIPPED (at least the delivered count).",
       customerLifetimeRevenue:
@@ -427,14 +510,51 @@ export function buildReport(orders, previous, history, scope, range) {
     },
   };
 }
+export function directSaleFilter(query, scope, user) {
+  const ownAnalytics =
+      user &&
+      !can(user, P.analytics.viewBusiness) &&
+      !can(user, P.analytics.viewGlobal),
+    filter = user ? saleScope(user, ownAnalytics) : {};
+  if (["TAMQO", "LOGIX"].includes(scope)) filter.business = scope;
+  if (scope === "PARTNERSHIP") filter._id = { $exists: false };
+  if (query.employee) {
+    const employeeId = objectId(query.employee);
+    if (
+      filter["createdBy.userId"] &&
+      String(filter["createdBy.userId"]) !== String(employeeId)
+    )
+      filter._id = { $exists: false };
+    else filter["createdBy.userId"] = employeeId;
+  }
+  if (query.catalog) filter.catalogItemId = objectId(query.catalog);
+  if (
+    [
+      "business",
+      "status",
+      "payment",
+      "deliveryType",
+      "source",
+      "wilaya",
+      "commune",
+      "phone",
+      "customer",
+      "customerId",
+      "search",
+    ].some((key) => query[key])
+  )
+    filter._id = { $exists: false };
+  return filter;
+}
 export async function analytics(query, scope = "ALL", user) {
   const range = reportingRange(query),
     filter = orderFilter({ ...query, period: undefined });
   if (scope === "PARTNERSHIP") filter.businessType = "PARTNERSHIP";
   else if (["TAMQO", "LOGIX"].includes(scope)) filter["items.business"] = scope;
   if (user) filter.$and = [...(filter.$and || []), analyticsScope(user, scope)];
-  const projection = { originalData: 0, __v: 0, note: 0 };
-  const [orders, previous] = await Promise.all([
+  const projection = { originalData: 0, __v: 0, note: 0 },
+    directFilter = directSaleFilter(query, scope, user);
+  const [orders, previous, sales, previousSales] = await Promise.all([
     Order.find(
       { ...filter, createdAt: { $gte: range.start, $lt: range.end } },
       projection,
@@ -446,6 +566,14 @@ export async function analytics(query, scope = "ALL", user) {
       },
       projection,
     ).lean(),
+    Sale.find({
+      ...directFilter,
+      saleDate: { $gte: range.start, $lt: range.end },
+    }).lean(),
+    Sale.find({
+      ...directFilter,
+      saleDate: { $gte: range.previousStart, $lt: range.previousEnd },
+    }).lean(),
   ]);
   const ids = [...new Set(orders.map((o) => String(o.customerId)))];
   const history = ids.length
@@ -463,7 +591,15 @@ export async function analytics(query, scope = "ALL", user) {
         projection,
       ).lean()
     : [];
-  const result = buildReport(orders, previous, history, scope, range);
+  const result = buildReport(
+    orders,
+    previous,
+    history,
+    scope,
+    range,
+    sales,
+    previousSales,
+  );
   if (
     ["TAMQO", "LOGIX"].includes(scope) &&
     (!user ||

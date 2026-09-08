@@ -238,6 +238,28 @@ export const Expense = create(
     [{ paymentMethod: 1 }, {}],
   ],
 );
+export const Sale = create(
+  "Sale",
+  {
+    fullName: { type: String, required: true, trim: true },
+    phoneNumber: { type: String, required: true, trim: true },
+    address: { type: String, default: "", trim: true },
+    amount: money,
+    quantity: { type: Number, required: true, min: 1, default: 1 },
+    business: { type: String, enum: BUSINESS, required: true },
+    catalogItemId: { type: Schema.Types.ObjectId, required: true },
+    itemName: { type: String, required: true },
+    saleDate: { type: Date, default: Date.now },
+    createdBy: { type: actorSchema, immutable: true },
+    updatedBy: actorSchema,
+  },
+  [
+    [{ business: 1, saleDate: -1, _id: -1 }, {}],
+    [{ "createdBy.userId": 1, saleDate: -1, _id: -1 }, {}],
+    [{ catalogItemId: 1, saleDate: -1 }, {}],
+    [{ phoneNumber: 1, saleDate: -1 }, {}],
+  ],
+);
 export const Counter = mongoose.model(
   "Counter",
   new Schema({ _id: String, value: { type: Number, default: 0 } }),

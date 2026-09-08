@@ -16,6 +16,7 @@ import {
   Wilaya,
   Expense,
   ExpenseCategory,
+  Sale,
 } from "../src/models/index.js";
 import { createOrder, transition } from "../src/services/orderService.js";
 import { DeliverySyncService } from "../src/services/delivery/deliverySyncService.js";
@@ -92,7 +93,7 @@ after(async () => {
   await replica?.stop();
 });
 beforeEach(async () => {
-  for (const Model of [Order, OrderEvent, Shipment, Customer, Expense])
+  for (const Model of [Order, OrderEvent, Shipment, Customer, Expense, Sale])
     await Model.deleteMany({});
 });
 function input(kind = "PARTNERSHIP", overrides = {}) {
@@ -535,6 +536,303 @@ test("expense CRUD, filters, pagination and business isolation leave revenue unt
   );
   assert.equal(
     (await request(app).delete("/api/expenses/" + expense._id)).status,
+    204,
+  );
+});
+test("direct sale CRUD snapshots catalog names and never creates fulfillment records", async () => {
+  const snapshotProduct = await LogixProduct.create({
+      name: "Snapshot Plaque",
+      price: 2500,
+    }),
+    actor = await User.findOne({ email: "qa@example.com" }),
+    today = new Date(Date.now() + 3600000).toISOString().slice(0, 10),
+    created = expectOk(
+      await request(app)
+        .post("/api/sales")
+        .send({
+          fullName: "Direct Customer",
+          phoneNumber: "0559000000",
+          amount: 5000,
+          business: "LOGIX",
+          catalogItemId: String(snapshotProduct._id),
+          createdBy: {
+            userId: new mongoose.Types.ObjectId(),
+            name: "Impostor",
+          },
+        }),
+    );
+  assert.equal(created.quantity, 1);
+  assert.equal(created.address, "");
+  assert.equal(created.itemName, "Snapshot Plaque");
+  assert.equal(created.createdBy.userId, String(actor._id));
+  assert.equal(created.createdBy.name, actor.name);
+  assert.equal(
+    new Date(created.saleDate).toISOString().slice(0, 10),
+    new Date(today + "T00:00:00+01:00").toISOString().slice(0, 10),
+  );
+  assert.equal(await Order.countDocuments(), 0);
+  assert.equal(await OrderEvent.countDocuments(), 0);
+  assert.equal(await Shipment.countDocuments(), 0);
+
+  const filtered = expectOk(
+    await request(app).get(
+      `/api/sales?business=LOGIX&period=today&search=0559&addedBy=${actor._id}&limit=1`,
+    ),
+  );
+  assert.equal(filtered.total, 1);
+  assert.equal(filtered.items[0]._id, created._id);
+  assert.equal(filtered.page, 1);
+  assert.equal(filtered.limit, 1);
+
+  snapshotProduct.name = "Renamed Plaque";
+  await snapshotProduct.save();
+  const updated = expectOk(
+    await request(app)
+      .patch(`/api/sales/${created._id}`)
+      .send({ amount: 5500 }),
+  );
+  assert.equal(updated.itemName, "Snapshot Plaque");
+  assert.equal(updated.amount, 5500);
+  assert.equal(
+    (
+      await request(app)
+        .patch(`/api/sales/${created._id}`)
+        .send({
+          business: "LOGIX",
+          catalogItemId: String(plan._id),
+        })
+    ).status,
+    400,
+  );
+  const moved = expectOk(
+    await request(app)
+      .patch(`/api/sales/${created._id}`)
+      .send({
+        business: "TAMQO",
+        catalogItemId: String(plan._id),
+      }),
+  );
+  assert.equal(moved.business, "TAMQO");
+  assert.equal(moved.itemName, plan.name);
+
+  assert.equal(
+    (await request(app).delete(`/api/sales/${created._id}`)).status,
+    204,
+  );
+  assert.equal(await Sale.countDocuments(), 0);
+  assert.deepEqual(
+    (
+      await AuditLog.find({ resourceType: "Sale", resourceId: created._id })
+        .sort({ createdAt: 1 })
+        .lean()
+    ).map((entry) => entry.action),
+    ["SALE_CREATED", "SALE_UPDATED", "SALE_UPDATED", "SALE_DELETED"],
+  );
+});
+
+test("direct sales contribute only to revenue, sold units, catalog and employee analytics", async () => {
+  expectOk(
+    await request(app)
+      .post("/api/sales")
+      .send({
+        fullName: "Logix Direct",
+        phoneNumber: "0559111111",
+        amount: 5000,
+        quantity: 2,
+        business: "LOGIX",
+        catalogItemId: String(product._id),
+      }),
+  );
+  expectOk(
+    await request(app)
+      .post("/api/sales")
+      .send({
+        fullName: "Tamqo Direct",
+        phoneNumber: "0559222222",
+        amount: 4000,
+        business: "TAMQO",
+        catalogItemId: String(plan._id),
+      }),
+  );
+  const all = expectOk(
+    await request(app).get("/api/analytics/all?period=today"),
+  );
+  assert.equal(all.metrics.totalOrders, 0);
+  assert.equal(all.metrics.confirmedOrders, 0);
+  assert.equal(all.metrics.deliveredOrders, 0);
+  assert.equal(all.metrics.grossSales, 9000);
+  assert.equal(all.metrics.netSales, 9000);
+  assert.equal(all.metrics.totalUnitsSold, 3);
+  assert.equal(all.metrics.totalUnitsOrdered, 0);
+  assert.equal(all.metrics.directSalesCount, 2);
+  assert.equal(all.metrics.directSalesRevenue, 9000);
+  assert.equal(all.metrics.directSalesUnits, 3);
+  assert.equal(all.metrics.deliverySuccessRate, 0);
+  assert.equal(all.metrics.totalDeliveryCharged, 0);
+  assert.deepEqual(all.agencies, []);
+  assert.deepEqual(all.delivery, []);
+  assert.equal(
+    all.products.find((row) => row.name === product.name).revenue,
+    5000,
+  );
+  assert.equal(all.products.find((row) => row.name === product.name).units, 2);
+  assert.equal(
+    all.products.find((row) => row.name === plan.name).revenue,
+    4000,
+  );
+  assert.equal(all.employees[0].netSales, 9000);
+  assert.equal(all.employees[0].totalOrders, 0);
+  assert.equal(all.employees[0].directSalesCount, 2);
+
+  const tamqo = expectOk(
+      await request(app).get("/api/analytics/tamqo?period=today"),
+    ),
+    partnership = expectOk(
+      await request(app).get("/api/analytics/partnership?period=today"),
+    ),
+    sourceFiltered = expectOk(
+      await request(app).get(
+        `/api/analytics/all?period=today&source=${source._id}`,
+      ),
+    );
+  assert.equal(tamqo.metrics.netSales, 4000);
+  assert.equal(tamqo.metrics.totalUnitsSold, 1);
+  assert.equal(partnership.metrics.netSales, 0);
+  assert.equal(partnership.metrics.totalUnitsSold, 0);
+  assert.equal(sourceFiltered.metrics.netSales, 0);
+
+  const team = expectOk(
+    await request(app).get("/api/analytics/employees?period=today&scope=ALL"),
+  );
+  assert.equal(team.items.length, 1);
+  assert.equal(team.items[0].metrics.netSales, 9000);
+  assert.equal(team.items[0].metrics.totalOrders, 0);
+  assert.equal(team.items[0].metrics.directSalesCount, 2);
+});
+
+test("direct sale own/all permissions and business access are enforced", async () => {
+  const ownUser = expectOk(
+      await apiAgent.post("/api/users").send({
+        name: "Own Sales Employee",
+        email: "own-sales@example.com",
+        password: "employee-password",
+        businessAccess: ["LOGIX"],
+        permissions: [
+          P.sales.viewOwn,
+          P.sales.create,
+          P.sales.updateOwn,
+          P.sales.deleteOwn,
+        ],
+      }),
+    ),
+    allUser = expectOk(
+      await apiAgent.post("/api/users").send({
+        name: "All Sales Employee",
+        email: "all-sales@example.com",
+        password: "employee-password",
+        businessAccess: ["LOGIX"],
+        permissions: [P.sales.viewAll, P.sales.updateAll, P.sales.deleteAll],
+      }),
+    ),
+    ownAgent = supertest.agent(app),
+    allAgent = supertest.agent(app);
+  expectOk(
+    await ownAgent.post("/api/auth/login").send({
+      email: ownUser.email,
+      password: "employee-password",
+    }),
+  );
+  expectOk(
+    await allAgent.post("/api/auth/login").send({
+      email: allUser.email,
+      password: "employee-password",
+    }),
+  );
+  assert.equal((await ownAgent.get("/api/config/products")).status, 200);
+  assert.equal((await ownAgent.get("/api/config/plans")).status, 403);
+
+  const otherSale = expectOk(
+      await apiAgent.post("/api/sales").send({
+        fullName: "Other Owner",
+        phoneNumber: "0559333333",
+        amount: 1000,
+        business: "LOGIX",
+        catalogItemId: String(product._id),
+      }),
+    ),
+    tamqoSale = expectOk(
+      await apiAgent.post("/api/sales").send({
+        fullName: "Tamqo Owner",
+        phoneNumber: "0559444444",
+        amount: 2000,
+        business: "TAMQO",
+        catalogItemId: String(plan._id),
+      }),
+    ),
+    ownSale = expectOk(
+      await ownAgent.post("/api/sales").send({
+        fullName: "Own Customer",
+        phoneNumber: "0559555555",
+        amount: 3000,
+        business: "LOGIX",
+        catalogItemId: String(product._id),
+        createdBy: { userId: allUser._id, name: allUser.name },
+      }),
+    );
+  assert.equal(ownSale.createdBy.userId, ownUser._id);
+  const ownList = expectOk(
+    await ownAgent.get("/api/sales?business=LOGIX&period=today"),
+  );
+  assert.equal(ownList.total, 1);
+  assert.equal(ownList.items[0]._id, ownSale._id);
+  assert.equal(
+    (
+      await ownAgent.get(
+        `/api/sales?business=LOGIX&period=today&addedBy=${otherSale.createdBy.userId}`,
+      )
+    ).body.total,
+    0,
+  );
+  assert.equal((await ownAgent.get(`/api/sales/${otherSale._id}`)).status, 403);
+  assert.equal(
+    (await ownAgent.patch(`/api/sales/${otherSale._id}`).send({ amount: 1 }))
+      .status,
+    403,
+  );
+  assert.equal(
+    (await ownAgent.delete(`/api/sales/${otherSale._id}`)).status,
+    403,
+  );
+  assert.equal(
+    (
+      await ownAgent.post("/api/sales").send({
+        fullName: "Forbidden Tamqo",
+        phoneNumber: "0559666666",
+        amount: 1000,
+        business: "TAMQO",
+        catalogItemId: String(plan._id),
+      })
+    ).status,
+    403,
+  );
+
+  expectOk(await allAgent.get(`/api/sales/${ownSale._id}`));
+  const updated = expectOk(
+    await allAgent.patch(`/api/sales/${ownSale._id}`).send({ amount: 3500 }),
+  );
+  assert.equal(updated.amount, 3500);
+  assert.equal(
+    (
+      await allAgent.patch(`/api/sales/${ownSale._id}`).send({
+        business: "TAMQO",
+        catalogItemId: String(plan._id),
+      })
+    ).status,
+    403,
+  );
+  assert.equal((await allAgent.get(`/api/sales/${tamqoSale._id}`)).status, 403);
+  assert.equal(
+    (await allAgent.delete(`/api/sales/${ownSale._id}`)).status,
     204,
   );
 });

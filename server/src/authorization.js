@@ -51,17 +51,32 @@ export function orderScope(user, own = false) {
 }
 export function requireOwnOrAll(
   user,
-  order,
+  resource,
   own = P.orders.updateOwn,
   all = P.orders.updateAll,
+  businesses = orderBusinesses(resource),
+  message = "Order access denied",
 ) {
-  requireBusinesses(user, orderBusinesses(order));
+  requireBusinesses(user, businesses);
   assert(
     can(user, all) ||
-      (can(user, own) && String(order.createdBy?.userId) === String(user._id)),
-    "Order access denied",
+      (can(user, own) &&
+        String(resource.createdBy?.userId) === String(user._id)),
+    message,
     403,
   );
+}
+export function ownOrAllScope(user, own, all, message = "Access denied") {
+  assert(can(user, own) || can(user, all), message, 403);
+  return can(user, all) ? {} : { "createdBy.userId": user._id };
+}
+export function saleScope(user, own = false) {
+  const allowed =
+    user.role === "SUPER_ADMIN" ? BUSINESSES : user.businessAccess;
+  return {
+    business: { $in: allowed },
+    ...(own ? { "createdBy.userId": user._id } : {}),
+  };
 }
 export function analyticsScope(user, scope = "ALL") {
   assert(
