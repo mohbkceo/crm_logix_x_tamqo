@@ -4,7 +4,7 @@ import { pathToFileURL } from "node:url";
 import { config } from "./config.js";
 import { User, RegistrationSetting } from "./models/security.js";
 import { DeliveryAgency, DeliveryRate } from "./models/delivery.js";
-import { Order, Shipment, Wilaya, Expense } from "./models/index.js";
+import { Order, Shipment, Wilaya, Expense, Sale } from "./models/index.js";
 import { encryptCredentials } from "./services/delivery/credentials.js";
 export async function bootstrap() {
   const email = (
@@ -39,7 +39,12 @@ export async function bootstrap() {
   });
 }
 export async function migrate() {
-  await Promise.all([DeliveryAgency.init(), DeliveryRate.init(), User.init()]);
+  await Promise.all([
+    DeliveryAgency.init(),
+    DeliveryRate.init(),
+    User.init(),
+    Sale.init(),
+  ]);
   const agency = await DeliveryAgency.findOneAndUpdate(
     { code: "ABEX" },
     {

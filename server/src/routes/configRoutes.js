@@ -24,7 +24,10 @@ function allowed(user, key, write = false) {
         can(user, manage) ||
         can(user, P.orders.create) ||
         can(user, P.orders.updateOwn) ||
-        can(user, P.orders.updateAll))
+        can(user, P.orders.updateAll) ||
+        can(user, P.sales.create) ||
+        can(user, P.sales.updateOwn) ||
+        can(user, P.sales.updateAll))
   );
 }
 const scopeFilter = (user, key) =>

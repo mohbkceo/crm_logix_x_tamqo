@@ -13,6 +13,7 @@ import authRoutes, { requireAuth } from "./auth.js";
 import configRoutes from "./routes/configRoutes.js";
 import orderRoutes from "./routes/orderRoutes.js";
 import expenseRoutes from "./routes/expenseRoutes.js";
+import saleRoutes from "./routes/saleRoutes.js";
 import { analytics } from "./services/analyticsService.js";
 import { Customer, Order } from "./models/index.js";
 import { pagination, escapeRegex, objectId } from "./services/filters.js";
@@ -66,6 +67,7 @@ app.get("/api/employees", employeeOptions);
 app.use("/api/config", configRoutes);
 app.use("/api/orders", orderRoutes);
 app.use("/api/expenses", expenseRoutes);
+app.use("/api/sales", saleRoutes);
 app.get("/api/analytics/:scope", async (req, res) => {
   if (req.query.export)
     assert(can(req.user, P.analytics.export), "Export permission denied", 403);

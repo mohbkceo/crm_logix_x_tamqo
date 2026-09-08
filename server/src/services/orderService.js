@@ -6,8 +6,6 @@ import {
   OrderEvent,
   Customer,
   Counter,
-  TamqoPlan,
-  LogixProduct,
   OrderSource,
   Wilaya,
   Shipment,
@@ -21,6 +19,7 @@ import {
   canProviderTransition,
 } from "../domain/order.js";
 import { assert } from "../errors.js";
+import { resolveCatalogItem } from "./catalog.js";
 export const transaction = (fn) => mongoose.connection.transaction(fn);
 export async function materialize(input, session, existing) {
   const p = orderInput.parse(input),
@@ -43,17 +42,18 @@ export async function materialize(input, session, existing) {
   );
   const items = [];
   for (const item of p.items) {
-    const catalog = await (item.business === "TAMQO" ? TamqoPlan : LogixProduct)
-      .findById(item.catalogItemId)
-      .session(session);
     const old = existing?.items.find(
       (x) =>
         String(x.catalogItemId) === item.catalogItemId &&
         x.business === item.business,
     );
-    assert(
-      catalog && (catalog.active || old),
-      "Select an active product or plan.",
+    const catalog = await resolveCatalogItem(
+      item.business,
+      item.catalogItemId,
+      {
+        session,
+        allowInactive: Boolean(old),
+      },
     );
     const price = item.unitPrice ?? old?.unitPrice ?? catalog.price;
     items.push({

@@ -2,6 +2,7 @@ export const ROLES = ['SUPER_ADMIN', 'ADMIN', 'EMPLOYEE'];
 export const BUSINESSES = ['LOGIX', 'TAMQO'];
 const groups = {
   orders: ['viewOwn','viewAll','create','updateOwn','updateAll','confirm','prepare','cancel','createShipment','markReady','refreshTracking'],
+  sales: ['viewOwn','viewAll','create','updateOwn','updateAll','deleteOwn','deleteAll'],
   analytics: ['viewOwn','viewBusiness','viewGlobal','export'], partnership: ['view'],
   customers: ['view','update'], expenses: ['view','create','update','delete'],
   tamqoPlans: ['view','manage'], logixProducts: ['view','manage'], sources: ['view','manage'], wilayas: ['view','manage'],

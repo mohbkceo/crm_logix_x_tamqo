@@ -16,6 +16,7 @@ import {
   Wilaya,
   Expense,
   ExpenseCategory,
+  Sale,
 } from "../src/models/index.js";
 import { createOrder, transition } from "../src/services/orderService.js";
 import { DeliverySyncService } from "../src/services/delivery/deliverySyncService.js";
@@ -92,7 +93,7 @@ after(async () => {
   await replica?.stop();
 });
 beforeEach(async () => {
-  for (const Model of [Order, OrderEvent, Shipment, Customer, Expense])
+  for (const Model of [Order, OrderEvent, Shipment, Customer, Expense, Sale])
     await Model.deleteMany({});
 });
 function input(kind = "PARTNERSHIP", overrides = {}) {
@@ -538,6 +539,124 @@ test("expense CRUD, filters, pagination and business isolation leave revenue unt
     204,
   );
 });
+test("direct sale CRUD uses catalog snapshots, audits changes, and affects only sales analytics", async () => {
+  const catalogItem = await LogixProduct.create({
+    name: "Direct Sale Plaque",
+    price: 900,
+  });
+  const today = new Date(Date.now() + 3600000).toISOString().slice(0, 10);
+  const body = {
+    fullName: "Direct Customer",
+    phoneNumber: "0550112233",
+    address: "Alger Centre",
+    amount: 2400,
+    quantity: 2,
+    business: "LOGIX",
+    catalogItemId: String(catalogItem._id),
+    saleDate: today,
+  };
+  const sale = expectOk(await request(app).post("/api/sales").send(body));
+  assert.equal(sale.itemName, "Direct Sale Plaque");
+  assert.equal(sale.createdBy.name, "Test Super Admin");
+  assert.equal(await Order.countDocuments(), 0);
+  assert.equal(await OrderEvent.countDocuments(), 0);
+  assert.equal(await Shipment.countDocuments(), 0);
+
+  await LogixProduct.updateOne(
+    { _id: catalogItem._id },
+    { $set: { name: "Renamed Plaque" } },
+  );
+  const listed = expectOk(
+    await request(app).get(
+      `/api/sales?business=LOGIX&period=today&search=Direct&addedBy=${sale.createdBy.userId}&limit=1`,
+    ),
+  );
+  assert.equal(listed.total, 1);
+  assert.equal(listed.items[0].itemName, "Direct Sale Plaque");
+  const updated = expectOk(
+    await request(app).patch(`/api/sales/${sale._id}`).send({ amount: 2500 }),
+  );
+  assert.equal(updated.itemName, "Direct Sale Plaque");
+
+  const report = expectOk(
+    await request(app).get("/api/analytics/logix?period=today"),
+  );
+  assert.equal(report.metrics.totalOrders, 0);
+  assert.equal(report.metrics.directSales, 1);
+  assert.equal(report.metrics.directSalesRevenue, 2500);
+  assert.equal(report.metrics.netSales, 2500);
+  assert.equal(report.metrics.totalUnitsSold, 2);
+  assert.equal(report.products[0].name, "Direct Sale Plaque");
+  assert.equal(report.products[0].units, 2);
+  assert.equal(report.employees[0].directSalesRevenue, 2500);
+  assert.deepEqual(report.agencies, []);
+  assert.deepEqual(report.delivery, []);
+  const team = expectOk(
+    await request(app).get("/api/analytics/employees?scope=LOGIX&period=today"),
+  );
+  assert.equal(team.items[0].metrics.totalOrders, 0);
+  assert.equal(team.items[0].metrics.directSalesRevenue, 2500);
+
+  const defaulted = expectOk(
+    await request(app)
+      .post("/api/sales")
+      .send({
+        fullName: "Defaulted Sale",
+        phoneNumber: "0550443322",
+        amount: 1000,
+        business: "TAMQO",
+        catalogItemId: String(plan._id),
+      }),
+  );
+  assert.equal(defaulted.quantity, 1);
+  assert.equal(defaulted.address, "");
+  assert.equal(
+    new Date(defaulted.saleDate).toISOString().slice(0, 10),
+    new Date(today + "T00:00:00+01:00").toISOString().slice(0, 10),
+  );
+  assert.equal(
+    (
+      await request(app)
+        .post("/api/sales")
+        .send({
+          amount: 1000,
+          business: "TAMQO",
+          catalogItemId: String(plan._id),
+        })
+    ).status,
+    400,
+  );
+
+  assert.equal(
+    (
+      await request(app)
+        .post("/api/sales")
+        .send({ ...body, business: "TAMQO" })
+    ).status,
+    400,
+  );
+  await LogixProduct.updateOne(
+    { _id: catalogItem._id },
+    { $set: { active: false } },
+  );
+  assert.equal((await request(app).post("/api/sales").send(body)).status, 400);
+  assert.equal(
+    (await request(app).delete(`/api/sales/${sale._id}`)).status,
+    204,
+  );
+  assert.equal(
+    (await request(app).delete(`/api/sales/${defaulted._id}`)).status,
+    204,
+  );
+  assert.equal(
+    await AuditLog.countDocuments({
+      resourceId: String(sale._id),
+      action: { $in: ["SALE_CREATED", "SALE_UPDATED", "SALE_DELETED"] },
+    }),
+    3,
+  );
+  await LogixProduct.deleteOne({ _id: catalogItem._id });
+});
 test("date-range boundaries, collection audit and customer lifetime revenue", async () => {
   const o = await createOrder(input("TAMQO_ONLY"));
   await transition(o._id, "CONFIRMED");
@@ -863,6 +982,145 @@ test("business access blocks direct expense API calls", async () => {
   );
   assert.equal(created.createdBy.userId, employee._id);
   assert.equal(created.business, "LOGIX");
+});
+
+test("direct sale own/all permissions and business access are enforced", async () => {
+  const today = new Date(Date.now() + 3600000).toISOString().slice(0, 10);
+  const saleBody = {
+    fullName: "Permission Customer",
+    phoneNumber: "0550998877",
+    amount: 1200,
+    quantity: 1,
+    business: "LOGIX",
+    catalogItemId: String(product._id),
+    saleDate: today,
+  };
+  const adminSale = expectOk(await apiAgent.post("/api/sales").send(saleBody));
+  const tamqoSale = expectOk(
+    await apiAgent.post("/api/sales").send({
+      ...saleBody,
+      business: "TAMQO",
+      catalogItemId: String(plan._id),
+    }),
+  );
+  const owner = expectOk(
+    await apiAgent.post("/api/users").send({
+      name: "Sale Owner",
+      email: "sale-owner@example.com",
+      password: "employee-password",
+      businessAccess: ["LOGIX"],
+      permissions: [
+        P.sales.viewOwn,
+        P.sales.create,
+        P.sales.updateOwn,
+        P.sales.deleteOwn,
+        P.analytics.viewOwn,
+      ],
+    }),
+  );
+  const ownerAgent = supertest.agent(app);
+  expectOk(
+    await ownerAgent.post("/api/auth/login").send({
+      email: owner.email,
+      password: "employee-password",
+    }),
+  );
+  const config = expectOk(await ownerAgent.get("/api/config"));
+  assert.ok(
+    config.products.some((item) => String(item._id) === String(product._id)),
+  );
+  const ownSale = expectOk(
+    await ownerAgent.post("/api/sales").send({
+      ...saleBody,
+      createdBy: { userId: new mongoose.Types.ObjectId(), name: "Impostor" },
+    }),
+  );
+  assert.equal(String(ownSale.createdBy.userId), String(owner._id));
+  assert.equal((await ownerAgent.get("/api/sales?period=today")).body.total, 1);
+  assert.equal(
+    (
+      await ownerAgent.get(
+        `/api/sales?period=today&addedBy=${adminSale.createdBy.userId}`,
+      )
+    ).body.total,
+    0,
+  );
+  assert.equal(
+    (
+      await ownerAgent.get(
+        `/api/analytics/logix?period=today&employee=${adminSale.createdBy.userId}`,
+      )
+    ).body.metrics.directSales,
+    0,
+  );
+  assert.equal(
+    (await ownerAgent.get(`/api/sales/${adminSale._id}`)).status,
+    403,
+  );
+  assert.equal(
+    (await ownerAgent.patch(`/api/sales/${adminSale._id}`).send({ amount: 1 }))
+      .status,
+    403,
+  );
+  assert.equal(
+    (await ownerAgent.delete(`/api/sales/${adminSale._id}`)).status,
+    403,
+  );
+  assert.equal(
+    (
+      await ownerAgent.post("/api/sales").send({
+        ...saleBody,
+        business: "TAMQO",
+        catalogItemId: String(plan._id),
+      })
+    ).status,
+    403,
+  );
+  expectOk(
+    await ownerAgent.patch(`/api/sales/${ownSale._id}`).send({ amount: 1300 }),
+  );
+  assert.equal(
+    (await ownerAgent.delete(`/api/sales/${ownSale._id}`)).status,
+    204,
+  );
+
+  const manager = expectOk(
+    await apiAgent.post("/api/users").send({
+      name: "Sale Manager",
+      email: "sale-manager@example.com",
+      password: "employee-password",
+      businessAccess: ["LOGIX"],
+      permissions: [P.sales.viewAll, P.sales.updateAll, P.sales.deleteAll],
+    }),
+  );
+  const managerAgent = supertest.agent(app);
+  expectOk(
+    await managerAgent.post("/api/auth/login").send({
+      email: manager.email,
+      password: "employee-password",
+    }),
+  );
+  assert.equal(
+    (await managerAgent.get("/api/sales?period=today")).body.total,
+    1,
+  );
+  assert.equal(
+    (await managerAgent.get("/api/sales?business=TAMQO&period=today")).status,
+    403,
+  );
+  assert.equal(
+    (await managerAgent.get(`/api/sales/${tamqoSale._id}`)).status,
+    403,
+  );
+  expectOk(
+    await managerAgent
+      .patch(`/api/sales/${adminSale._id}`)
+      .send({ amount: 1400 }),
+  );
+  assert.equal(
+    (await managerAgent.delete(`/api/sales/${adminSale._id}`)).status,
+    204,
+  );
 });
 
 test("admins cannot escalate privileges or modify a Super Admin", async () => {

@@ -24,6 +24,7 @@ import {
   Command,
   Radio,
   Handshake,
+  CircleDollarSign,
   X,
 } from "lucide-react";
 import { api, useApi, ConfigContext } from "./api";
@@ -31,6 +32,7 @@ import { ErrorBox, Loading, Field } from "./components";
 import { Reports } from "./pages/Reports";
 import { Orders, OrderDetails, OrderForm } from "./pages/Orders";
 import { Expenses } from "./pages/Expenses";
+import { Sales } from "./pages/Sales";
 import { Settings } from "./pages/Settings";
 import { Customers } from "./pages/Customers";
 import { UserContext, Can, Guard, P, can, hasBusinessAccess } from "./access";
@@ -188,6 +190,7 @@ function Workspace({ user, logout }) {
       [P.analytics.viewOwn, P.analytics.viewBusiness, P.analytics.viewGlobal],
     ],
     ["/orders", "Orders", ShoppingBag, [P.orders.viewOwn, P.orders.viewAll]],
+    ["/sales", "Sales", CircleDollarSign, [P.sales.viewOwn, P.sales.viewAll]],
     ["/customers", "Customers", Users, [P.customers.view]],
     [
       "/team",
@@ -552,6 +555,14 @@ function Workspace({ user, logout }) {
                         business="PARTNERSHIP"
                       >
                         <Reports scope="partnership" />
+                      </Guard>
+                    }
+                  />
+                  <Route
+                    path="/sales"
+                    element={
+                      <Guard permissions={[P.sales.viewOwn, P.sales.viewAll]}>
+                        <Sales />
                       </Guard>
                     }
                   />

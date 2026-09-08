@@ -420,6 +420,9 @@ export function TeamAnalytics() {
     "returnedOrders",
     "pendingOrders",
     "failedDeliveryOrders",
+    "directSales",
+    "directSalesRevenue",
+    "directSalesUnits",
     "grossSales",
     "netSales",
     "totalUnitsSold",
@@ -434,7 +437,7 @@ export function TeamAnalytics() {
     <>
       <PageHeader
         title="Employee performance"
-        description="Sales belong to the employee who originally created each order."
+        description="Order and direct-sale revenue belongs to the employee who created each record."
       />
       <div className="report-toolbar">
         <PeriodFilter value={filters} onChange={setFilters} />
@@ -499,8 +502,11 @@ export function TeamAnalytics() {
         <>
           <Panel title={row.name + " — activity"}>
             <p>
-              Today: {row.ordersToday} · This week: {row.ordersThisWeek} · This
-              month: {row.ordersThisMonth}
+              Orders — today: {row.ordersToday} · this week:{" "}
+              {row.ordersThisWeek}· this month: {row.ordersThisMonth}. Direct
+              sales — today: {row.directSalesToday}· this week:{" "}
+              {row.directSalesThisWeek} · this month: {row.directSalesThisMonth}
+              .
             </p>
             <DataTable
               rows={["tamqo", "logix", "partnership"].map((name) => ({

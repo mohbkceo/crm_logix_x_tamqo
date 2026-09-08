@@ -63,7 +63,30 @@ export function requireOwnOrAll(
     403,
   );
 }
-export function analyticsScope(user, scope = "ALL") {
+export function saleScope(user) {
+  const viewAll = can(user, P.sales.viewAll);
+  assert(
+    viewAll || can(user, P.sales.viewOwn),
+    "Sale view permission denied",
+    403,
+  );
+  const businesses =
+    user.role === "SUPER_ADMIN" ? BUSINESSES : user.businessAccess;
+  return {
+    business: { $in: businesses },
+    ...(viewAll ? {} : { "createdBy.userId": user._id }),
+  };
+}
+export function requireSaleOwnOrAll(user, sale, own, all) {
+  requireBusinesses(user, [sale.business]);
+  assert(
+    can(user, all) ||
+      (can(user, own) && String(sale.createdBy?.userId) === String(user._id)),
+    "Sale access denied",
+    403,
+  );
+}
+function analyticsContext(user, scope) {
   assert(
     [
       P.analytics.viewOwn,
@@ -80,12 +103,33 @@ export function analyticsScope(user, scope = "ALL") {
       403,
     );
   else if (BUSINESSES.includes(scope)) requireBusinesses(user, [scope]);
-  const own =
-    !can(user, P.analytics.viewBusiness) && !can(user, P.analytics.viewGlobal);
+  return {
+    allowed: user.role === "SUPER_ADMIN" ? BUSINESSES : user.businessAccess,
+    own:
+      !can(user, P.analytics.viewBusiness) &&
+      !can(user, P.analytics.viewGlobal),
+  };
+}
+export function analyticsScope(user, scope = "ALL") {
+  const { own } = analyticsContext(user, scope);
   const filter = orderScope(user, own);
   if (!can(user, P.partnership.view))
     filter.businessType.$in = filter.businessType.$in.filter(
       (b) => b !== "PARTNERSHIP",
     );
   return filter;
+}
+export function saleAnalyticsScope(user, scope = "ALL") {
+  const { allowed, own } = analyticsContext(user, scope);
+  return {
+    business: {
+      $in:
+        scope === "PARTNERSHIP"
+          ? []
+          : BUSINESSES.includes(scope)
+            ? [scope]
+            : allowed,
+    },
+    ...(own ? { "createdBy.userId": user._id } : {}),
+  };
 }
