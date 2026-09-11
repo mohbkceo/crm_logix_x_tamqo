@@ -578,17 +578,14 @@ test("tracking deduplicates orders while Algerian phone normalization deduplicat
   assert.equal(result.imported, 2);
   assert.equal(await Order.countDocuments(), 2);
   assert.equal(await Customer.countDocuments(), 1);
-  const sync = await deliveryService.syncBatch();
-  assert.equal(sync.synced, 0);
-  assert.equal(sync.errors, 0);
-  assert.equal(sync.status, "COMPLETED");
   const importedOrder = await Order.findOne({
     importBatchId: result.batchId,
   });
-  assert.equal(
-    (await apiAgent.post(`/api/orders/${importedOrder._id}/shipment`)).status,
-    409,
+  const existingShipment = expectOk(
+    await apiAgent.post(`/api/orders/${importedOrder._id}/shipment`),
   );
+  assert.equal(existingShipment.tracking, "PHONE-001");
+  assert.equal(await Shipment.countDocuments({ orderId: importedOrder._id }), 1);
 
   await Shipment.updateOne(
     { tracking: "PHONE-001" },
@@ -2694,7 +2691,7 @@ test("delivery sync batches by agency, uses order terminal state, persists outco
       skipped: run.skipped,
     },
     {
-      scanned: 4,
+      scanned: 3,
       eligible: 3,
       attempted: 3,
       successful: 2,
@@ -2703,9 +2700,16 @@ test("delivery sync batches by agency, uses order terminal state, persists outco
       terminalReached: 1,
       unknownStatuses: 1,
       failed: 1,
-      skipped: 1,
+      skipped: 0,
     },
   );
+  assert.deepEqual(run.skipReasons, {
+    noShipment: 0,
+    noTracking: 0,
+    missingAgency: 0,
+    manualAgency: 0,
+    trackingDisabled: 0,
+  });
   assert.equal(logs.length, 1);
   assert.match(logs[0], /^\[DELIVERY SYNC\] trigger=CRON/);
   assert.equal(logs[0].includes("agency-token-private"), false);
@@ -2771,6 +2775,215 @@ test("delivery sync batches by agency, uses order terminal state, persists outco
   assert.equal(detail.items.length, 2);
 });
 
+test("delivery sync scans all non-terminal orders and reports eligibility skip reasons", async (t) => {
+  const apiFixture = await courierFixture(t, (req, res, _call, body) => {
+      assert.equal(req.url, "/lire");
+      jsonReply(res, 200, {
+        Colis: body.Colis.map(({ Tracking }) => ({
+          Tracking,
+          Situation: Tracking === "API-TRACK" ? "Livrée" : "Dispatcher",
+        })),
+      });
+    }),
+    manualAgency = await DeliveryAgency.create({
+      name: "Sync manual courier",
+      code: "SYNC_MANUAL",
+      businesses: ["LOGIX"],
+      integrationType: "MANUAL",
+      apiProvider: "MANUAL",
+      capabilities: { tracking: true },
+    }),
+    trackingDisabledAgency = await DeliveryAgency.create({
+      name: "Sync tracking-disabled courier",
+      code: "SYNC_TRACKING_DISABLED",
+      businesses: ["LOGIX"],
+      integrationType: "API",
+      apiProvider: "PROCOLIS",
+      capabilities: { tracking: false },
+    }),
+    manualInput = input("LOGIX_ONLY", {
+      delivery: {
+        agencyId: String(manualAgency._id),
+        type: "HOME",
+        exchange: false,
+      },
+      deliveryCharged: 500,
+    }),
+    trackingDisabledInput = input("LOGIX_ONLY", {
+      delivery: {
+        agencyId: String(trackingDisabledAgency._id),
+        type: "HOME",
+        exchange: false,
+      },
+      deliveryCharged: 500,
+    });
+  t.after(() =>
+    DeliveryAgency.deleteMany({
+      _id: { $in: [manualAgency._id, trackingDisabledAgency._id] },
+    }),
+  );
+
+  const [imported, apiTracked, NO_SHIPMENT, noTracking, missingAgency, manual, trackingDisabled, terminal] =
+    await Promise.all([
+      createOrder(apiFixture.input),
+      createOrder(apiFixture.input),
+      createOrder(apiFixture.input),
+      createOrder(apiFixture.input),
+      createOrder(apiFixture.input),
+      createOrder(manualInput),
+      createOrder(trackingDisabledInput),
+      createOrder(apiFixture.input),
+    ]);
+  await Promise.all([
+    Order.updateOne({ _id: imported._id }, { $set: { status: "SHIPPED" } }),
+    Order.updateOne(
+      { _id: apiTracked._id },
+      { $set: { status: "SHIPPED" } },
+    ),
+    Order.updateOne(
+      { _id: noTracking._id },
+      { $set: { status: "CONFIRMED" } },
+    ),
+    Order.updateOne(
+      { _id: missingAgency._id },
+      {
+        $set: {
+          status: "PREPARING",
+          "delivery.agencyId": new mongoose.Types.ObjectId(),
+        },
+      },
+    ),
+    Order.updateOne(
+      { _id: manual._id },
+      { $set: { status: "READY_TO_SHIP" } },
+    ),
+    Order.updateOne(
+      { _id: trackingDisabled._id },
+      { $set: { status: "FAILED_DELIVERY" } },
+    ),
+    Order.updateOne({ _id: terminal._id }, { $set: { status: "DELIVERED" } }),
+  ]);
+  const missingAgencyId = (await Order.findById(missingAgency._id)).delivery
+    .agencyId;
+  await Shipment.create([
+    {
+      orderId: imported._id,
+      agencyId: apiFixture.agency._id,
+      agencyName: apiFixture.agency.name,
+      origin: "EXCEL_IMPORT",
+      provider: "PROCOLIS",
+      tracking: "IMPORT-TRACK",
+      trackingKey: "IMPORT-TRACK",
+      status: "SHIPPED",
+    },
+    {
+      orderId: apiTracked._id,
+      agencyId: apiFixture.agency._id,
+      agencyName: apiFixture.agency.name,
+      provider: "PROCOLIS",
+      tracking: "API-TRACK",
+      trackingKey: "API-TRACK",
+      status: "SHIPPED",
+    },
+    {
+      orderId: noTracking._id,
+      agencyId: apiFixture.agency._id,
+      agencyName: apiFixture.agency.name,
+      provider: "PROCOLIS",
+      status: "CONFIRMED",
+    },
+    {
+      orderId: missingAgency._id,
+      agencyId: missingAgencyId,
+      agencyName: "Missing agency",
+      provider: "PROCOLIS",
+      tracking: "MISSING-AGENCY",
+      trackingKey: "MISSING-AGENCY",
+      status: "PREPARING",
+    },
+    {
+      orderId: manual._id,
+      agencyId: manualAgency._id,
+      agencyName: manualAgency.name,
+      provider: "MANUAL",
+      tracking: "MANUAL-SKIP",
+      trackingKey: "MANUAL-SKIP",
+      status: "READY_TO_SHIP",
+    },
+    {
+      orderId: trackingDisabled._id,
+      agencyId: trackingDisabledAgency._id,
+      agencyName: trackingDisabledAgency.name,
+      provider: "PROCOLIS",
+      tracking: "TRACKING-DISABLED",
+      trackingKey: "TRACKING-DISABLED",
+      status: "FAILED_DELIVERY",
+    },
+    {
+      orderId: terminal._id,
+      agencyId: apiFixture.agency._id,
+      agencyName: apiFixture.agency.name,
+      provider: "PROCOLIS",
+      tracking: "ALREADY-DELIVERED",
+      trackingKey: "ALREADY-DELIVERED",
+      status: "DELIVERED",
+    },
+  ]);
+
+  const first = await deliveryService.syncBatch({ trigger: "CRON" });
+  assert.deepEqual(
+    {
+      scanned: first.scanned,
+      eligible: first.eligible,
+      attempted: first.attempted,
+      skipped: first.skipped,
+    },
+    { scanned: 7, eligible: 2, attempted: 2, skipped: 5 },
+  );
+  assert.deepEqual(first.skipReasons, {
+    noShipment: 1,
+    noTracking: 1,
+    missingAgency: 1,
+    manualAgency: 1,
+    trackingDisabled: 1,
+  });
+  assert.equal(apiFixture.calls.length, 1);
+  assert.equal(apiFixture.calls[0].url, "/lire");
+  assert.deepEqual(
+    apiFixture.calls[0].body.Colis.map((row) => row.Tracking).sort(),
+    ["API-TRACK", "IMPORT-TRACK"],
+  );
+  assert.equal(
+    apiFixture.calls.some((call) => call.url === "/add_colis"),
+    false,
+  );
+  assert.ok(NO_SHIPMENT);
+  assert.equal((await Order.findById(apiTracked._id)).status, "DELIVERED");
+  assert.equal(
+    (await Shipment.findOne({ orderId: imported._id })).syncStatus,
+    "SYNCED",
+  );
+  const stored = await DeliverySyncRun.findById(first.runId).lean();
+  assert.deepEqual(stored.skipReasons, first.skipReasons);
+  const history = expectOk(await apiAgent.get("/api/delivery-sync/runs"));
+  assert.deepEqual(history.items[0].skipReasons, first.skipReasons);
+
+  const second = await deliveryService.syncBatch({ trigger: "CRON" });
+  assert.deepEqual(
+    {
+      scanned: second.scanned,
+      eligible: second.eligible,
+      attempted: second.attempted,
+      skipped: second.skipped,
+    },
+    { scanned: 6, eligible: 1, attempted: 1, skipped: 5 },
+  );
+  assert.equal(apiFixture.calls.length, 2);
+  assert.deepEqual(apiFixture.calls[1].body.Colis, [
+    { Tracking: "IMPORT-TRACK" },
+  ]);
+});
+
 test("an active MongoDB delivery lease prevents concurrent cron execution", async (t) => {
   const previousMap = process.env.DELIVERY_STATUS_MAP;
   process.env.DELIVERY_STATUS_MAP = JSON.stringify({ shipped: "SHIPPED" });
@@ -2810,7 +3023,8 @@ test("an active MongoDB delivery lease prevents concurrent cron execution", asyn
   const first = deliveryService.syncBatch({ trigger: "CRON" });
   await started;
   const second = await deliveryService.syncBatch({ trigger: "CRON" });
-  assert.equal(second.skipped, 1);
+  assert.equal(second.scanned, 0);
+  assert.equal(second.skipped, 0);
   assert.equal(second.attempted, 0);
   releaseRequest();
   assert.equal((await first).status, "COMPLETED");

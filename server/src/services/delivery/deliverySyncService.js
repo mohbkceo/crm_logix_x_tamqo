@@ -383,11 +383,6 @@ export class DeliverySyncService {
   }
   async refresh(orderId) {
     const s = await Shipment.findOne({ orderId });
-    assert(
-      s?.origin !== "EXCEL_IMPORT",
-      "Excel-imported shipments cannot call a delivery provider.",
-      409,
-    );
     if (s?.creationAttemptedAt && s.uncertain && !s.tracking)
       return this.create(orderId);
     assert(s?.tracking, "No tracking number is linked to this order.", 409);
@@ -428,11 +423,6 @@ export class DeliverySyncService {
     const s = await Shipment.findOne({ orderId }),
       o = await Order.findById(orderId);
     assert(o, "Order not found", 404);
-    assert(
-      s?.origin !== "EXCEL_IMPORT",
-      "Excel-imported shipments cannot call a delivery provider.",
-      409,
-    );
     assert(
       o.status === "PREPARING" || o.status === "READY_TO_SHIP",
       "Prepare this order first.",
@@ -492,11 +482,6 @@ export class DeliverySyncService {
   async reconcile(orderId, tracking, absentConfirmed = false, actor) {
     const s = await Shipment.findOne({ orderId });
     assert(s, "No shipment attempt to reconcile", 404);
-    assert(
-      s.origin !== "EXCEL_IMPORT",
-      "Excel-imported shipments cannot call a delivery provider.",
-      409,
-    );
     assert(
       !s.lockUntil || s.lockUntil < new Date(),
       "Shipment request is still in progress.",

@@ -72,18 +72,12 @@ function publicRun(run) {
     ...value,
     runId: String(value._id),
     synced: value.successful,
-    errors: value.failed + value.unknownStatuses,
+    errors: value.failed,
   };
 }
 async function context(id, capability, creating = false) {
   const order = await Order.findById(id);
   assert(order, "Order not found", 404);
-  const shipment = await Shipment.findOne({ orderId: id });
-  assert(
-    shipment?.origin !== "EXCEL_IMPORT",
-    "Excel-imported shipments are internal records and cannot call a delivery provider.",
-    409,
-  );
   const agency = await DeliveryAgency.findById(order.delivery.agencyId);
   assert(agency, "Order delivery agency is missing. Run the migration.", 409);
   if (creating) {
@@ -286,6 +280,13 @@ export const deliveryService = {
       skipped: 0,
       terminalReached: 0,
       unknownStatuses: 0,
+      skipReasons: {
+        noShipment: 0,
+        noTracking: 0,
+        missingAgency: 0,
+        manualAgency: 0,
+        trackingDisabled: 0,
+      },
     };
     const finish = async (status) => {
       const finishedAt = new Date(),
@@ -326,39 +327,63 @@ export const deliveryService = {
     try {
       lockOwner = await acquireSyncLock(run._id);
       if (!lockOwner) {
-        counters.skipped = 1;
         return await finish("COMPLETED");
       }
-      const shipments = await Shipment.find({
-          origin: { $ne: "EXCEL_IMPORT" },
-        })
+      const orders = await Order.find({ status: { $nin: TERMINAL } })
+          .sort({ createdAt: 1, _id: 1 })
+          .lean(),
+        orderIds = orders.map((order) => order._id),
+        shipments = await Shipment.find({ orderId: { $in: orderIds } })
           .sort({ lastSyncedAt: 1, _id: 1 })
           .lean(),
-        orderIds = shipments.map((shipment) => shipment.orderId),
-        agencyIds = shipments.map((shipment) => shipment.agencyId),
-        [orders, agencies] = await Promise.all([
-          Order.find({ _id: { $in: orderIds } }).lean(),
-          DeliveryAgency.find({ _id: { $in: agencyIds } }).lean(),
-        ]),
-        ordersById = new Map(orders.map((order) => [String(order._id), order])),
+        shipmentsByOrderId = new Map(
+          shipments.map((shipment) => [String(shipment.orderId), shipment]),
+        ),
+        agencyIds = [
+          ...shipments.map((shipment) => shipment.agencyId),
+          ...orders.map((order) => order.delivery?.agencyId),
+        ].filter(Boolean),
+        agencies = await DeliveryAgency.find({
+          _id: { $in: agencyIds },
+        }).lean(),
         agenciesById = new Map(
           agencies.map((agency) => [String(agency._id), agency]),
         );
-      counters.scanned = shipments.length;
-      const eligible = shipments.flatMap((shipment) => {
-        const order = ordersById.get(String(shipment.orderId)),
-          agency = agenciesById.get(String(shipment.agencyId));
-        return order &&
-          agency &&
-          validTracking(shipment.tracking) &&
-          agency.integrationType === "API" &&
-          agency.capabilities?.tracking &&
-          !TERMINAL.includes(order.status)
-          ? [{ shipment, order, agency }]
-          : [];
-      });
+      counters.scanned = orders.length;
+      const eligible = [];
+      for (const order of orders) {
+        const shipment = shipmentsByOrderId.get(String(order._id));
+        if (!shipment) {
+          counters.skipReasons.noShipment++;
+          continue;
+        }
+        if (!validTracking(shipment.tracking)) {
+          counters.skipReasons.noTracking++;
+          continue;
+        }
+        const agency =
+          agenciesById.get(String(shipment.agencyId || "")) ||
+          agenciesById.get(String(order.delivery?.agencyId || ""));
+        if (!agency) {
+          counters.skipReasons.missingAgency++;
+          continue;
+        }
+        if (agency.integrationType !== "API") {
+          counters.skipReasons.manualAgency++;
+          continue;
+        }
+        if (!agency.capabilities?.tracking) {
+          counters.skipReasons.trackingDisabled++;
+          continue;
+        }
+        eligible.push({ shipment, order, agency });
+      }
+      eligible.sort(
+        (a, b) =>
+          (a.shipment.lastSyncedAt?.getTime() || 0) -
+          (b.shipment.lastSyncedAt?.getTime() || 0),
+      );
       counters.eligible = eligible.length;
-      counters.attempted = eligible.length;
       counters.skipped = counters.scanned - counters.eligible;
       const byAgency = new Map();
       for (const entry of eligible) {
@@ -382,6 +407,7 @@ export const deliveryService = {
           const batch = entries.slice(index, index + SYNC_BATCH_SIZE);
           let parcels;
           try {
+            counters.attempted += batch.length;
             parcels = parsePackages(
               await service.client.readPackages(
                 batch.map((entry) => entry.shipment.tracking),
@@ -437,9 +463,7 @@ export const deliveryService = {
           }
         }
       }
-      return await finish(
-        counters.failed ? "PARTIAL" : "COMPLETED",
-      );
+      return await finish(counters.failed ? "PARTIAL" : "COMPLETED");
     } catch {
       counters.failed = Math.max(counters.failed, counters.attempted || 1);
       return await finish("FAILED");

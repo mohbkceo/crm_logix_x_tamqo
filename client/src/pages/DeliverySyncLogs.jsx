@@ -31,6 +31,13 @@ const statusTone = (status) =>
       : status === "UNCHANGED" || status === "UNKNOWN_STATUS"
         ? "confirmed"
         : "failed_delivery";
+const skipReasonCounters = [
+  ["No shipment", "noShipment"],
+  ["No/invalid tracking", "noTracking"],
+  ["Missing agency", "missingAgency"],
+  ["Manual agency", "manualAgency"],
+  ["Tracking disabled", "trackingDisabled"],
+];
 
 function RunDetails({ id, onClose }) {
   const detail = useApi(`/delivery-sync/runs/${id}`);
@@ -54,6 +61,15 @@ function RunDetails({ id, onClose }) {
                     {detail.data.run.status}
                   </Badge>
                 </div>
+              </div>
+              <div className="metrics-grid">
+                {skipReasonCounters.map(([label, key]) => (
+                  <Metric
+                    key={key}
+                    label={label}
+                    value={detail.data.run.skipReasons?.[key] || 0}
+                  />
+                ))}
               </div>
               <DataTable
                 rows={detail.data.items}
@@ -175,11 +191,24 @@ export function DeliverySyncLogs() {
             </div>
           </Panel>
           {last && (
-            <div className="metrics-grid">
-              {counters.map(([label, key]) => (
-                <Metric key={key} label={label} value={last[key]} />
-              ))}
-            </div>
+            <>
+              <div className="metrics-grid">
+                {counters.map(([label, key]) => (
+                  <Metric key={key} label={label} value={last[key]} />
+                ))}
+              </div>
+              <Panel title="Skip reasons">
+                <div className="metrics-grid">
+                  {skipReasonCounters.map(([label, key]) => (
+                    <Metric
+                      key={key}
+                      label={label}
+                      value={last.skipReasons?.[key] || 0}
+                    />
+                  ))}
+                </div>
+              </Panel>
+            </>
           )}
         </>
       )}

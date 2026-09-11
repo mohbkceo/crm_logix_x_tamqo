@@ -62,6 +62,16 @@ const syncCounters = {
   terminalReached: { type: Number, default: 0, min: 0 },
   unknownStatuses: { type: Number, default: 0, min: 0 },
 };
+const skipReasonsSchema = new Schema(
+  {
+    noShipment: { type: Number, default: 0, min: 0 },
+    noTracking: { type: Number, default: 0, min: 0 },
+    missingAgency: { type: Number, default: 0, min: 0 },
+    manualAgency: { type: Number, default: 0, min: 0 },
+    trackingDisabled: { type: Number, default: 0, min: 0 },
+  },
+  { _id: false },
+);
 const syncRunSchema = new Schema(
   {
     trigger: {
@@ -80,6 +90,7 @@ const syncRunSchema = new Schema(
       index: true,
     },
     ...syncCounters,
+    skipReasons: { type: skipReasonsSchema, default: () => ({}) },
   },
   { timestamps: true },
 );
