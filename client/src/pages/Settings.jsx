@@ -9,6 +9,7 @@ import {
   Check,
   ShieldCheck,
   RefreshCw,
+  FileSpreadsheet,
   Radio,
 } from "lucide-react";
 import { api, useApi, useConfig, money, human } from "../api";
@@ -155,6 +156,11 @@ export function Settings() {
               {label}
             </button>
           ))}
+        {can(user, P.imports.view) && (
+          <Link to="/settings/import-data">
+            <FileSpreadsheet size={15} /> Import data
+          </Link>
+        )}
         {can(user, P.deliverySync.view) && (
           <Link to="/settings/delivery-sync">
             <Radio size={15} /> Delivery Sync Logs

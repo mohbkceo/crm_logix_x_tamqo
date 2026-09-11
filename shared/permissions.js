@@ -5,6 +5,7 @@ const groups = {
   sales: ['viewOwn','viewAll','create','updateOwn','updateAll','deleteOwn','deleteAll'],
   analytics: ['viewOwn','viewBusiness','viewGlobal','export'], partnership: ['view'],
   customers: ['view','update'], expenses: ['view','create','update','delete'], finance: ['viewBalance'],
+  imports: ['view','execute'],
   tamqoPlans: ['view','manage'], logixProducts: ['view','manage'], sources: ['view','manage'], wilayas: ['view','manage'],
   deliveryAgencies: ['view','create','update','disable','delete','assignBusinesses','manageRates','manageCredentials','testConnection'],
   deliverySync: ['view','run'],

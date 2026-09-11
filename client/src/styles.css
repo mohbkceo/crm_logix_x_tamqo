@@ -1,4 +1,3 @@
-
 :root {
   font-family: var(--font-sans);
   color: #18181b;
@@ -3321,5 +3320,256 @@ main,
   .back-link,
   .pipeline-link {
     min-height: 44px;
+  }
+}
+/* Settings / Import data */
+.import-flow {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: 8px;
+  padding: 0;
+  margin: 0 0 18px;
+  list-style: none;
+}
+.import-flow li {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 700;
+}
+.import-flow li::after {
+  content: "";
+  height: 2px;
+  flex: 1;
+  background: var(--line);
+}
+.import-flow li:last-child::after {
+  display: none;
+}
+.import-flow li > span {
+  width: 26px;
+  height: 26px;
+  display: inline-grid;
+  place-items: center;
+  border: 1px solid var(--line);
+  border-radius: 50%;
+  background: white;
+}
+.import-flow li.active {
+  color: var(--ink);
+}
+.import-flow li.active > span {
+  color: white;
+  border-color: var(--accent);
+  background: var(--accent);
+}
+.import-flow li.active::after {
+  background: var(--accent);
+}
+.import-dropzone {
+  width: 100%;
+  min-height: 180px;
+  display: grid;
+  place-items: center;
+  align-content: center;
+  gap: 8px;
+  border: 2px dashed var(--line);
+  border-radius: 14px;
+  background: color-mix(in srgb, white 82%, var(--accent) 3%);
+  color: var(--muted);
+}
+.import-dropzone strong {
+  color: var(--ink);
+  font-size: 16px;
+}
+.import-dropzone.dragging {
+  border-color: var(--accent);
+  background: color-mix(in srgb, white 90%, var(--accent) 10%);
+}
+.import-actions {
+  display: flex;
+  justify-content: flex-end;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+.import-summary {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(120px, 1fr));
+  gap: 10px;
+}
+.import-summary > div {
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--soft);
+}
+.import-summary span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+.import-summary strong {
+  display: block;
+  margin-top: 4px;
+  font-size: 18px;
+}
+.mapping-list {
+  display: grid;
+  gap: 12px;
+}
+.mapping-card {
+  display: grid;
+  grid-template-columns: minmax(180px, 0.8fr) minmax(300px, 1.8fr);
+  gap: 16px;
+  padding: 14px;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+}
+.mapping-source span,
+.wilaya-mapping-grid label > span {
+  display: block;
+  color: var(--muted);
+  font-size: 12px;
+}
+.mapping-source strong {
+  display: block;
+  margin: 4px 0 8px;
+}
+.mapping-targets {
+  display: grid;
+  gap: 8px;
+}
+.mapping-row {
+  display: grid;
+  grid-template-columns: 1fr 90px 38px;
+  gap: 8px;
+  align-items: end;
+}
+.mapping-row label {
+  font-size: 12px;
+  color: var(--muted);
+}
+.mapping-row input {
+  margin-top: 3px;
+}
+.wilaya-mapping-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 12px;
+}
+.wilaya-mapping-grid select {
+  margin-top: 5px;
+  width: 100%;
+}
+.row-select {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  white-space: nowrap;
+}
+.import-selection-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+.import-selection-toolbar .import-actions {
+  justify-content: flex-start;
+  margin-top: 0;
+}
+.import-selection-toolbar > span {
+  color: var(--muted);
+  font-size: 13px;
+}
+.warning-text,
+.success-text {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.warning-text {
+  color: var(--warning, #9a6700);
+}
+.success-text {
+  color: var(--success, #16794b);
+  font-weight: 700;
+}
+.import-commit {
+  justify-content: space-between;
+}
+.import-commit > div:first-child {
+  display: grid;
+  gap: 5px;
+}
+.import-resolution-warning {
+  font-size: 13px;
+}
+.import-result {
+  border-color: color-mix(in srgb, var(--line) 50%, #2a9d68 50%);
+}
+.import-failures {
+  margin-top: 18px;
+}
+.import-failures li {
+  margin: 5px 0;
+  color: var(--muted);
+}
+.tabs a {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 13px;
+  border-radius: 8px;
+  color: var(--muted);
+  text-decoration: none;
+  font-weight: 700;
+  font-size: 13px;
+}
+.tabs a:hover {
+  color: var(--ink);
+  background: var(--soft);
+}
+@media (max-width: 960px) {
+  .import-summary {
+    grid-template-columns: repeat(2, minmax(120px, 1fr));
+  }
+  .wilaya-mapping-grid {
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .mapping-card {
+    grid-template-columns: 1fr;
+  }
+}
+@media (max-width: 760px) {
+  .import-flow {
+    grid-template-columns: repeat(3, 1fr);
+    row-gap: 12px;
+  }
+  .import-flow li:nth-child(3)::after,
+  .import-flow li:last-child::after {
+    display: none;
+  }
+  .wilaya-mapping-grid {
+    grid-template-columns: 1fr;
+  }
+  .mapping-row {
+    grid-template-columns: 1fr 80px 38px;
+  }
+  .import-actions {
+    align-items: stretch;
+    flex-direction: column;
+  }
+  .import-selection-toolbar {
+    align-items: stretch;
+    flex-direction: column;
+  }
+}
+@media (max-width: 480px) {
+  .import-summary {
+    grid-template-columns: 1fr;
   }
 }

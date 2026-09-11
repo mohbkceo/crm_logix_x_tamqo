@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import mongoose from "mongoose";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
 import supertest from "supertest";
+import * as XLSX from "xlsx";
 import { app } from "../src/app.js";
 import { seed } from "../src/seed.js";
 import {
@@ -16,6 +17,8 @@ import {
   Wilaya,
   Expense,
   ExpenseCategory,
+  ImportBatch,
+  ImportMapping,
   Sale,
 } from "../src/models/index.js";
 import { createOrder, transition } from "../src/services/orderService.js";
@@ -41,7 +44,7 @@ import { createServer } from "node:http";
 import { encryptCredentials } from "../src/services/delivery/credentials.js";
 import { providerFor } from "../src/services/delivery/deliveryProviderFactory.js";
 import { deliveryService } from "../src/services/delivery/deliveryService.js";
-let replica, plan, product, source, wilaya, apiAgent;
+let replica, plan, product, plaque15, stand, source, wilaya, apiAgent;
 const request = () => apiAgent;
 before(
   async () => {
@@ -59,7 +62,11 @@ before(
       { name: "3 Months", price: 4000, durationDays: 90 },
       { name: "6 Months", price: 7000, durationDays: 180 },
     ]);
-    await LogixProduct.create({ name: "20cm Plaque", price: 3500 });
+    await LogixProduct.create([
+      { name: "15cm Plaque", price: 2500 },
+      { name: "20cm Plaque", price: 3500 },
+      { name: "Stand", price: 1500 },
+    ]);
     await OrderSource.create({ name: "Messages", isDefault: true });
     await ExpenseCategory.create([
       { business: "LOGIX", name: "Materials" },
@@ -90,6 +97,8 @@ before(
     );
     plan = await TamqoPlan.findOne({ name: "3 Months" });
     product = await LogixProduct.findOne({ name: "20cm Plaque" });
+    plaque15 = await LogixProduct.findOne({ name: "15cm Plaque" });
+    stand = await LogixProduct.findOne({ name: "Stand" });
     source = await OrderSource.findOne({ isDefault: true });
     wilaya = await Wilaya.findOne({ agencyId: "16" });
   },
@@ -107,6 +116,8 @@ beforeEach(async () => {
     Customer,
     Expense,
     Sale,
+    ImportBatch,
+    ImportMapping,
     DeliverySyncItem,
     DeliverySyncLock,
     DeliverySyncRun,
@@ -146,6 +157,100 @@ const expectOk = (r) => {
   assert.ok(r.status < 300, JSON.stringify(r.body));
   return r.body;
 };
+const importHeaders = [
+  "Date",
+  "Tracking",
+  "ID",
+  "Client",
+  "Mobile1",
+  "Mobile2",
+  "adresse",
+  "Wilaya",
+  "Commune",
+  "Produit",
+  "Note",
+  "Situation",
+  "Commentaire",
+  "Date Action",
+  "Total",
+  "Frais de livraison",
+];
+function importRow(overrides = {}) {
+  return {
+    Date: "08/09/2026",
+    Tracking: "IMPORT-001",
+    ID: "EXT-001",
+    Client: "Imported Customer",
+    Mobile1: "0550123456",
+    Mobile2: "",
+    adresse: "12 Import Street",
+    Wilaya: "16 - Alger",
+    Commune: "Alger Centre",
+    Produit: "Plaque 20*20",
+    Note: "Imported note",
+    Situation: "En livraison",
+    Commentaire: "External comment",
+    "Date Action": "08/09/2026",
+    Total: 4000,
+    "Frais de livraison": 500,
+    ...overrides,
+  };
+}
+function importWorkbook(rows, bookType = "xlsx", headers = importHeaders) {
+  const sheet = XLSX.utils.aoa_to_sheet([
+    headers,
+    ...rows.map((row) => headers.map((header) => row[header] ?? "")),
+  ]);
+  return XLSX.write(
+    { SheetNames: ["Orders"], Sheets: { Orders: sheet } },
+    { type: "buffer", bookType },
+  );
+}
+async function previewWorkbook(agent, rows, bookType = "xlsx", headers) {
+  const buffer = importWorkbook(rows, bookType, headers);
+  const response = await agent
+    .post("/api/imports/orders/preview")
+    .attach("file", buffer, {
+      filename: `orders.${bookType}`,
+      contentType: "application/octet-stream",
+    });
+  return { response, buffer };
+}
+function importOptions(
+  preview,
+  selectedRows = preview.rows.map((row) => row.rowNumber),
+) {
+  return {
+    selectedRows,
+    productMappings: Object.fromEntries(
+      preview.productMappings.map((mapping) => [
+        mapping.key,
+        [
+          {
+            business: "LOGIX",
+            catalogItemId: String(product._id),
+            quantity: 1,
+          },
+        ],
+      ]),
+    ),
+    wilayaMappings: Object.fromEntries(
+      preview.wilayaMappings.map((mapping) => [
+        mapping.key,
+        String(wilaya._id),
+      ]),
+    ),
+  };
+}
+async function commitWorkbook(agent, buffer, bookType, options) {
+  return agent
+    .post("/api/imports/orders/commit")
+    .field("options", JSON.stringify(options))
+    .attach("file", buffer, {
+      filename: `orders.${bookType}`,
+      contentType: "application/octet-stream",
+    });
+}
 test("seeds 58 Wilayas and fixtures provide one active default", async () => {
   assert.equal(await Wilaya.countDocuments(), 58);
   assert.equal(
@@ -234,6 +339,383 @@ test("normalized phone identity joins formatted repeat purchases", async () => {
   assert.equal(await Customer.countDocuments(), 1);
   const customers = expectOk(await request(app).get("/api/customers"));
   assert.equal(customers.items[0].orders, 2);
+});
+test(".xls and .xlsx imports parse normalized columns and ignore delivered rows", async () => {
+  for (const bookType of ["xls", "xlsx"]) {
+    const { response } = await previewWorkbook(
+      apiAgent,
+      [
+        importRow({
+          Tracking: `DELIVERED-${bookType}`,
+          Situation: " Livrée [Encaisser] ",
+        }),
+      ],
+      bookType,
+    );
+    const preview = expectOk(response);
+    assert.equal(preview.summary.totalRows, 1);
+    assert.equal(preview.summary.deliveredIgnored, 1);
+    assert.equal(preview.summary.eligibleRows, 0);
+    assert.equal(preview.rows[0].action, "IGNORE_DELIVERED");
+  }
+});
+
+test("common LOGIX descriptions, quantities and Wilaya variants map automatically", async () => {
+  const cases = [
+    {
+      Tracking: "AUTO-MAP-001",
+      Wilaya: "16 Alger",
+      Produit: "Plaque NFC 15X15",
+      expected: [[plaque15, 1]],
+    },
+    {
+      Tracking: "AUTO-MAP-002",
+      Wilaya: "ALGER",
+      Produit: "2 plaque 20*20 + stand",
+      expected: [
+        [product, 2],
+        [stand, 1],
+      ],
+    },
+    {
+      Tracking: "AUTO-MAP-003",
+      Wilaya: "16Alger",
+      Produit: "02 stande bureau + 02 plaques 20X20",
+      expected: [
+        [stand, 2],
+        [product, 2],
+      ],
+    },
+  ];
+  const preview = expectOk(
+    (
+      await previewWorkbook(
+        apiAgent,
+        cases.map(({ expected: _expected, ...row }) => importRow(row)),
+      )
+    ).response,
+  );
+  assert.equal(preview.summary.productMappingsRequired, 0);
+  assert.equal(preview.summary.wilayaMappingsRequired, 0);
+  for (const [index, expectedCase] of cases.entries()) {
+    const row = preview.rows[index];
+    assert.equal(row.action, "CREATE");
+    assert.equal(row.needsProductMapping, false);
+    assert.equal(row.productMappingSource, "AUTOMATIC");
+    assert.equal(row.needsWilayaMapping, false);
+    assert.equal(row.wilayaId, String(wilaya._id));
+    assert.deepEqual(
+      row.productItems.map((item) => [item.catalogItemId, item.quantity]),
+      expectedCase.expected.map(([item, quantity]) => [
+        String(item._id),
+        quantity,
+      ]),
+    );
+  }
+});
+
+test("returned imports create one internal order and one positive idempotent 150 DA expense", async () => {
+  let courierCalls = 0;
+  const originalAutomatic = deliveryService.createAutomatically;
+  deliveryService.createAutomatically = async () => {
+    courierCalls++;
+    throw new Error("Importer must never create a provider parcel");
+  };
+  try {
+    const row = importRow({
+      Tracking: "RETURN-001",
+      Situation: "Retour Client",
+      Mobile1: "0550 12 34 56",
+    });
+    const { response, buffer } = await previewWorkbook(apiAgent, [row]);
+    const preview = expectOk(response);
+    assert.equal(preview.rows[0].mappedStatus, "RETURNED");
+    assert.equal(preview.summary.automaticFeeAmount, 150);
+    const first = expectOk(
+      await commitWorkbook(apiAgent, buffer, "xlsx", importOptions(preview)),
+    );
+    assert.equal(first.imported, 1);
+    assert.equal(first.returned, 1);
+    assert.equal(first.feesCreated, 1);
+    assert.equal(first.totalFees, 150);
+    const order = await Order.findOne();
+    const shipment = await Shipment.findOne({ orderId: order._id });
+    const expense = await Expense.findOne({ sourceOrderId: order._id });
+    assert.equal(order.status, "RETURNED");
+    assert.equal(order.originalData.import.sheetSituation, "Retour Client");
+    assert.equal(shipment.tracking, "RETURN-001");
+    assert.equal(shipment.origin, "EXCEL_IMPORT");
+    assert.equal(shipment.provider, "EXCEL_IMPORT");
+    assert.equal(shipment.creationAttemptedAt, undefined);
+    assert.equal(expense.amount, 150);
+    assert.equal(expense.business, "LOGIX");
+    assert.equal(expense.systemGenerated, true);
+    assert.equal(expense.sourceKey, "DELIVERY_FAILURE_FEE:RETURN-001");
+    const batch = await ImportBatch.findById(first.batchId);
+    assert.equal(batch.importedRows, 1);
+    assert.equal(batch.feesCreated, 1);
+    assert.equal(batch.feeAmount, 150);
+    assert.equal(await ImportMapping.countDocuments(), 1);
+    assert.equal(
+      await AuditLog.countDocuments({
+        resourceId: String(batch._id),
+        action: "IMPORT_EXECUTED",
+      }),
+      1,
+    );
+    assert.equal(
+      await OrderEvent.countDocuments({
+        orderId: order._id,
+        type: "ORDER_IMPORTED",
+        source: "EXCEL_IMPORT",
+      }),
+      1,
+    );
+    assert.equal(courierCalls, 0);
+
+    const secondPreview = expectOk(
+      (await previewWorkbook(apiAgent, [row])).response,
+    );
+    const second = expectOk(
+      await commitWorkbook(
+        apiAgent,
+        buffer,
+        "xlsx",
+        importOptions(secondPreview),
+      ),
+    );
+    assert.equal(second.imported, 0);
+    assert.equal(second.feesCreated, 0);
+    assert.equal(await Order.countDocuments(), 1);
+    assert.equal(await Expense.countDocuments(), 1);
+    assert.equal(courierCalls, 0);
+  } finally {
+    deliveryService.createAutomatically = originalAutomatic;
+  }
+});
+
+test("partnership failure fees use positive underlying-business expenses totaling 150 DA", async () => {
+  const row = importRow({
+    Tracking: "PARTNER-RETURN-001",
+    Produit: "Plan plus plaque",
+    Situation: "Retour Livreur",
+    Total: 11500,
+  });
+  const { response, buffer } = await previewWorkbook(apiAgent, [row]);
+  const preview = expectOk(response);
+  const options = importOptions(preview);
+  options.productMappings = {
+    [preview.productMappings[0].key]: [
+      {
+        business: "TAMQO",
+        catalogItemId: String(plan._id),
+        quantity: 1,
+      },
+      {
+        business: "LOGIX",
+        catalogItemId: String(product._id),
+        quantity: 2,
+      },
+    ],
+  };
+  const result = expectOk(
+    await commitWorkbook(apiAgent, buffer, "xlsx", options),
+  );
+  assert.equal(result.imported, 1);
+  assert.equal(result.feesCreated, 1);
+  assert.equal(result.totalFees, 150);
+  const order = await Order.findOne();
+  assert.equal(order.businessType, "PARTNERSHIP");
+  const expenses = await Expense.find({ sourceOrderId: order._id });
+  assert.equal(expenses.length, 2);
+  assert.deepEqual(
+    [...new Set(expenses.map((expense) => expense.business))].sort(),
+    ["LOGIX", "TAMQO"],
+  );
+  assert.equal(
+    expenses.reduce((sum, expense) => sum + expense.amount, 0),
+    150,
+  );
+  assert.ok(expenses.every((expense) => expense.amount > 0));
+});
+
+test("Annuler par le Client imports CANCELLED and never duplicates its 150 DA fee", async () => {
+  const row = importRow({
+    Tracking: "CANCEL-001",
+    Situation: "Annuler par le Client",
+  });
+  const { response, buffer } = await previewWorkbook(apiAgent, [row]);
+  const preview = expectOk(response);
+  assert.equal(preview.rows[0].mappedStatus, "CANCELLED");
+  const first = expectOk(
+    await commitWorkbook(apiAgent, buffer, "xlsx", importOptions(preview)),
+  );
+  assert.equal(first.cancelled, 1);
+  assert.equal(first.feesCreated, 1);
+  const repeated = expectOk(
+    await commitWorkbook(apiAgent, buffer, "xlsx", importOptions(preview)),
+  );
+  assert.equal(repeated.feesCreated, 0);
+  assert.equal(await Order.countDocuments(), 1);
+  assert.equal(await Expense.countDocuments(), 1);
+  assert.equal((await Expense.findOne()).amount, 150);
+});
+
+test("tracking deduplicates orders while Algerian phone normalization deduplicates customers", async () => {
+  const rows = [
+    importRow({ Tracking: "PHONE-001", Mobile1: "0550123456" }),
+    importRow({
+      Tracking: "PHONE-002",
+      ID: "EXT-002",
+      Mobile1: "+213550123456",
+    }),
+  ];
+  const { response, buffer } = await previewWorkbook(apiAgent, rows);
+  const preview = expectOk(response);
+  const result = expectOk(
+    await commitWorkbook(apiAgent, buffer, "xlsx", importOptions(preview)),
+  );
+  assert.equal(result.imported, 2);
+  assert.equal(await Order.countDocuments(), 2);
+  assert.equal(await Customer.countDocuments(), 1);
+  const sync = await deliveryService.syncBatch();
+  assert.equal(sync.synced, 0);
+  assert.equal(sync.errors, 0);
+  assert.equal(sync.status, "COMPLETED");
+  const importedOrder = await Order.findOne({
+    importBatchId: result.batchId,
+  });
+  assert.equal(
+    (await apiAgent.post(`/api/orders/${importedOrder._id}/shipment`)).status,
+    409,
+  );
+
+  await Shipment.updateOne(
+    { tracking: "PHONE-001" },
+    { $set: { tracking: "phone-001" } },
+  );
+  const oneRow = await previewWorkbook(apiAgent, [rows[0]]);
+  const duplicatePreview = expectOk(oneRow.response);
+  assert.equal(duplicatePreview.rows[0].existingOrderId != null, true);
+  expectOk(
+    await commitWorkbook(
+      apiAgent,
+      oneRow.buffer,
+      "xlsx",
+      importOptions(duplicatePreview),
+    ),
+  );
+  assert.equal(await Order.countDocuments(), 2);
+  assert.equal(await Customer.countDocuments(), 1);
+});
+
+test("unknown Wilaya and Product block rows, and malformed Excel is rejected", async () => {
+  const unresolved = await previewWorkbook(apiAgent, [
+    importRow({ Wilaya: "Atlantis", Produit: "Unknown automatic product" }),
+  ]);
+  const unknown = expectOk(unresolved.response);
+  assert.equal(unknown.rows[0].needsWilayaMapping, true);
+  assert.equal(unknown.rows[0].needsProductMapping, true);
+  assert.equal(unknown.rows[0].action, "NEEDS_MAPPING");
+  assert.equal(unknown.summary.eligibleRows, 0);
+  const unresolvedCommit = await commitWorkbook(
+    apiAgent,
+    unresolved.buffer,
+    "xlsx",
+    {
+      selectedRows: [unknown.rows[0].rowNumber],
+      productMappings: {},
+      wilayaMappings: {},
+    },
+  );
+  assert.equal(unresolvedCommit.status, 409);
+  assert.match(unresolvedCommit.body.error.message, /selected row.*not ready/i);
+  assert.equal(await ImportBatch.countDocuments(), 0);
+
+  const invalidHeaders = importHeaders.filter((header) => header !== "Client");
+  const invalid = await previewWorkbook(
+    apiAgent,
+    [importRow()],
+    "xlsx",
+    invalidHeaders,
+  );
+  assert.equal(invalid.response.status, 400);
+  assert.match(invalid.response.body.error.message, /Missing critical columns/);
+
+  const malformed = await apiAgent
+    .post("/api/imports/orders/preview")
+    .attach("file", Buffer.from([0, 1, 2, 3, 4]), "broken.xlsx");
+  assert.equal(malformed.status, 400);
+  assert.equal(await Order.countDocuments(), 0);
+});
+
+test("imports.view, imports.execute and business access are enforced independently", async () => {
+  const viewUser = expectOk(
+    await apiAgent.post("/api/users").send({
+      name: "Import Preview User",
+      email: "import-preview@example.com",
+      password: "employee-password",
+      businessAccess: ["LOGIX"],
+      permissions: [P.imports.view],
+    }),
+  );
+  const executeUser = expectOk(
+    await apiAgent.post("/api/users").send({
+      name: "Import Execute User",
+      email: "import-execute@example.com",
+      password: "employee-password",
+      businessAccess: ["LOGIX"],
+      permissions: [P.imports.execute],
+    }),
+  );
+  const viewAgent = supertest.agent(app);
+  const executeAgent = supertest.agent(app);
+  expectOk(
+    await viewAgent.post("/api/auth/login").send({
+      email: viewUser.email,
+      password: "employee-password",
+    }),
+  );
+  expectOk(
+    await executeAgent.post("/api/auth/login").send({
+      email: executeUser.email,
+      password: "employee-password",
+    }),
+  );
+  const { response, buffer } = await previewWorkbook(viewAgent, [
+    importRow({ Tracking: "PERMISSION-001" }),
+  ]);
+  const preview = expectOk(response);
+  assert.equal(
+    (await commitWorkbook(viewAgent, buffer, "xlsx", importOptions(preview)))
+      .status,
+    403,
+  );
+  assert.equal(
+    (await previewWorkbook(executeAgent, [importRow()])).response.status,
+    403,
+  );
+  const executeResult = expectOk(
+    await commitWorkbook(executeAgent, buffer, "xlsx", importOptions(preview)),
+  );
+  assert.equal(executeResult.imported, 1);
+
+  const forbiddenOptions = importOptions(preview);
+  forbiddenOptions.selectedRows = [2];
+  forbiddenOptions.productMappings = {
+    [preview.productMappings[0].key]: [
+      {
+        business: "TAMQO",
+        catalogItemId: String(plan._id),
+        quantity: 1,
+      },
+    ],
+  };
+  assert.equal(
+    (await commitWorkbook(executeAgent, buffer, "xlsx", forbiddenOptions))
+      .status,
+    403,
+  );
 });
 test("catalog renames and price changes do not mutate order snapshots", async () => {
   const order = await createOrder(input());
@@ -439,7 +921,56 @@ test("shipment tracking refresh updates mapped status once and retains unknown v
     (await Shipment.findOne({ orderId: o._id })).providerStatus,
     "undocumented",
   );
+  assert.equal(
+    (await Shipment.findOne({ orderId: o._id })).syncStatus,
+    "SYNCED",
+  );
+  assert.equal((await Shipment.findOne({ orderId: o._id })).lastError, "");
+  assert.equal((await Shipment.findOne({ orderId: o._id })).status, null);
+  await service.refresh(o._id);
+  assert.equal((await Order.findById(o._id)).status, "SHIPPED");
   delete process.env.DELIVERY_STATUS_MAP;
+});
+test("real ABEX lire status updates provider metadata and maps Situation", async () => {
+  const order = await createOrder(input());
+  await transition(order._id, "CONFIRMED");
+  await transition(order._id, "PREPARING");
+  await Shipment.create({
+    orderId: order._id,
+    agencyId: order.delivery.agencyId,
+    agencyName: order.delivery.agencyName,
+    provider: "PROCOLIS",
+    tracking: "ABVIN086R",
+    trackingKey: "ABVIN086R",
+    status: "PREPARING",
+  });
+  const raw = {
+    Colis: [
+      {
+        Tracking: "ABVIN086R",
+        IDSituation: 28,
+        Situation: "Dispatcher",
+        DateH_Action: "2026-09-10T21:32:18.858",
+      },
+    ],
+  };
+  const service = new DeliverySyncService({
+    async readPackages() {
+      return raw;
+    },
+  });
+  const shipment = await service.refresh(order._id);
+  assert.equal(shipment.providerStatus, "Dispatcher");
+  assert.equal(shipment.providerSituationId, "28");
+  assert.equal(
+    shipment.providerUpdatedAt.getTime(),
+    new Date("2026-09-10T21:32:18.858").getTime(),
+  );
+  assert.equal(shipment.status, "SHIPPED");
+  assert.equal(shipment.syncStatus, "SYNCED");
+  assert.equal(shipment.lastError, "");
+  assert.deepEqual(shipment.sanitizedProviderData, raw);
+  assert.equal((await Order.findById(order._id)).status, "SHIPPED");
 });
 test("pagination and detailed filters are enforced server-side", async () => {
   await createOrder(input("TAMQO_ONLY"));
@@ -1850,7 +2381,8 @@ test("unknown success is retained and retries only read deterministic tracking",
   );
   assert.equal(linked.tracking, o.orderNumber);
   assert.equal(linked.uncertain, false);
-  assert.equal(linked.syncStatus, "ERROR");
+  assert.equal(linked.syncStatus, "SYNCED");
+  assert.equal(linked.lastError, "");
   assert.equal(linked.providerStatus, "unknown");
   assert.equal((await Order.findById(o._id)).status, "NEW");
   assert.deepEqual(
@@ -1957,7 +2489,8 @@ test("Double Tracking reconciles with lire and never repeats add_colis", async (
     ),
   );
   const order = expectOk(await apiAgent.post("/api/orders").send(f.input));
-  assert.equal(order.shipment.syncStatus, "ERROR");
+  assert.equal(order.shipment.syncStatus, "SYNCED");
+  assert.equal(order.shipment.lastError, "");
   assert.equal(order.shipment.providerStatus, "existing");
   assert.equal(order.shipment.uncertain, false);
   assert.equal(order.shipment.tracking, order.orderNumber);
@@ -2126,6 +2659,7 @@ test("delivery sync batches by agency, uses order terminal state, persists outco
       agencyName: fixture.agency.name,
       provider: "PROCOLIS",
       tracking: ["SYNC-A", "SYNC-B", "SYNC-C", "SYNC-TERMINAL"][index],
+      trackingKey: ["SYNC-A", "SYNC-B", "SYNC-C", "SYNC-TERMINAL"][index],
       // Deliberately opposite for two records: eligibility must use Order.status.
       status: index === 0 ? "DELIVERED" : "SHIPPED",
     })),
@@ -2163,7 +2697,7 @@ test("delivery sync batches by agency, uses order terminal state, persists outco
       scanned: 4,
       eligible: 3,
       attempted: 3,
-      successful: 1,
+      successful: 2,
       changed: 2,
       unchanged: 1,
       terminalReached: 1,
@@ -2206,6 +2740,12 @@ test("delivery sync batches by agency, uses order terminal state, persists outco
   );
   assert.equal(items[1].afterProviderStatus, "Mystery   Status");
   assert.equal(items[1].afterOrderStatus, "SHIPPED");
+  assert.equal(items[1].error, null);
+  assert.equal(
+    (await Shipment.findOne({ tracking: "SYNC-B" })).syncStatus,
+    "SYNCED",
+  );
+  assert.equal((await Shipment.findOne({ tracking: "SYNC-B" })).status, null);
   assert.equal((await Order.findById(orders[2]._id)).status, "SHIPPED");
   assert.ok((await Shipment.findOne({ tracking: "SYNC-A" })).lastSyncedAt);
   assert.ok((await Shipment.findOne({ tracking: "SYNC-B" })).lastSyncedAt);
@@ -2264,6 +2804,7 @@ test("an active MongoDB delivery lease prevents concurrent cron execution", asyn
     agencyName: fixture.agency.name,
     provider: "PROCOLIS",
     tracking: "LOCKED-SYNC",
+    trackingKey: "LOCKED-SYNC",
     status: "SHIPPED",
   });
   const first = deliveryService.syncBatch({ trigger: "CRON" });

@@ -78,6 +78,12 @@ function publicRun(run) {
 async function context(id, capability, creating = false) {
   const order = await Order.findById(id);
   assert(order, "Order not found", 404);
+  const shipment = await Shipment.findOne({ orderId: id });
+  assert(
+    shipment?.origin !== "EXCEL_IMPORT",
+    "Excel-imported shipments are internal records and cannot call a delivery provider.",
+    409,
+  );
   const agency = await DeliveryAgency.findById(order.delivery.agencyId);
   assert(agency, "Order delivery agency is missing. Run the migration.", 409);
   if (creating) {
@@ -197,7 +203,9 @@ export const deliveryService = {
               agencyName: agency.name,
               provider: "MANUAL",
               externalId: order.orderNumber,
-              ...(tracking ? { tracking } : {}),
+              ...(tracking
+                ? { tracking, trackingKey: tracking.toUpperCase() }
+                : {}),
               status: o.status,
               syncStatus: "SYNCED",
               lastSyncedAt: new Date(),
@@ -249,6 +257,7 @@ export const deliveryService = {
       { orderId: id },
       {
         tracking: tracking.trim(),
+        trackingKey: tracking.trim().toUpperCase(),
         status: order.status,
         lastSyncedAt: new Date(),
       },
@@ -320,7 +329,9 @@ export const deliveryService = {
         counters.skipped = 1;
         return await finish("COMPLETED");
       }
-      const shipments = await Shipment.find({})
+      const shipments = await Shipment.find({
+          origin: { $ne: "EXCEL_IMPORT" },
+        })
           .sort({ lastSyncedAt: 1, _id: 1 })
           .lean(),
         orderIds = shipments.map((shipment) => shipment.orderId),
@@ -412,9 +423,10 @@ export const deliveryService = {
                 ...outcome,
                 durationMs: Math.max(0, Date.now() - began),
               });
-              if (outcome.result === "UNKNOWN_STATUS")
+              if (outcome.result === "UNKNOWN_STATUS") {
                 counters.unknownStatuses++;
-              else if (outcome.result === "ERROR") counters.failed++;
+                counters.successful++;
+              } else if (outcome.result === "ERROR") counters.failed++;
               else counters.successful++;
               if (outcome.changed) counters.changed++;
               else counters.unchanged++;
@@ -426,7 +438,7 @@ export const deliveryService = {
         }
       }
       return await finish(
-        counters.failed || counters.unknownStatuses ? "PARTIAL" : "COMPLETED",
+        counters.failed ? "PARTIAL" : "COMPLETED",
       );
     } catch {
       counters.failed = Math.max(counters.failed, counters.attempted || 1);

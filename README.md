@@ -113,7 +113,7 @@ The response preserves top-level order fields and adds `shipment` and `shipmentS
 
 Every outbound creation attempt remains reserved, including timeouts and HTTP errors. A later retry checks the order number through `/lire` before any new creation. An administrator can still explicitly confirm parcel absence to unlock one retry. No external-reference search endpoint is assumed. Unknown tracking blocks readiness until reconciliation; linked parcels use `/pret`.
 
-The parser accepts the legacy `{ Colis: [...] }` envelope, a direct array returned by the legacy service, or one direct object with `Tracking`. It reads `Tracking`, `Statut`, and `MessageRetour` and preserves other sanitized provider properties.
+The parser accepts the legacy `{ Colis: [...] }` envelope, a direct array returned by the legacy service, or one direct object with `Tracking`. For `/lire`, it reads `Situation` first and retains `IDSituation` plus `DateH_Action`; legacy `Statut` remains a fallback. The complete sanitized provider response is preserved for diagnostics.
 
 ### Orders and history
 
@@ -186,7 +186,7 @@ The request mapping includes Tracking, TypeLivraison (`0` home / `1` desk), Type
 
 ### Response verification
 
-Legacy creation responses are read from `Colis[0]`. `Good` is successful, `Double Tracking` is reconciled through `/lire`, and any other `MessageRetour` is retained as a provider rejection. Leave `DELIVERY_STATUS_MAP={}` until ABEX status values are verified. Unknown `Statut` values are retained without changing the order.
+Legacy creation responses are read from `Colis[0]`. `Good` is successful, `Double Tracking` is reconciled through `/lire`, and any other `MessageRetour` is retained as a provider rejection. Verified ABEX labels have built-in mappings; `DELIVERY_STATUS_MAP` can extend or override them. Unknown `Situation` values remain successful syncs, retain the exact provider label, and do not change the order.
 
 Known mapped forward status jumps can skip unobserved stages; only the actual observed transition is recorded. Invalid regressions and terminal-state changes are retained as sync errors for review.
 

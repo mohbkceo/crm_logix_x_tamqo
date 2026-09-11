@@ -28,7 +28,7 @@ const statusTone = (status) =>
     ? "delivered"
     : status === "RUNNING"
       ? "shipped"
-      : status === "UNCHANGED"
+      : status === "UNCHANGED" || status === "UNKNOWN_STATUS"
         ? "confirmed"
         : "failed_delivery";
 
@@ -78,7 +78,11 @@ function RunDetails({ id, onClose }) {
                     key: "result",
                     label: "Result",
                     render: (row) => (
-                      <Badge tone={statusTone(row.result)}>{row.result}</Badge>
+                      <Badge tone={statusTone(row.result)}>
+                        {row.result === "UNKNOWN_STATUS"
+                          ? "Unmapped provider status"
+                          : row.result}
+                      </Badge>
                     ),
                   },
                   { key: "error", label: "Error" },

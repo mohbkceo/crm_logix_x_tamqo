@@ -208,6 +208,7 @@ export class DeliverySyncService {
         {
           $set: {
             tracking: result.parcel.tracking,
+            trackingKey: result.parcel.tracking.toUpperCase(),
             uncertain: false,
             lockUntil: null,
           },
@@ -325,11 +326,14 @@ export class DeliverySyncService {
       const beforeProviderStatus = s.providerStatus || null,
         beforeOrderStatus = order.status;
       s.tracking = parcel.tracking;
+      s.trackingKey = parcel.tracking.toUpperCase();
       s.uncertain = false;
       s.lockUntil = null;
       s.providerAccepted = true;
       if (parcel.messageRetour) s.messageRetour = parcel.messageRetour;
       s.providerStatus = parcel.providerStatus;
+      s.providerSituationId = parcel.providerSituationId;
+      s.providerUpdatedAt = parcel.providerUpdatedAt;
       s.sanitizedProviderData = parcel.raw;
       s.lastSyncedAt = new Date();
       s.lastError = "";
@@ -351,12 +355,10 @@ export class DeliverySyncService {
           result = "ERROR";
         }
       } else if (!status && (options.requireStatus || parcel.providerStatus)) {
-        s.lastError = `UNKNOWN_STATUS: ${parcel.providerStatus || "(empty)"}`;
-        s.syncStatus = "ERROR";
         result = "UNKNOWN_STATUS";
       }
       // Unknown provider values are retained without guessing a normalized order status.
-      s.status = status || afterOrderStatus;
+      s.status = status || null;
       await s.save({ session });
       const changed =
           beforeProviderStatus !== (s.providerStatus || null) ||
@@ -381,6 +383,11 @@ export class DeliverySyncService {
   }
   async refresh(orderId) {
     const s = await Shipment.findOne({ orderId });
+    assert(
+      s?.origin !== "EXCEL_IMPORT",
+      "Excel-imported shipments cannot call a delivery provider.",
+      409,
+    );
     if (s?.creationAttemptedAt && s.uncertain && !s.tracking)
       return this.create(orderId);
     assert(s?.tracking, "No tracking number is linked to this order.", 409);
@@ -421,6 +428,11 @@ export class DeliverySyncService {
     const s = await Shipment.findOne({ orderId }),
       o = await Order.findById(orderId);
     assert(o, "Order not found", 404);
+    assert(
+      s?.origin !== "EXCEL_IMPORT",
+      "Excel-imported shipments cannot call a delivery provider.",
+      409,
+    );
     assert(
       o.status === "PREPARING" || o.status === "READY_TO_SHIP",
       "Prepare this order first.",
@@ -480,6 +492,11 @@ export class DeliverySyncService {
   async reconcile(orderId, tracking, absentConfirmed = false, actor) {
     const s = await Shipment.findOne({ orderId });
     assert(s, "No shipment attempt to reconcile", 404);
+    assert(
+      s.origin !== "EXCEL_IMPORT",
+      "Excel-imported shipments cannot call a delivery provider.",
+      409,
+    );
     assert(
       !s.lockUntil || s.lockUntil < new Date(),
       "Shipment request is still in progress.",
@@ -543,6 +560,7 @@ export class DeliverySyncService {
       $inc: { __v: 1 },
       $set: {
         tracking: tracking.trim(),
+        trackingKey: tracking.trim().toUpperCase(),
         uncertain: false,
         providerAccepted: true,
       },

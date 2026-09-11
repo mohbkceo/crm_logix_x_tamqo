@@ -21,6 +21,16 @@ import {
 import { assert } from "../errors.js";
 import { resolveCatalogItem } from "./catalogService.js";
 export const transaction = (fn) => mongoose.connection.transaction(fn);
+export async function allocateOrderNumber() {
+  // Allocate outside order transactions so rolled-back numbers are never reused.
+  const year = new Date().getUTCFullYear();
+  const counter = await Counter.findOneAndUpdate(
+    { _id: `orders-${year}` },
+    { $inc: { value: 1 } },
+    { upsert: true, new: true },
+  );
+  return `ORD-${year}-${String(counter.value).padStart(6, "0")}`;
+}
 export async function materialize(input, session, existing) {
   const p = orderInput.parse(input),
     phone = normalizePhone(p.customer.phoneA);
@@ -138,14 +148,7 @@ export async function materialize(input, session, existing) {
   };
 }
 export async function createOrder(input, actor = "admin") {
-  // Allocate outside the order transaction: rolled-back numbers are intentionally never reused.
-  const year = new Date().getUTCFullYear();
-  const counter = await Counter.findOneAndUpdate(
-    { _id: `orders-${year}` },
-    { $inc: { value: 1 } },
-    { upsert: true, new: true },
-  );
-  const orderNumber = `ORD-${year}-${String(counter.value).padStart(6, "0")}`;
+  const orderNumber = await allocateOrderNumber();
   return transaction(async (session) => {
     const data = await materialize(input, session);
     const [order] = await Order.create(

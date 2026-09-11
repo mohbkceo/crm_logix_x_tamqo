@@ -86,6 +86,7 @@ export function sanitizeProviderStatus(value) {
   return status || null;
 }
 export function parsePackages(raw) {
+  const sanitizedRaw = sanitizeProviderData(raw);
   return extractColis(raw)
     .filter(
       (v) =>
@@ -93,14 +94,27 @@ export function parsePackages(raw) {
         validTracking(v.Tracking) &&
         (!v.MessageRetour || v.MessageRetour === "Good"),
     )
-    .map((v) => ({
-      tracking: v.Tracking.trim(),
-      externalId: typeof v.id_Externe === "string" ? v.id_Externe : null,
-      providerStatus: sanitizeProviderStatus(v.Statut),
-      messageRetour:
-        typeof v.MessageRetour === "string" ? v.MessageRetour : null,
-      raw: sanitizeProviderData(v),
-    }));
+    .map((v) => {
+      const providerStatus =
+        typeof v.Situation === "string" && v.Situation.trim()
+          ? v.Situation.trim()
+          : typeof v.Statut === "string" || typeof v.Statut === "number"
+            ? String(v.Statut).trim()
+            : null;
+      return {
+        tracking: v.Tracking.trim(),
+        externalId: typeof v.id_Externe === "string" ? v.id_Externe : null,
+        providerStatus: sanitizeProviderStatus(providerStatus),
+        providerSituationId:
+          v.IDSituation !== undefined && v.IDSituation !== null
+            ? String(v.IDSituation)
+            : null,
+        providerUpdatedAt: v.DateH_Action ? new Date(v.DateH_Action) : null,
+        messageRetour:
+          typeof v.MessageRetour === "string" ? v.MessageRetour : null,
+        raw: sanitizedRaw,
+      };
+    });
 }
 export function parseCreationResult(raw, orderNumber) {
   const rows = extractColis(raw);

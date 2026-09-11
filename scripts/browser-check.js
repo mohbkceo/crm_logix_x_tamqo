@@ -4,6 +4,7 @@ import mongoose from "mongoose";
 import assert from "node:assert/strict";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
+import * as XLSX from "xlsx";
 process.env.NODE_ENV = "test";
 process.env.CLIENT_URL = "http://127.0.0.1:4019";
 process.env.BOOTSTRAP_SUPER_ADMIN_NAME = "Browser Test Admin";
@@ -17,8 +18,24 @@ const replica = await MongoMemoryReplSet.create({
 await mongoose.connect(replica.getUri("browser_check"));
 const { seed } = await import("../server/src/seed.js");
 await seed();
+const { TamqoPlan, LogixProduct, OrderSource, ExpenseCategory, Wilaya } =
+  await import("../server/src/models/index.js");
+await Promise.all([
+  TamqoPlan.create({ name: "3 Months", price: 4000, durationDays: 90 }),
+  LogixProduct.create({ name: "20cm Plaque", price: 3500 }),
+  OrderSource.create({ name: "Messages", isDefault: true }),
+  ExpenseCategory.create({ business: "TAMQO", name: "Software" }),
+]);
 const { migrate } = await import("../server/src/migrate.js");
 await migrate();
+const { DeliveryAgency, DeliveryRate } =
+  await import("../server/src/models/delivery.js");
+const browserAgency = await DeliveryAgency.findOne({ code: "ABEX" });
+const browserWilaya = await Wilaya.findOne({ agencyId: "16" });
+await DeliveryRate.updateOne(
+  { agencyId: browserAgency._id, wilayaId: browserWilaya._id },
+  { homePrice: 500, deskPrice: 300 },
+);
 const { app } = await import("../server/src/app.js");
 const server = await new Promise((resolve) => {
   const s = app.listen(4019, "127.0.0.1", () => resolve(s));
@@ -51,11 +68,117 @@ try {
     ["/settings/agencies", "Delivery agencies"],
     ["/settings/registration", "Registration security"],
     ["/settings/audit", "Audit log"],
+    ["/settings/import-data", "Bring external orders into the workspace."],
     ["/team", "Employee performance"],
   ]) {
     await goto(route);
     await page.getByRole("heading", { name: heading, exact: true }).waitFor();
   }
+  await goto("/settings/import-data");
+  const importHeaders = [
+    "Date",
+    "Tracking",
+    "ID",
+    "Client",
+    "Mobile1",
+    "Mobile2",
+    "adresse",
+    "Wilaya",
+    "Commune",
+    "Produit",
+    "Note",
+    "Situation",
+    "Commentaire",
+    "Date Action",
+    "Total",
+    "Frais de livraison",
+  ];
+  const importValues = [
+    "08/09/2026",
+    "BROWSER-IMPORT-001",
+    "BROWSER-EXT-001",
+    "Browser Import Customer",
+    "0550123456",
+    "",
+    "12 Import Street",
+    "16 - Alger",
+    "Alger Centre",
+    "Genuinely ambiguous product",
+    "",
+    "En livraison",
+    "",
+    "08/09/2026",
+    4000,
+    500,
+  ];
+  const importSheet = XLSX.utils.aoa_to_sheet([
+    importHeaders,
+    importValues,
+    importValues.map((value, index) =>
+      index === 1
+        ? "BROWSER-IMPORT-DELIVERED"
+        : index === 11
+          ? "Livrée"
+          : value,
+    ),
+    importValues.map((value, index) =>
+      index === 1
+        ? "BROWSER-IMPORT-INVALID"
+        : index === 3
+          ? ""
+          : index === 9
+            ? "Plaque 20*20"
+            : value,
+    ),
+  ]);
+  const importBuffer = XLSX.write(
+    { SheetNames: ["Orders"], Sheets: { Orders: importSheet } },
+    { type: "buffer", bookType: "xlsx" },
+  );
+  const analyzed = page.waitForResponse(
+    (response) =>
+      response.url().endsWith("/api/imports/orders/preview") &&
+      response.request().method() === "POST",
+  );
+  await page.locator('input[type="file"]').setInputFiles({
+    name: "browser-import.xlsx",
+    mimeType:
+      "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    buffer: importBuffer,
+  });
+  assert.equal((await analyzed).status(), 200);
+  await page.getByRole("heading", { name: "Review rows" }).waitFor();
+  const rowCheckboxes = page.locator('.row-select input[type="checkbox"]');
+  assert.equal(await rowCheckboxes.count(), 3);
+  const unresolvedCheckbox = rowCheckboxes.nth(0);
+  assert.equal(await unresolvedCheckbox.isChecked(), true);
+  assert.equal(await unresolvedCheckbox.isDisabled(), false);
+  for (const index of [1, 2]) {
+    assert.equal(await rowCheckboxes.nth(index).isChecked(), false);
+    assert.equal(await rowCheckboxes.nth(index).isDisabled(), true);
+  }
+  await page
+    .getByText("1 selected · 0 ready to import · 1 need resolution", {
+      exact: true,
+    })
+    .first()
+    .waitFor();
+  await page.getByRole("button", { name: "Deselect all" }).click();
+  assert.equal(await unresolvedCheckbox.isChecked(), false);
+  await page.getByRole("button", { name: "Select all importable" }).click();
+  assert.equal(await unresolvedCheckbox.isChecked(), true);
+  assert.equal(await rowCheckboxes.nth(1).isChecked(), false);
+  assert.equal(await rowCheckboxes.nth(2).isChecked(), false);
+  await page
+    .getByRole("button", { name: "Add catalog item", exact: true })
+    .click();
+  await page
+    .getByText("1 selected · 1 ready to import · 0 need resolution", {
+      exact: true,
+    })
+    .first()
+    .waitFor();
+  assert.equal(await unresolvedCheckbox.isChecked(), true);
   await goto("/");
   await page.getByText("Your sales story starts here").waitFor();
   await page.screenshot({
@@ -199,7 +322,7 @@ try {
     .fill("550");
   await page.getByRole("button", { name: "Save changes", exact: true }).click();
   await page.getByRole("dialog").waitFor({ state: "hidden" });
-  await page.getByText("550 DA", { exact: true }).waitFor();
+  await page.getByText("550 DA", { exact: true }).first().waitFor();
   await goto("/customers");
   await page.getByRole("button", { name: "View orders", exact: true }).click();
   await page
@@ -239,7 +362,7 @@ try {
   assert.ok(width.main >= 380 && width.metric >= 160, JSON.stringify(width));
   assert.deepEqual(errors, []);
   console.log(
-    "Browser verification passed: order creation, fulfillment, collection, analytics tabs, expense CRUD/filtering, business isolation, catalog/source/shipping configuration, customer history, order filters, mobile layout.",
+    "Browser verification passed: Import Data route, order creation, fulfillment, collection, analytics tabs, expense CRUD/filtering, business isolation, catalog/source/shipping configuration, customer history, order filters, mobile layout.",
   );
   console.log("Screenshots: " + output);
 } catch (error) {

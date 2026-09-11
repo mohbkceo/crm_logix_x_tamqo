@@ -25,6 +25,7 @@ import {
   Radio,
   Handshake,
   BadgeDollarSign,
+  FileSpreadsheet,
   X,
 } from "lucide-react";
 import { api, useApi, ConfigContext } from "./api";
@@ -34,6 +35,7 @@ import { Orders, OrderDetails, OrderForm } from "./pages/Orders";
 import { Expenses } from "./pages/Expenses";
 import { Sales } from "./pages/Sales";
 import { Settings } from "./pages/Settings";
+import { ImportData } from "./pages/ImportData";
 import { DeliverySyncLogs } from "./pages/DeliverySyncLogs";
 import { Customers } from "./pages/Customers";
 import { UserContext, Can, Guard, P, can, hasBusinessAccess } from "./access";
@@ -341,6 +343,12 @@ function Workspace({ user, logout }) {
                     <span>Settings</span>
                   </NavLink>
                 </Can>
+                <Can permission={P.imports.view}>
+                  <NavLink to="/settings/import-data">
+                    <FileSpreadsheet size={17} />
+                    <span>Import data</span>
+                  </NavLink>
+                </Can>
                 <Can permission={P.users.view}>
                   <NavLink to="/settings/users">Users</NavLink>
                 </Can>
@@ -593,6 +601,14 @@ function Workspace({ user, logout }) {
                     element={
                       <Guard permissions={[P.customers.view]}>
                         <Customers />
+                      </Guard>
+                    }
+                  />
+                  <Route
+                    path="/settings/import-data"
+                    element={
+                      <Guard permissions={[P.imports.view]}>
+                        <ImportData />
                       </Guard>
                     }
                   />

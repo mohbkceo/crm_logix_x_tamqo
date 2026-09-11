@@ -21,12 +21,17 @@ import {
 import {
   deliveryStatusMapping,
   mapProviderStatus,
+  normalizeProviderStatus,
 } from "../src/services/delivery/deliveryStatusMapper.js";
 import {
   DEFAULT_DELIVERY_SYNC_INTERVAL_MS,
   deliverySyncSettings,
   startDeliverySyncScheduler,
 } from "../src/services/delivery/deliveryScheduler.js";
+import {
+  mapImportSituation,
+  normalizeImportText,
+} from "../src/services/importService.js";
 const items = [
   {
     business: "TAMQO",
@@ -81,6 +86,46 @@ test("Algerian phone formats resolve to one primary identity", () => {
   ])
     assert.equal(normalizePhone(p), "+213550123456");
   assert.throws(() => normalizePhone("123"));
+});
+test("Excel situations normalize accents and map only observed safe CRM statuses", () => {
+  for (const situation of [
+    "Livrée [Encaisser]",
+    "Livrée [Recouvert]",
+    "Livrée",
+  ])
+    assert.deepEqual(mapImportSituation(situation), {
+      status: "DELIVERED",
+      delivered: true,
+      known: true,
+    });
+  for (const situation of [
+    "Retour Client",
+    "Retour Livreur",
+    "Retour Navette",
+    "Retour de Dispatche",
+  ]) {
+    const mapped = mapImportSituation(situation);
+    assert.equal(mapped.status, "RETURNED");
+    assert.equal(mapped.fee, true);
+  }
+  assert.equal(mapImportSituation("Annuler par le Client").status, "CANCELLED");
+  assert.equal(mapImportSituation("En livraison").status, "OUT_FOR_DELIVERY");
+  assert.equal(mapImportSituation("En Préparation").status, "PREPARING");
+  assert.equal(mapImportSituation("En Traitement").status, "PREPARING");
+  assert.equal(mapImportSituation("Dispatcher").status, "READY_TO_SHIP");
+  for (const situation of [
+    "SD - En Attente du Client",
+    "SD - Appel sans Réponse",
+    "A Relancé",
+  ])
+    assert.equal(mapImportSituation(situation).status, "CONFIRMED");
+  const unknown = mapImportSituation("External custom status");
+  assert.equal(unknown.status, "CONFIRMED");
+  assert.equal(unknown.known, false);
+  assert.equal(
+    normalizeImportText("  Fràis   de Livraison "),
+    "frais de livraison",
+  );
 });
 test("classification derives from items and overrides remain item based", () => {
   assert.equal(
@@ -282,12 +327,27 @@ test("current balance uses realized scoped order revenue, direct sales once, and
     currentBalance: 10000,
   });
 });
-test("delivery status mappings normalize case and whitespace and reject empty maps", () => {
+test("delivery status mappings include normalized verified ABEX statuses", () => {
   const previous = process.env.DELIVERY_STATUS_MAP;
   try {
     process.env.DELIVERY_STATUS_MAP = "{}";
-    assert.equal(deliveryStatusMapping().configured, false);
+    assert.equal(deliveryStatusMapping().configured, true);
     assert.equal(mapProviderStatus("Delivered"), null);
+    assert.equal(
+      normalizeProviderStatus("Livrée [ Encaisser ]"),
+      "livree [ encaisser ]",
+    );
+    for (const [providerStatus, internalStatus] of [
+      ["Dispatcher", "SHIPPED"],
+      ["En livraison", "OUT_FOR_DELIVERY"],
+      ["Livrée", "DELIVERED"],
+      ["Livrée [ Encaisser ]", "DELIVERED"],
+      ["Livrée [ Recouvert ]", "DELIVERED"],
+      ["Retour Stock", "RETURNED"],
+      ["Retour Navette", "RETURNING"],
+      ["SD - Appel sans Réponse 1", "FAILED_DELIVERY"],
+      ["Annuler par le Client", "CANCELLED"],
+    ]) assert.equal(mapProviderStatus(providerStatus), internalStatus);
     process.env.DELIVERY_STATUS_MAP = JSON.stringify({
       "  En   Livraison ": "OUT_FOR_DELIVERY",
     });
@@ -338,7 +398,7 @@ test("transitions reject lifecycle regressions and allow digital completion", ()
   assert.equal(canTransition("CONFIRMED", "DELIVERED", "TAMQO_ONLY"), true);
 });
 
-test("legacy Colis parser preserves status and rejects invented aliases", () => {
+test("Colis parser preserves status and rejects invented aliases", () => {
   const parcel = {
     Tracking: "ORD-1",
     Statut: "unknown",
@@ -348,7 +408,7 @@ test("legacy Colis parser preserves status and rejects invented aliases", () => 
   for (const raw of [{ Colis: [parcel] }, [parcel], parcel]) {
     assert.equal(parseCreationResult(raw, "ORD-1").trackingFound, true);
     assert.equal(parsePackages(raw)[0].providerStatus, "unknown");
-    assert.equal(parsePackages(raw)[0].raw.extra, 42);
+    assert.deepEqual(parsePackages(raw)[0].raw, raw);
   }
   for (const raw of [
     null,
@@ -386,6 +446,29 @@ test("legacy Colis parser preserves status and rejects invented aliases", () => 
     }),
     [],
   );
+});
+test("real ABEX lire responses prefer Situation and retain provider metadata", () => {
+  const raw = {
+    Colis: [
+      {
+        Tracking: "ABVIN086R",
+        IDSituation: 28,
+        Situation: "Dispatcher",
+        Statut: "legacy-status-must-not-win",
+        DateH_Action: "2026-09-10T21:32:18.858",
+      },
+    ],
+  };
+  const [parcel] = parsePackages(raw);
+  assert.equal(parcel.tracking, "ABVIN086R");
+  assert.equal(parcel.providerStatus, "Dispatcher");
+  assert.equal(parcel.providerSituationId, "28");
+  assert.equal(
+    parcel.providerUpdatedAt.getTime(),
+    new Date("2026-09-10T21:32:18.858").getTime(),
+  );
+  assert.equal(mapProviderStatus(parcel.providerStatus), "SHIPPED");
+  assert.deepEqual(parcel.raw, raw);
 });
 test("prepaid collection uses local wilaya agency ID and deterministic tracking", () => {
   const order = fixture({

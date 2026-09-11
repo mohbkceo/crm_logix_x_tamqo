@@ -1262,7 +1262,16 @@ export function OrderDetails() {
                             ? "Shipment synchronized"
                             : "Shipment awaiting verification"}
                   </p>
-                  <p>Provider status: {s.providerStatus || "Not reported"}</p>
+                  <p>
+                    Provider Status: {s.providerStatus || "Not reported"}
+                  </p>
+                  <p>CRM Status: {s.status ? human(s.status) : "Not mapped"}</p>
+                  {s.providerStatus && !s.status && (
+                    <Badge tone="confirmed">Unmapped provider status</Badge>
+                  )}
+                  <p>
+                    Provider Situation ID: {s.providerSituationId || "Not reported"}
+                  </p>
                   <p>
                     Last sync:{" "}
                     {s.lastSyncedAt

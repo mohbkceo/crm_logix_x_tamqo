@@ -6,11 +6,20 @@ import {
   useContext,
 } from "react";
 export async function api(path, options = {}) {
+  const formData =
+    typeof FormData !== "undefined" && options.body instanceof FormData;
   const response = await fetch("/api" + path, {
     credentials: "include",
     ...options,
-    headers: { "Content-Type": "application/json", ...options.headers },
-    body: options.body === undefined ? undefined : JSON.stringify(options.body),
+    headers: formData
+      ? { ...options.headers }
+      : { "Content-Type": "application/json", ...options.headers },
+    body:
+      options.body === undefined
+        ? undefined
+        : formData
+          ? options.body
+          : JSON.stringify(options.body),
   });
   if (response.status === 204) return null;
   const data = await response.json();

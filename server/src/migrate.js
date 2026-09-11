@@ -4,7 +4,14 @@ import { pathToFileURL } from "node:url";
 import { config } from "./config.js";
 import { User, RegistrationSetting } from "./models/security.js";
 import { DeliveryAgency, DeliveryRate } from "./models/delivery.js";
-import { Order, Shipment, Wilaya, Expense } from "./models/index.js";
+import {
+  Order,
+  Shipment,
+  Wilaya,
+  Expense,
+  ImportBatch,
+  ImportMapping,
+} from "./models/index.js";
 import { encryptCredentials } from "./services/delivery/credentials.js";
 export async function bootstrap() {
   const email = (
@@ -39,7 +46,16 @@ export async function bootstrap() {
   });
 }
 export async function migrate() {
-  await Promise.all([DeliveryAgency.init(), DeliveryRate.init(), User.init()]);
+  await Promise.all([
+    DeliveryAgency.init(),
+    DeliveryRate.init(),
+    User.init(),
+    Order.init(),
+    Shipment.init(),
+    Expense.init(),
+    ImportBatch.init(),
+    ImportMapping.init(),
+  ]);
   const agency = await DeliveryAgency.findOneAndUpdate(
     { code: "ABEX" },
     {
@@ -111,6 +127,10 @@ export async function migrate() {
         provider: "PROCOLIS",
       },
     },
+  );
+  await Shipment.collection.updateMany(
+    { tracking: { $type: "string" }, trackingKey: { $exists: false } },
+    [{ $set: { trackingKey: { $toUpper: "$tracking" } } }],
   );
   // Pipeline updates preserve legacy data and never assign an invented employee.
   await Expense.collection.updateMany({ date: { $exists: false } }, [

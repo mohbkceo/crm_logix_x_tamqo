@@ -90,6 +90,22 @@ const itemSchema = new Schema(
   },
   { _id: false },
 );
+export const ImportMapping = create(
+  "ImportMapping",
+  {
+    normalizedValue: {
+      type: String,
+      required: true,
+      trim: true,
+      maxlength: 500,
+    },
+    originalValue: { type: String, required: true, trim: true, maxlength: 500 },
+    items: { type: [itemSchema], required: true },
+    createdBy: { type: actorSchema, immutable: true },
+    updatedBy: actorSchema,
+  },
+  [[{ normalizedValue: 1 }, { unique: true }]],
+);
 const historySchema = new Schema(
   {
     status: { type: String, enum: STATUSES },
@@ -150,6 +166,9 @@ export const Order = create(
     status: { type: String, enum: STATUSES, default: "NEW" },
     statusHistory: [historySchema],
     originalData: { type: Schema.Types.Mixed, immutable: true },
+    importBatchId: { type: Schema.Types.ObjectId, ref: "ImportBatch" },
+    importFingerprint: { type: String },
+    importedAt: Date,
     revision: { type: Number, default: 0 },
   },
   [
@@ -164,6 +183,8 @@ export const Order = create(
     [{ "location.commune": 1 }, {}],
     [{ "items.business": 1, createdAt: -1 }, {}],
     [{ "items.catalogItemId": 1 }, {}],
+    [{ importBatchId: 1 }, { sparse: true }],
+    [{ importFingerprint: 1 }, { unique: true, sparse: true }],
   ],
 );
 export const OrderEvent = create(
@@ -172,7 +193,15 @@ export const OrderEvent = create(
     orderId: ref("Order"),
     kind: {
       type: String,
-      enum: ["CREATED", "STATUS", "EDITED", "ACTIVATED", "PAYMENT", "SHIPMENT"],
+      enum: [
+        "CREATED",
+        "STATUS",
+        "EDITED",
+        "ACTIVATED",
+        "PAYMENT",
+        "SHIPMENT",
+        "IMPORT",
+      ],
       required: true,
     },
     type: String,
@@ -190,10 +219,23 @@ export const Shipment = create("Shipment", {
   agencyId: { type: Schema.Types.ObjectId, ref: "DeliveryAgency", index: true },
   agencyName: String,
   provider: { type: String, default: "PROCOLIS" },
-  tracking: { type: String, unique: true, sparse: true },
+  origin: {
+    type: String,
+    enum: ["DELIVERY_PROVIDER", "EXCEL_IMPORT"],
+    default: "DELIVERY_PROVIDER",
+  },
+  tracking: { type: String, unique: true, sparse: true, maxlength: 150 },
+  trackingKey: {
+    type: String,
+    unique: true,
+    sparse: true,
+    maxlength: 150,
+    select: false,
+  },
   externalId: String,
   status: String,
   providerStatus: String,
+  providerSituationId: String,
   messageRetour: String,
   syncStatus: {
     type: String,
@@ -209,6 +251,8 @@ export const Shipment = create("Shipment", {
   providerAccepted: { type: Boolean, default: false },
   uncertain: { type: Boolean, default: false },
   lockUntil: Date,
+  importBatchId: { type: Schema.Types.ObjectId, ref: "ImportBatch" },
+  importRowNumber: Number,
 });
 export const Expense = create(
   "Expense",
@@ -229,6 +273,13 @@ export const Expense = create(
       default: "CASH",
     },
     note: String,
+    systemGenerated: { type: Boolean, default: false },
+    sourceType: String,
+    sourceOrderId: { type: Schema.Types.ObjectId, ref: "Order" },
+    sourceTracking: { type: String, maxlength: 150 },
+    sourceKey: { type: String, maxlength: 300 },
+    sourceGroupKey: { type: String, maxlength: 250 },
+    importBatchId: { type: Schema.Types.ObjectId, ref: "ImportBatch" },
   },
   [
     [{ business: 1, expenseDate: -1 }, {}],
@@ -236,6 +287,57 @@ export const Expense = create(
     [{ "createdBy.userId": 1, date: -1 }, {}],
     [{ categoryId: 1 }, {}],
     [{ paymentMethod: 1 }, {}],
+    [{ sourceKey: 1 }, { unique: true, sparse: true }],
+    [
+      { sourceType: 1, sourceOrderId: 1, business: 1 },
+      {
+        unique: true,
+        partialFilterExpression: {
+          systemGenerated: true,
+          sourceType: "DELIVERY_FAILURE_FEE",
+        },
+      },
+    ],
+  ],
+);
+export const ImportBatch = create(
+  "ImportBatch",
+  {
+    filename: { type: String, required: true, trim: true, maxlength: 255 },
+    fileType: { type: String, enum: ["xls", "xlsx"], required: true },
+    fileHash: { type: String, required: true },
+    importedBy: { type: actorSchema, required: true, immutable: true },
+    businesses: [{ type: String, enum: BUSINESS }],
+    totalRows: { type: Number, required: true, min: 0 },
+    importedRows: { type: Number, default: 0, min: 0 },
+    updatedRows: { type: Number, default: 0, min: 0 },
+    ignoredRows: { type: Number, default: 0, min: 0 },
+    duplicateRows: { type: Number, default: 0, min: 0 },
+    invalidRows: { type: Number, default: 0, min: 0 },
+    returnedRows: { type: Number, default: 0, min: 0 },
+    cancelledRows: { type: Number, default: 0, min: 0 },
+    feesCreated: { type: Number, default: 0, min: 0 },
+    feeAmount: { ...money, default: 0 },
+    status: {
+      type: String,
+      enum: ["PROCESSING", "COMPLETED", "PARTIAL", "FAILED"],
+      default: "PROCESSING",
+    },
+    failures: [
+      new Schema(
+        {
+          rowNumber: Number,
+          tracking: String,
+          message: String,
+        },
+        { _id: false },
+      ),
+    ],
+  },
+  [
+    [{ createdAt: -1 }, {}],
+    [{ businesses: 1, createdAt: -1 }, {}],
+    [{ "importedBy.userId": 1, createdAt: -1 }, {}],
   ],
 );
 export const Sale = create(
