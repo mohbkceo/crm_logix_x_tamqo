@@ -1,11 +1,80 @@
+import { randomUUID } from "node:crypto";
 import { Order, Shipment, OrderEvent } from "../../models/index.js";
-import { DeliveryAgency } from "../../models/delivery.js";
+import {
+  DeliveryAgency,
+  DeliverySyncItem,
+  DeliverySyncLock,
+  DeliverySyncRun,
+} from "../../models/delivery.js";
 import { audit } from "../../models/security.js";
 import { providerFor } from "./deliveryProviderFactory.js";
 import { DeliverySyncService } from "./deliverySyncService.js";
 import { transaction, transition } from "../orderService.js";
 import { assert, AppError } from "../../errors.js";
-import { sanitizeProviderData } from "./deliveryMapper.js";
+import {
+  parsePackages,
+  sanitizeProviderData,
+  validTracking,
+} from "./deliveryMapper.js";
+import { TERMINAL } from "../../constants.js";
+const SYNC_LOCK_ID = "delivery-status-sync";
+const SYNC_BATCH_SIZE = 20;
+const lockDuration = () =>
+  Math.max(
+    30 * 60 * 1000,
+    Number(process.env.DELIVERY_SYNC_INTERVAL_MS || 900000) * 2,
+  );
+const safeError = (error) =>
+  sanitizeProviderData(
+    error instanceof Error ? error.message : "Delivery synchronization failed.",
+  );
+async function acquireSyncLock(runId) {
+  const owner = randomUUID(),
+    now = new Date();
+  try {
+    const lock = await DeliverySyncLock.findOneAndUpdate(
+      {
+        _id: SYNC_LOCK_ID,
+        $or: [{ expiresAt: { $lte: now } }, { owner }],
+      },
+      {
+        $set: {
+          owner,
+          runId,
+          expiresAt: new Date(Date.now() + lockDuration()),
+        },
+      },
+      { upsert: true, new: true },
+    );
+    return lock?.owner === owner ? owner : null;
+  } catch (error) {
+    if (error?.code === 11000) return null;
+    throw error;
+  }
+}
+const releaseSyncLock = (owner) =>
+  owner
+    ? DeliverySyncLock.deleteOne({ _id: SYNC_LOCK_ID, owner })
+    : Promise.resolve();
+const extendSyncLock = (owner) =>
+  DeliverySyncLock.updateOne(
+    { _id: SYNC_LOCK_ID, owner },
+    { $set: { expiresAt: new Date(Date.now() + lockDuration()) } },
+  );
+function syncSummary(run) {
+  console.log(
+    `[DELIVERY SYNC] trigger=${run.trigger} run=${run._id} scanned=${run.scanned} eligible=${run.eligible} attempted=${run.attempted} changed=${run.changed} unchanged=${run.unchanged} terminal=${run.terminalReached} unknown=${run.unknownStatuses} failed=${run.failed} duration=${run.durationMs}ms`,
+  );
+}
+function publicRun(run) {
+  const value = run?.toObject ? run.toObject() : run;
+  return {
+    ...value,
+    runId: String(value._id),
+    synced: value.successful,
+    errors: value.failed + value.unknownStatuses,
+  };
+}
 async function context(id, capability, creating = false) {
   const order = await Order.findById(id);
   assert(order, "Order not found", 404);
@@ -189,26 +258,181 @@ export const deliveryService = {
     await event(id, actor, "Manual tracking updated");
     return result;
   },
-  async syncBatch() {
-    let synced = 0,
-      errors = 0;
-    const shipments = await Shipment.find({
-      status: { $nin: ["DELIVERED", "RETURNED", "CANCELLED"] },
-      tracking: { $type: "string" },
-    })
-      .sort({ lastSyncedAt: 1 })
-      .limit(100);
-    for (const s of shipments) {
-      try {
-        const agency = await DeliveryAgency.findById(s.agencyId);
-        if (agency?.integrationType !== "API" || !agency.capabilities?.tracking)
-          continue;
-        await this.refresh(s.orderId);
-        synced++;
-      } catch {
-        errors++;
+  async syncBatch({ trigger = "MANUAL" } = {}) {
+    const started = Date.now(),
+      run = await DeliverySyncRun.create({
+        trigger,
+        startedAt: new Date(started),
+        status: "RUNNING",
+      });
+    let lockOwner;
+    const counters = {
+      scanned: 0,
+      eligible: 0,
+      attempted: 0,
+      successful: 0,
+      failed: 0,
+      changed: 0,
+      unchanged: 0,
+      skipped: 0,
+      terminalReached: 0,
+      unknownStatuses: 0,
+    };
+    const finish = async (status) => {
+      const finishedAt = new Date(),
+        durationMs = Math.max(0, Date.now() - started);
+      Object.assign(run, counters, { status, finishedAt, durationMs });
+      await run.save();
+      syncSummary(run);
+      return publicRun(run);
+    };
+    const persistError = async (entry, error) => {
+      const message = safeError(error),
+        began = Date.now();
+      await Shipment.updateOne(
+        { _id: entry.shipment._id },
+        { $set: { syncStatus: "ERROR", lastError: message } },
+      );
+      await DeliverySyncItem.create({
+        runId: run._id,
+        orderId: entry.order._id,
+        orderNumber: entry.order.orderNumber,
+        shipmentId: entry.shipment._id,
+        tracking: entry.shipment.tracking,
+        agencyId: entry.agency._id,
+        agencyName: entry.agency.name,
+        beforeProviderStatus: entry.shipment.providerStatus || null,
+        afterProviderStatus: entry.shipment.providerStatus || null,
+        beforeOrderStatus: entry.order.status,
+        afterOrderStatus: entry.order.status,
+        changed: false,
+        terminalReached: false,
+        result: "ERROR",
+        error: message,
+        durationMs: Math.max(0, Date.now() - began),
+      });
+      counters.failed++;
+      counters.unchanged++;
+    };
+    try {
+      lockOwner = await acquireSyncLock(run._id);
+      if (!lockOwner) {
+        counters.skipped = 1;
+        return await finish("COMPLETED");
       }
+      const shipments = await Shipment.find({})
+          .sort({ lastSyncedAt: 1, _id: 1 })
+          .lean(),
+        orderIds = shipments.map((shipment) => shipment.orderId),
+        agencyIds = shipments.map((shipment) => shipment.agencyId),
+        [orders, agencies] = await Promise.all([
+          Order.find({ _id: { $in: orderIds } }).lean(),
+          DeliveryAgency.find({ _id: { $in: agencyIds } }).lean(),
+        ]),
+        ordersById = new Map(orders.map((order) => [String(order._id), order])),
+        agenciesById = new Map(
+          agencies.map((agency) => [String(agency._id), agency]),
+        );
+      counters.scanned = shipments.length;
+      const eligible = shipments.flatMap((shipment) => {
+        const order = ordersById.get(String(shipment.orderId)),
+          agency = agenciesById.get(String(shipment.agencyId));
+        return order &&
+          agency &&
+          validTracking(shipment.tracking) &&
+          agency.integrationType === "API" &&
+          agency.capabilities?.tracking &&
+          !TERMINAL.includes(order.status)
+          ? [{ shipment, order, agency }]
+          : [];
+      });
+      counters.eligible = eligible.length;
+      counters.attempted = eligible.length;
+      counters.skipped = counters.scanned - counters.eligible;
+      const byAgency = new Map();
+      for (const entry of eligible) {
+        const key = String(entry.agency._id);
+        if (!byAgency.has(key)) byAgency.set(key, []);
+        byAgency.get(key).push(entry);
+      }
+      for (const entries of byAgency.values()) {
+        await extendSyncLock(lockOwner);
+        let service;
+        try {
+          service = new DeliverySyncService(
+            await providerFor(entries[0].agency._id, "tracking"),
+          );
+        } catch (error) {
+          for (const entry of entries) await persistError(entry, error);
+          continue;
+        }
+        for (let index = 0; index < entries.length; index += SYNC_BATCH_SIZE) {
+          await extendSyncLock(lockOwner);
+          const batch = entries.slice(index, index + SYNC_BATCH_SIZE);
+          let parcels;
+          try {
+            parcels = parsePackages(
+              await service.client.readPackages(
+                batch.map((entry) => entry.shipment.tracking),
+              ),
+            );
+          } catch (error) {
+            for (const entry of batch) await persistError(entry, error);
+            continue;
+          }
+          const parcelsByTracking = new Map(
+            parcels.map((parcel) => [parcel.tracking.toUpperCase(), parcel]),
+          );
+          for (const entry of batch) {
+            const began = Date.now(),
+              parcel = parcelsByTracking.get(
+                entry.shipment.tracking.trim().toUpperCase(),
+              );
+            if (!parcel) {
+              await persistError(
+                entry,
+                new AppError("Tracking absent from batch response.", 502),
+              );
+              continue;
+            }
+            try {
+              const { outcome } = await service.applyWithResult(
+                entry.order._id,
+                parcel,
+                { requireStatus: true },
+              );
+              await DeliverySyncItem.create({
+                runId: run._id,
+                orderId: entry.order._id,
+                orderNumber: entry.order.orderNumber,
+                shipmentId: entry.shipment._id,
+                tracking: entry.shipment.tracking,
+                agencyId: entry.agency._id,
+                agencyName: entry.agency.name,
+                ...outcome,
+                durationMs: Math.max(0, Date.now() - began),
+              });
+              if (outcome.result === "UNKNOWN_STATUS")
+                counters.unknownStatuses++;
+              else if (outcome.result === "ERROR") counters.failed++;
+              else counters.successful++;
+              if (outcome.changed) counters.changed++;
+              else counters.unchanged++;
+              if (outcome.terminalReached) counters.terminalReached++;
+            } catch (error) {
+              await persistError(entry, error);
+            }
+          }
+        }
+      }
+      return await finish(
+        counters.failed || counters.unknownStatuses ? "PARTIAL" : "COMPLETED",
+      );
+    } catch {
+      counters.failed = Math.max(counters.failed, counters.attempted || 1);
+      return await finish("FAILED");
+    } finally {
+      await releaseSyncLock(lockOwner);
     }
-    return { synced, errors };
   },
 };

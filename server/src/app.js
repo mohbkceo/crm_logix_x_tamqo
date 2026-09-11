@@ -22,11 +22,13 @@ import { deliveryClient } from "./services/delivery/deliveryClient.js";
 import { securityRoutes } from "./routes/securityRoutes.js";
 import { agencyRoutes } from "./routes/agencyRoutes.js";
 import { teamRoutes, employeeOptions } from "./routes/teamRoutes.js";
+import { deliverySyncRoutes } from "./routes/deliverySyncRoutes.js";
 import { P, can, requirePermission, orderScope } from "./authorization.js";
 import { deliveryService } from "./services/delivery/deliveryService.js";
 import { normalizePhone } from "./domain/order.js";
 import { audit } from "./models/security.js";
 import { transaction } from "./services/orderService.js";
+import { deliveryStatusMapping } from "./services/delivery/deliveryStatusMapper.js";
 export const app = express();
 app.disable("x-powered-by");
 app.use(
@@ -62,6 +64,7 @@ app.use("/api/auth", authRoutes);
 app.use("/api", requireAuth);
 app.use("/api", securityRoutes);
 app.use("/api/delivery-agencies", agencyRoutes);
+app.use("/api/delivery-sync", deliverySyncRoutes);
 app.use("/api/analytics", teamRoutes);
 app.get("/api/employees", employeeOptions);
 app.use("/api/config", configRoutes);
@@ -208,15 +211,17 @@ app.patch(
 app.get(
   "/api/delivery/status",
   requirePermission(P.deliveryAgencies.view),
-  (_req, res) =>
+  (_req, res) => {
+    const mapping = deliveryStatusMapping();
     res.json({
       configured: Boolean(
         process.env.DELIVERY_API_TOKEN && process.env.DELIVERY_API_KEY,
       ),
-      statusMappingConfigured:
-        process.env.DELIVERY_STATUS_MAP !== "{}" &&
-        Boolean(process.env.DELIVERY_STATUS_MAP),
-    }),
+      statusMappingConfigured: mapping.configured,
+      statusMappingError: mapping.error,
+      invalidStatusMappings: mapping.invalidEntries || 0,
+    });
+  },
 );
 app.post(
   "/api/delivery/test",
@@ -237,14 +242,22 @@ app.post(
     });
   },
 );
-app.post("/api/delivery/sync", async (req, res) => {
-  assert(
-    req.user.role === "SUPER_ADMIN",
-    "Global synchronization requires Super Admin",
-    403,
-  );
-  res.json(await deliveryService.syncBatch());
-});
+app.post(
+  "/api/delivery/sync",
+  requirePermission(P.deliverySync.run),
+  async (req, res) => {
+    const result = await deliveryService.syncBatch({ trigger: "MANUAL" });
+    await audit(
+      req.actor,
+      "DELIVERY_SYNC_RUN",
+      "DeliverySyncRun",
+      result.runId,
+      undefined,
+      { status: result.status },
+    );
+    res.json(result);
+  },
+);
 app.use("/api", (_req, _res, next) =>
   next(new AppError("Endpoint not found", 404)),
 );

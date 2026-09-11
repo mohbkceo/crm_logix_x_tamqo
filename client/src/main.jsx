@@ -34,6 +34,7 @@ import { Orders, OrderDetails, OrderForm } from "./pages/Orders";
 import { Expenses } from "./pages/Expenses";
 import { Sales } from "./pages/Sales";
 import { Settings } from "./pages/Settings";
+import { DeliverySyncLogs } from "./pages/DeliverySyncLogs";
 import { Customers } from "./pages/Customers";
 import { UserContext, Can, Guard, P, can, hasBusinessAccess } from "./access";
 import {
@@ -346,6 +347,11 @@ function Workspace({ user, logout }) {
                 <Can permission={P.deliveryAgencies.view}>
                   <NavLink to="/settings/agencies">Delivery agencies</NavLink>
                 </Can>
+                <Can permission={P.deliverySync.view}>
+                  <NavLink to="/settings/delivery-sync">
+                    Delivery Sync Logs
+                  </NavLink>
+                </Can>
                 <Can permission={P.sessions.viewOwn}>
                   <NavLink to="/settings/sessions">My sessions</NavLink>
                 </Can>
@@ -454,6 +460,14 @@ function Workspace({ user, logout }) {
                     element={
                       <Guard permissions={[P.deliveryAgencies.view]}>
                         <Agencies />
+                      </Guard>
+                    }
+                  />
+                  <Route
+                    path="/settings/delivery-sync"
+                    element={
+                      <Guard permissions={[P.deliverySync.view]}>
+                        <DeliverySyncLogs />
                       </Guard>
                     }
                   />

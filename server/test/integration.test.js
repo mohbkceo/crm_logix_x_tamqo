@@ -28,12 +28,19 @@ import {
   Session,
   User,
 } from "../src/models/security.js";
-import { DeliveryAgency, DeliveryRate } from "../src/models/delivery.js";
+import {
+  DeliveryAgency,
+  DeliveryRate,
+  DeliverySyncItem,
+  DeliverySyncLock,
+  DeliverySyncRun,
+} from "../src/models/delivery.js";
 import { migrate } from "../src/migrate.js";
 import { P } from "../../shared/permissions.js";
 import { createServer } from "node:http";
 import { encryptCredentials } from "../src/services/delivery/credentials.js";
 import { providerFor } from "../src/services/delivery/deliveryProviderFactory.js";
+import { deliveryService } from "../src/services/delivery/deliveryService.js";
 let replica, plan, product, source, wilaya, apiAgent;
 const request = () => apiAgent;
 before(
@@ -93,7 +100,17 @@ after(async () => {
   await replica?.stop();
 });
 beforeEach(async () => {
-  for (const Model of [Order, OrderEvent, Shipment, Customer, Expense, Sale])
+  for (const Model of [
+    Order,
+    OrderEvent,
+    Shipment,
+    Customer,
+    Expense,
+    Sale,
+    DeliverySyncItem,
+    DeliverySyncLock,
+    DeliverySyncRun,
+  ])
     await Model.deleteMany({});
 });
 function input(kind = "PARTNERSHIP", overrides = {}) {
@@ -708,6 +725,108 @@ test("direct sales contribute only to revenue, sold units, catalog and employee 
   assert.equal(team.items[0].metrics.netSales, 9000);
   assert.equal(team.items[0].metrics.totalOrders, 0);
   assert.equal(team.items[0].metrics.directSalesCount, 2);
+});
+
+test("current balance is all-time, scoped, excludes unrealized orders, and counts direct sales once", async () => {
+  const realized = await createOrder(input()),
+    pending = await createOrder(input()),
+    cancelled = await createOrder(input()),
+    returned = await createOrder(input());
+  await Promise.all([
+    Order.updateOne({ _id: realized._id }, { $set: { status: "DELIVERED" } }),
+    Order.updateOne({ _id: pending._id }, { $set: { status: "NEW" } }),
+    Order.updateOne({ _id: cancelled._id }, { $set: { status: "CANCELLED" } }),
+    Order.updateOne({ _id: returned._id }, { $set: { status: "RETURNED" } }),
+    Sale.create({
+      fullName: "Tamqo Direct",
+      phoneNumber: "0550111111",
+      amount: 4000,
+      quantity: 1,
+      business: "TAMQO",
+      catalogItemId: plan._id,
+      itemName: plan.name,
+    }),
+    Sale.create({
+      fullName: "Logix Direct",
+      phoneNumber: "0550222222",
+      amount: 5000,
+      quantity: 1,
+      business: "LOGIX",
+      catalogItemId: product._id,
+      itemName: product.name,
+    }),
+    Expense.create({
+      business: "TAMQO",
+      title: "Tamqo expense",
+      amount: 1000,
+    }),
+    Expense.create({
+      business: "LOGIX",
+      title: "Logix expense",
+      amount: 2000,
+    }),
+  ]);
+  const query = "period=custom&start=2020-01-01&end=2020-01-01",
+    all = expectOk(await apiAgent.get(`/api/analytics/all?${query}`)),
+    tamqo = expectOk(await apiAgent.get(`/api/analytics/tamqo?${query}`)),
+    logix = expectOk(await apiAgent.get(`/api/analytics/logix?${query}`));
+  assert.equal(all.metrics.netSales, 0);
+  assert.deepEqual(all.balance, {
+    realizedOrderRevenue: 11000,
+    directSalesRevenue: 9000,
+    totalRevenue: 20000,
+    totalExpenses: 3000,
+    currentBalance: 17000,
+  });
+  assert.deepEqual(tamqo.balance, {
+    realizedOrderRevenue: 4000,
+    directSalesRevenue: 4000,
+    totalRevenue: 8000,
+    totalExpenses: 1000,
+    currentBalance: 7000,
+  });
+  assert.deepEqual(logix.balance, {
+    realizedOrderRevenue: 7000,
+    directSalesRevenue: 5000,
+    totalRevenue: 12000,
+    totalExpenses: 2000,
+    currentBalance: 10000,
+  });
+});
+
+test("balance permission, analytics scope, and business access are enforced server-side", async () => {
+  const employee = expectOk(
+      await apiAgent.post("/api/users").send({
+        name: "Logix analyst",
+        email: "balance-analyst@example.com",
+        password: "employee-password",
+        businessAccess: ["LOGIX"],
+        permissions: [P.analytics.viewBusiness],
+      }),
+    ),
+    agent = supertest.agent(app);
+  expectOk(
+    await agent.post("/api/auth/login").send({
+      email: employee.email,
+      password: "employee-password",
+    }),
+  );
+  let report = expectOk(await agent.get("/api/analytics/logix?period=today"));
+  assert.equal("balance" in report, false);
+  assert.equal("totalExpenses" in report.metrics, false);
+  await apiAgent.patch(`/api/users/${employee._id}`).send({
+    permissions: [P.analytics.viewBusiness, P.finance.viewBalance],
+  });
+  report = expectOk(await agent.get("/api/analytics/logix?period=today"));
+  assert.equal("balance" in report, true);
+  assert.equal(
+    (await agent.get("/api/analytics/tamqo?period=today")).status,
+    403,
+  );
+  assert.equal(
+    "balance" in expectOk(await agent.get("/api/analytics/all?period=today")),
+    false,
+  );
 });
 
 test("direct sale own/all permissions and business access are enforced", async () => {
@@ -1713,7 +1832,7 @@ test("manual and capability-disabled agencies do not automatically send parcels"
   assert.equal(f.calls.length, 0);
 });
 
-test("unknown success is pending and retries only read deterministic tracking", async (t) => {
+test("unknown success is retained and retries only read deterministic tracking", async (t) => {
   const f = await courierFixture(t, (req, res, _n, body) =>
     jsonReply(
       res,
@@ -1731,7 +1850,9 @@ test("unknown success is pending and retries only read deterministic tracking", 
   );
   assert.equal(linked.tracking, o.orderNumber);
   assert.equal(linked.uncertain, false);
-  assert.equal(linked.syncStatus, "SYNCED");
+  assert.equal(linked.syncStatus, "ERROR");
+  assert.equal(linked.providerStatus, "unknown");
+  assert.equal((await Order.findById(o._id)).status, "NEW");
   assert.deepEqual(
     f.calls.map((c) => c.url),
     ["/add_colis", "/lire"],
@@ -1836,7 +1957,8 @@ test("Double Tracking reconciles with lire and never repeats add_colis", async (
     ),
   );
   const order = expectOk(await apiAgent.post("/api/orders").send(f.input));
-  assert.equal(order.shipment.syncStatus, "SYNCED");
+  assert.equal(order.shipment.syncStatus, "ERROR");
+  assert.equal(order.shipment.providerStatus, "existing");
   assert.equal(order.shipment.uncertain, false);
   assert.equal(order.shipment.tracking, order.orderNumber);
   assert.equal(order.shipment.messageRetour, "Double Tracking");
@@ -1954,4 +2076,245 @@ test("stale tracking reconciliation cannot replace a new in-flight reservation",
   releaseCreate({ Tracking: "CURRENT-TRACKING", MessageRetour: "Good" });
   assert.equal((await retry).tracking, "CURRENT-TRACKING");
   assert.equal(calls, 2);
+});
+
+test("delivery sync batches by agency, uses order terminal state, persists outcomes, and isolates failures", async (t) => {
+  const previousMap = process.env.DELIVERY_STATUS_MAP;
+  process.env.DELIVERY_STATUS_MAP = JSON.stringify({
+    " delivered ": "DELIVERED",
+  });
+  t.after(() => {
+    if (previousMap === undefined) delete process.env.DELIVERY_STATUS_MAP;
+    else process.env.DELIVERY_STATUS_MAP = previousMap;
+  });
+  const fixture = await courierFixture(t, (req, res, _call, body) => {
+      assert.equal(req.url, "/lire");
+      jsonReply(res, 200, {
+        Colis: body.Colis.flatMap(({ Tracking }) =>
+          Tracking === "SYNC-A"
+            ? [{ Tracking, Statut: "Delivered", MessageRetour: "Good" }]
+            : Tracking === "SYNC-B"
+              ? [
+                  {
+                    Tracking,
+                    Statut: "  Mystery   Status  ",
+                    MessageRetour: "Good",
+                  },
+                ]
+              : [],
+        ),
+      });
+    }),
+    orders = await Promise.all([
+      createOrder(fixture.input),
+      createOrder(fixture.input),
+      createOrder(fixture.input),
+      createOrder(fixture.input),
+    ]);
+  await Order.updateMany(
+    { _id: { $in: orders.slice(0, 3).map((order) => order._id) } },
+    { $set: { status: "SHIPPED" } },
+  );
+  await Order.updateOne(
+    { _id: orders[3]._id },
+    { $set: { status: "DELIVERED" } },
+  );
+  await Shipment.create(
+    orders.map((order, index) => ({
+      orderId: order._id,
+      agencyId: fixture.agency._id,
+      agencyName: fixture.agency.name,
+      provider: "PROCOLIS",
+      tracking: ["SYNC-A", "SYNC-B", "SYNC-C", "SYNC-TERMINAL"][index],
+      // Deliberately opposite for two records: eligibility must use Order.status.
+      status: index === 0 ? "DELIVERED" : "SHIPPED",
+    })),
+  );
+  const logs = [],
+    originalLog = console.log;
+  console.log = (...parts) => logs.push(parts.join(" "));
+  let run;
+  try {
+    run = await deliveryService.syncBatch({ trigger: "CRON" });
+  } finally {
+    console.log = originalLog;
+  }
+  assert.equal(fixture.calls.length, 1);
+  assert.equal(fixture.calls[0].url, "/lire");
+  assert.deepEqual(
+    fixture.calls[0].body.Colis.map((row) => row.Tracking).sort(),
+    ["SYNC-A", "SYNC-B", "SYNC-C"],
+  );
+  assert.equal(run.status, "PARTIAL");
+  assert.deepEqual(
+    {
+      scanned: run.scanned,
+      eligible: run.eligible,
+      attempted: run.attempted,
+      successful: run.successful,
+      changed: run.changed,
+      unchanged: run.unchanged,
+      terminalReached: run.terminalReached,
+      unknownStatuses: run.unknownStatuses,
+      failed: run.failed,
+      skipped: run.skipped,
+    },
+    {
+      scanned: 4,
+      eligible: 3,
+      attempted: 3,
+      successful: 1,
+      changed: 2,
+      unchanged: 1,
+      terminalReached: 1,
+      unknownStatuses: 1,
+      failed: 1,
+      skipped: 1,
+    },
+  );
+  assert.equal(logs.length, 1);
+  assert.match(logs[0], /^\[DELIVERY SYNC\] trigger=CRON/);
+  assert.equal(logs[0].includes("agency-token-private"), false);
+  assert.equal(logs[0].includes("agency-key-private"), false);
+  const storedRun = await DeliverySyncRun.findById(run.runId),
+    items = await DeliverySyncItem.find({ runId: run.runId }).sort({
+      tracking: 1,
+    });
+  assert.equal(storedRun.status, "PARTIAL");
+  assert.equal(items.length, 3);
+  assert.deepEqual(
+    items.map((item) => item.result),
+    ["SUCCESS", "UNKNOWN_STATUS", "ERROR"],
+  );
+  assert.deepEqual(
+    {
+      beforeProviderStatus: items[0].beforeProviderStatus || null,
+      afterProviderStatus: items[0].afterProviderStatus,
+      beforeOrderStatus: items[0].beforeOrderStatus,
+      afterOrderStatus: items[0].afterOrderStatus,
+      changed: items[0].changed,
+      terminalReached: items[0].terminalReached,
+    },
+    {
+      beforeProviderStatus: null,
+      afterProviderStatus: "Delivered",
+      beforeOrderStatus: "SHIPPED",
+      afterOrderStatus: "DELIVERED",
+      changed: true,
+      terminalReached: true,
+    },
+  );
+  assert.equal(items[1].afterProviderStatus, "Mystery   Status");
+  assert.equal(items[1].afterOrderStatus, "SHIPPED");
+  assert.equal((await Order.findById(orders[2]._id)).status, "SHIPPED");
+  assert.ok((await Shipment.findOne({ tracking: "SYNC-A" })).lastSyncedAt);
+  assert.ok((await Shipment.findOne({ tracking: "SYNC-B" })).lastSyncedAt);
+  assert.equal(
+    (await Shipment.findOne({ tracking: "SYNC-C" })).lastSyncedAt,
+    undefined,
+  );
+
+  const manual = expectOk(await apiAgent.post("/api/delivery-sync/run"));
+  assert.equal(manual.trigger, "MANUAL");
+  assert.equal(fixture.calls.length, 2);
+  assert.deepEqual(
+    fixture.calls[1].body.Colis.map((row) => row.Tracking).sort(),
+    ["SYNC-B", "SYNC-C"],
+  );
+  assert.equal(await DeliverySyncRun.countDocuments(), 2);
+  const history = expectOk(await apiAgent.get("/api/delivery-sync/runs"));
+  assert.equal(history.total, 2);
+  const detail = expectOk(
+    await apiAgent.get(`/api/delivery-sync/runs/${manual.runId}`),
+  );
+  assert.equal(detail.run.trigger, "MANUAL");
+  assert.equal(detail.items.length, 2);
+});
+
+test("an active MongoDB delivery lease prevents concurrent cron execution", async (t) => {
+  const previousMap = process.env.DELIVERY_STATUS_MAP;
+  process.env.DELIVERY_STATUS_MAP = JSON.stringify({ shipped: "SHIPPED" });
+  t.after(() => {
+    if (previousMap === undefined) delete process.env.DELIVERY_STATUS_MAP;
+    else process.env.DELIVERY_STATUS_MAP = previousMap;
+  });
+  let requestStarted, releaseRequest;
+  const started = new Promise((resolve) => {
+      requestStarted = resolve;
+    }),
+    blocked = new Promise((resolve) => {
+      releaseRequest = resolve;
+    }),
+    fixture = await courierFixture(t, async (_req, res, _call, body) => {
+      requestStarted();
+      await blocked;
+      jsonReply(res, 200, {
+        Colis: body.Colis.map(({ Tracking }) => ({
+          Tracking,
+          Statut: "shipped",
+          MessageRetour: "Good",
+        })),
+      });
+    }),
+    order = await createOrder(fixture.input);
+  await Order.updateOne({ _id: order._id }, { $set: { status: "SHIPPED" } });
+  await Shipment.create({
+    orderId: order._id,
+    agencyId: fixture.agency._id,
+    agencyName: fixture.agency.name,
+    provider: "PROCOLIS",
+    tracking: "LOCKED-SYNC",
+    status: "SHIPPED",
+  });
+  const first = deliveryService.syncBatch({ trigger: "CRON" });
+  await started;
+  const second = await deliveryService.syncBatch({ trigger: "CRON" });
+  assert.equal(second.skipped, 1);
+  assert.equal(second.attempted, 0);
+  releaseRequest();
+  assert.equal((await first).status, "COMPLETED");
+  assert.equal(fixture.calls.length, 1);
+  assert.equal(await DeliverySyncRun.countDocuments(), 2);
+});
+
+test("delivery sync log permissions protect history and manual execution independently", async () => {
+  const viewer = expectOk(
+      await apiAgent.post("/api/users").send({
+        name: "Sync viewer",
+        email: "sync-viewer@example.com",
+        password: "employee-password",
+        businessAccess: [],
+        permissions: [P.deliverySync.view],
+      }),
+    ),
+    viewerAgent = supertest.agent(app),
+    denied = supertest.agent(app);
+  expectOk(
+    await viewerAgent.post("/api/auth/login").send({
+      email: viewer.email,
+      password: "employee-password",
+    }),
+  );
+  assert.equal(
+    (await viewerAgent.get("/api/delivery-sync/status")).status,
+    200,
+  );
+  assert.equal((await viewerAgent.get("/api/delivery-sync/runs")).status, 200);
+  assert.equal((await viewerAgent.post("/api/delivery-sync/run")).status, 403);
+  const deniedUser = expectOk(
+    await apiAgent.post("/api/users").send({
+      name: "No sync access",
+      email: "no-sync@example.com",
+      password: "employee-password",
+      businessAccess: [],
+      permissions: [],
+    }),
+  );
+  expectOk(
+    await denied.post("/api/auth/login").send({
+      email: deniedUser.email,
+      password: "employee-password",
+    }),
+  );
+  assert.equal((await denied.get("/api/delivery-sync/status")).status, 403);
 });

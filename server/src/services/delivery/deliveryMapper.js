@@ -65,13 +65,25 @@ export function extractColis(raw) {
   if (raw && typeof raw === "object" && raw.Tracking) return [raw];
   return [];
 }
-function validTracking(value) {
+export function validTracking(value) {
   return (
     typeof value === "string" &&
     value.trim() &&
     value.length <= 150 &&
     ![...value].some((c) => c.charCodeAt(0) < 32 || c.charCodeAt(0) === 127)
   );
+}
+export function sanitizeProviderStatus(value) {
+  if (typeof value !== "string" && typeof value !== "number") return null;
+  const status = [...sanitizeProviderData(String(value))]
+    .map((character) => {
+      const code = character.charCodeAt(0);
+      return code < 32 || code === 127 ? " " : character;
+    })
+    .join("")
+    .trim()
+    .slice(0, 500);
+  return status || null;
 }
 export function parsePackages(raw) {
   return extractColis(raw)
@@ -84,10 +96,7 @@ export function parsePackages(raw) {
     .map((v) => ({
       tracking: v.Tracking.trim(),
       externalId: typeof v.id_Externe === "string" ? v.id_Externe : null,
-      providerStatus:
-        typeof v.Statut === "string" || typeof v.Statut === "number"
-          ? String(v.Statut)
-          : null,
+      providerStatus: sanitizeProviderStatus(v.Statut),
       messageRetour:
         typeof v.MessageRetour === "string" ? v.MessageRetour : null,
       raw: sanitizeProviderData(v),

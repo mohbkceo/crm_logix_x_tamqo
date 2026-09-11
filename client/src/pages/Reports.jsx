@@ -193,8 +193,8 @@ export function Reports({ scope }) {
             "percent",
           ],
           [
-            scope === "all" ? "Pending sales" : "Total expenses",
-            scope === "all" ? "pendingSalesValue" : "totalExpenses",
+            data?.balance ? "Current Balance" : "Pending sales",
+            data?.balance ? "currentBalance" : "pendingSalesValue",
             "money",
           ],
         ];
@@ -358,6 +358,30 @@ export function Reports({ scope }) {
             </div>
             {tab === "Overview" && (
               <>
+                {data.balance && (
+                  <Panel
+                    title="Current Balance"
+                    subtitle="All-time financial position · independent of the selected report dates"
+                    action={<Wallet size={18} />}
+                  >
+                    <MetricRows
+                      metrics={{
+                        ...data.balance,
+                        orderRevenue: data.balance.realizedOrderRevenue,
+                        directSales: data.balance.directSalesRevenue,
+                        expenses: data.balance.totalExpenses,
+                      }}
+                      format="money"
+                      keys={[
+                        "currentBalance",
+                        "totalRevenue",
+                        "directSales",
+                        "orderRevenue",
+                        "expenses",
+                      ]}
+                    />
+                  </Panel>
+                )}
                 <div className="overview-charts">
                   <Panel
                     title="Sales performance"

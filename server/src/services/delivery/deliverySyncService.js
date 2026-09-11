@@ -314,11 +314,16 @@ export class DeliverySyncService {
     );
   }
   async apply(orderId, parcel) {
+    return (await this.applyWithResult(orderId, parcel)).shipment;
+  }
+  async applyWithResult(orderId, parcel, options = {}) {
     return transaction(async (session) => {
       const s = await Shipment.findOne({ orderId }).session(session),
         order = await Order.findById(orderId).session(session);
       assert(s && order, "Shipment not found", 404);
       const status = mapProviderStatus(parcel.providerStatus);
+      const beforeProviderStatus = s.providerStatus || null,
+        beforeOrderStatus = order.status;
       s.tracking = parcel.tracking;
       s.uncertain = false;
       s.lockUntil = null;
@@ -329,18 +334,49 @@ export class DeliverySyncService {
       s.lastSyncedAt = new Date();
       s.lastError = "";
       s.syncStatus = "SYNCED";
+      let afterOrderStatus = order.status,
+        result;
       if (status && status !== order.status) {
-        if (canProviderTransition(order.status, status))
-          await transition(orderId, status, "courier", session);
-        else {
+        if (canProviderTransition(order.status, status)) {
+          const changedOrder = await transition(
+            orderId,
+            status,
+            "courier",
+            session,
+          );
+          afterOrderStatus = changedOrder.status;
+        } else {
           s.lastError = `Provider reports ${status}; internal state is ${order.status}. Review the skipped or conflicting transition.`;
           s.syncStatus = "ERROR";
+          result = "ERROR";
         }
+      } else if (!status && (options.requireStatus || parcel.providerStatus)) {
+        s.lastError = `UNKNOWN_STATUS: ${parcel.providerStatus || "(empty)"}`;
+        s.syncStatus = "ERROR";
+        result = "UNKNOWN_STATUS";
       }
       // Unknown provider values are retained without guessing a normalized order status.
-      s.status = status || order.status;
+      s.status = status || afterOrderStatus;
       await s.save({ session });
-      return s;
+      const changed =
+          beforeProviderStatus !== (s.providerStatus || null) ||
+          beforeOrderStatus !== afterOrderStatus,
+        terminalReached =
+          !["DELIVERED", "RETURNED", "CANCELLED"].includes(beforeOrderStatus) &&
+          ["DELIVERED", "RETURNED", "CANCELLED"].includes(afterOrderStatus);
+      return {
+        shipment: s,
+        outcome: {
+          beforeProviderStatus,
+          afterProviderStatus: s.providerStatus || null,
+          beforeOrderStatus,
+          afterOrderStatus,
+          changed,
+          terminalReached,
+          result: result || (changed ? "SUCCESS" : "UNCHANGED"),
+          error: s.lastError || null,
+        },
+      };
     });
   }
   async refresh(orderId) {
@@ -524,56 +560,6 @@ export class DeliverySyncService {
       message: `Admin reconciled ${tracking.trim()} using external order number.`,
     });
     return this.apply(orderId, parcel);
-  }
-  async syncBatch(limit = 100) {
-    const shipments = await Shipment.find({
-      tracking: { $type: "string" },
-      status: { $nin: ["DELIVERED", "RETURNED", "CANCELLED"] },
-    })
-      .sort({ lastSyncedAt: 1 })
-      .limit(limit)
-      .lean();
-    if (!shipments.length) return { synced: 0, errors: 0 };
-    let synced = 0,
-      errors = 0;
-    for (let i = 0; i < shipments.length; i += 20) {
-      const batch = shipments.slice(i, i + 20);
-      try {
-        const parcels = parsePackages(
-          await this.client.readPackages(batch.map((s) => s.tracking)),
-        );
-        for (const s of batch) {
-          const p = parcels.find((p) => p.tracking === s.tracking);
-          if (p) {
-            await this.apply(s.orderId, p);
-            synced++;
-          } else {
-            errors++;
-            await Shipment.updateOne(
-              { _id: s._id },
-              {
-                $set: {
-                  syncStatus: "ERROR",
-                  lastError: "Tracking absent from batch response.",
-                },
-              },
-            );
-          }
-        }
-      } catch {
-        errors += batch.length;
-        await Shipment.updateMany(
-          { _id: { $in: batch.map((s) => s._id) } },
-          {
-            $set: {
-              syncStatus: "ERROR",
-              lastError: "Batch synchronization failed.",
-            },
-          },
-        );
-      }
-    }
-    return { synced, errors };
   }
 }
 export const deliverySyncService = new DeliverySyncService();

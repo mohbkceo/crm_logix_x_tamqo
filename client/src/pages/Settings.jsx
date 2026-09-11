@@ -1,5 +1,6 @@
 import { P, Can, can, useUser } from "../access";
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import {
   Plus,
   Pencil,
@@ -8,6 +9,7 @@ import {
   Check,
   ShieldCheck,
   RefreshCw,
+  Radio,
 } from "lucide-react";
 import { api, useApi, useConfig, money, human } from "../api";
 import {
@@ -153,6 +155,11 @@ export function Settings() {
               {label}
             </button>
           ))}
+        {can(user, P.deliverySync.view) && (
+          <Link to="/settings/delivery-sync">
+            <Radio size={15} /> Delivery Sync Logs
+          </Link>
+        )}
       </div>
       <ErrorBox error={error} />
       {message && (
@@ -351,13 +358,15 @@ export function Settings() {
                 <ShieldCheck size={15} />
                 Test connection
               </button>
-              <button
-                disabled={busy || !delivery.data?.configured}
-                onClick={() => test("sync")}
-              >
-                <RefreshCw size={15} />
-                Sync active shipments
-              </button>
+              <Can permission={P.deliverySync.run}>
+                <button
+                  disabled={busy || !delivery.data?.configured}
+                  onClick={() => test("sync")}
+                >
+                  <RefreshCw size={15} />
+                  Sync active shipments
+                </button>
+              </Can>
             </div>
           </div>
         </Panel>

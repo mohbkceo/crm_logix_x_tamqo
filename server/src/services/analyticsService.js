@@ -1,4 +1,10 @@
-import { P, can, analyticsScope, saleScope } from "../authorization.js";
+import {
+  P,
+  can,
+  analyticsScope,
+  saleScope,
+  hasBusinessAccess,
+} from "../authorization.js";
 import { Order, Expense, Sale } from "../models/index.js";
 import { round } from "../domain/order.js";
 import { dateKey, reportingRange, dayStart } from "../domain/period.js";
@@ -231,6 +237,27 @@ const scopedSales = (sales, scope) =>
         (sale) =>
           !["TAMQO", "LOGIX"].includes(scope) || sale.business === scope,
       );
+export function balanceBreakdown(orders, sales, expenses, scope = "ALL") {
+  const orderMetrics = summarize(orders, scope),
+    revenueMetrics = summarizePerformance(orders, sales, scope),
+    realizedOrderRevenue = orderMetrics.netSales,
+    directSalesRevenue = revenueMetrics.directSalesRevenue,
+    totalRevenue = revenueMetrics.netSales,
+    totalExpenses = sum(
+      expenses.filter(
+        (expense) =>
+          !["TAMQO", "LOGIX"].includes(scope) || expense.business === scope,
+      ),
+      (expense) => expense.amount,
+    );
+  return {
+    realizedOrderRevenue,
+    directSalesRevenue,
+    totalRevenue,
+    totalExpenses,
+    currentBalance: round(totalRevenue - totalExpenses),
+  };
+}
 function addDirectSales(metrics, sales, scope) {
   const rows = scopedSales(sales, scope),
     revenue = sum(rows, (sale) => sale.amount),
@@ -507,6 +534,8 @@ export function buildReport(
         "Orders selected by creation date; current order state determines realization.",
       partnershipShares:
         "Realized partnership product revenue, excluding shipping.",
+      currentBalance:
+        "All-time realized order product revenue plus direct sales, less all-time expenses. It does not change with the report date filter.",
     },
   };
 }
@@ -545,6 +574,23 @@ export function directSaleFilter(query, scope, user) {
   )
     filter._id = { $exists: false };
   return filter;
+}
+export function canViewBalance(user, scope) {
+  if (!user) return ["ALL", "TAMQO", "LOGIX"].includes(scope);
+  if (!can(user, P.finance.viewBalance)) return false;
+  if (["TAMQO", "LOGIX"].includes(scope))
+    return (
+      (can(user, P.analytics.viewBusiness) ||
+        can(user, P.analytics.viewGlobal)) &&
+      hasBusinessAccess(user, scope)
+    );
+  return (
+    scope === "ALL" &&
+    can(user, P.analytics.viewGlobal) &&
+    hasBusinessAccess(user, "TAMQO") &&
+    hasBusinessAccess(user, "LOGIX") &&
+    can(user, P.partnership.view)
+  );
 }
 export async function analytics(query, scope = "ALL", user) {
   const range = reportingRange(query),
@@ -600,10 +646,37 @@ export async function analytics(query, scope = "ALL", user) {
     sales,
     previousSales,
   );
+  if (canViewBalance(user, scope)) {
+    const balanceOrderFilter = {
+        ...(["TAMQO", "LOGIX"].includes(scope)
+          ? { "items.business": scope }
+          : {}),
+      },
+      balanceSaleFilter = {
+        ...(user ? saleScope(user) : {}),
+        ...(["TAMQO", "LOGIX"].includes(scope) ? { business: scope } : {}),
+      },
+      balanceExpenseFilter = ["TAMQO", "LOGIX"].includes(scope)
+        ? { business: scope }
+        : {};
+    if (user) balanceOrderFilter.$and = [analyticsScope(user, scope)];
+    const [balanceOrders, balanceSales, balanceExpenses] = await Promise.all([
+      Order.find(balanceOrderFilter, projection).lean(),
+      Sale.find(balanceSaleFilter).lean(),
+      Expense.find(balanceExpenseFilter).select("business amount").lean(),
+    ]);
+    result.balance = balanceBreakdown(
+      balanceOrders,
+      balanceSales,
+      balanceExpenses,
+      scope,
+    );
+    result.metrics.currentBalance = result.balance.currentBalance;
+  }
   if (
     ["TAMQO", "LOGIX"].includes(scope) &&
     (!user ||
-      (can(user, P.expenses.view) &&
+      (can(user, P.finance.viewBalance) &&
         (can(user, P.analytics.viewBusiness) ||
           can(user, P.analytics.viewGlobal))))
   ) {

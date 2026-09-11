@@ -4,9 +4,10 @@ const groups = {
   orders: ['viewOwn','viewAll','create','updateOwn','updateAll','confirm','prepare','cancel','createShipment','markReady','refreshTracking'],
   sales: ['viewOwn','viewAll','create','updateOwn','updateAll','deleteOwn','deleteAll'],
   analytics: ['viewOwn','viewBusiness','viewGlobal','export'], partnership: ['view'],
-  customers: ['view','update'], expenses: ['view','create','update','delete'],
+  customers: ['view','update'], expenses: ['view','create','update','delete'], finance: ['viewBalance'],
   tamqoPlans: ['view','manage'], logixProducts: ['view','manage'], sources: ['view','manage'], wilayas: ['view','manage'],
   deliveryAgencies: ['view','create','update','disable','delete','assignBusinesses','manageRates','manageCredentials','testConnection'],
+  deliverySync: ['view','run'],
   users: ['view','create','update','disable','permissions'], sessions: ['viewOwn','revokeOwn'],
   'users.sessions': ['view','revoke'], audit: ['view'], settings: ['view','manage'], registrationKey: ['manage'],
 };

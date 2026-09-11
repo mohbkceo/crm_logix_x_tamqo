@@ -13,7 +13,20 @@ import {
   parseCreationResult,
 } from "../src/services/delivery/deliveryMapper.js";
 import { DeliveryClient } from "../src/services/delivery/deliveryClient.js";
-import { buildReport, isRealized } from "../src/services/analyticsService.js";
+import {
+  balanceBreakdown,
+  buildReport,
+  isRealized,
+} from "../src/services/analyticsService.js";
+import {
+  deliveryStatusMapping,
+  mapProviderStatus,
+} from "../src/services/delivery/deliveryStatusMapper.js";
+import {
+  DEFAULT_DELIVERY_SYNC_INTERVAL_MS,
+  deliverySyncSettings,
+  startDeliverySyncScheduler,
+} from "../src/services/delivery/deliveryScheduler.js";
 const items = [
   {
     business: "TAMQO",
@@ -231,6 +244,93 @@ test("realization excludes cancelled, returned and returning sales", () => {
     ),
     false,
   );
+});
+test("current balance uses realized scoped order revenue, direct sales once, and expenses", () => {
+  const orders = [
+      fixture(),
+      fixture({ status: "NEW" }),
+      fixture({ status: "CANCELLED" }),
+      fixture({ status: "RETURNED" }),
+    ],
+    sales = [
+      { business: "TAMQO", amount: 4000 },
+      { business: "LOGIX", amount: 5000 },
+    ],
+    expenses = [
+      { business: "TAMQO", amount: 1000 },
+      { business: "LOGIX", amount: 2000 },
+    ];
+  assert.deepEqual(balanceBreakdown(orders, sales, expenses, "ALL"), {
+    realizedOrderRevenue: 11000,
+    directSalesRevenue: 9000,
+    totalRevenue: 20000,
+    totalExpenses: 3000,
+    currentBalance: 17000,
+  });
+  assert.deepEqual(balanceBreakdown(orders, sales, expenses, "TAMQO"), {
+    realizedOrderRevenue: 4000,
+    directSalesRevenue: 4000,
+    totalRevenue: 8000,
+    totalExpenses: 1000,
+    currentBalance: 7000,
+  });
+  assert.deepEqual(balanceBreakdown(orders, sales, expenses, "LOGIX"), {
+    realizedOrderRevenue: 7000,
+    directSalesRevenue: 5000,
+    totalRevenue: 12000,
+    totalExpenses: 2000,
+    currentBalance: 10000,
+  });
+});
+test("delivery status mappings normalize case and whitespace and reject empty maps", () => {
+  const previous = process.env.DELIVERY_STATUS_MAP;
+  try {
+    process.env.DELIVERY_STATUS_MAP = "{}";
+    assert.equal(deliveryStatusMapping().configured, false);
+    assert.equal(mapProviderStatus("Delivered"), null);
+    process.env.DELIVERY_STATUS_MAP = JSON.stringify({
+      "  En   Livraison ": "OUT_FOR_DELIVERY",
+    });
+    assert.equal(mapProviderStatus("EN livraison"), "OUT_FOR_DELIVERY");
+  } finally {
+    if (previous === undefined) delete process.env.DELIVERY_STATUS_MAP;
+    else process.env.DELIVERY_STATUS_MAP = previous;
+  }
+});
+test("delivery scheduler runs once at startup and every fifteen minutes by default", async () => {
+  const previousInterval = process.env.DELIVERY_SYNC_INTERVAL_MS,
+    previousEnabled = process.env.DELIVERY_SYNC_ENABLED,
+    triggers = [];
+  let callback, scheduledInterval;
+  delete process.env.DELIVERY_SYNC_INTERVAL_MS;
+  delete process.env.DELIVERY_SYNC_ENABLED;
+  try {
+    assert.deepEqual(deliverySyncSettings(), {
+      enabled: true,
+      intervalMs: DEFAULT_DELIVERY_SYNC_INTERVAL_MS,
+    });
+    startDeliverySyncScheduler({
+      sync: async (trigger) => triggers.push(trigger),
+      setIntervalFn: (fn, ms) => {
+        callback = fn;
+        scheduledInterval = ms;
+        return { fn, ms };
+      },
+      now: () => 0,
+    });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(scheduledInterval, 900000);
+    assert.deepEqual(triggers, ["STARTUP"]);
+    callback();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(triggers, ["STARTUP", "CRON"]);
+  } finally {
+    if (previousInterval === undefined)
+      delete process.env.DELIVERY_SYNC_INTERVAL_MS;
+    else process.env.DELIVERY_SYNC_INTERVAL_MS = previousInterval;
+    if (previousEnabled === undefined) delete process.env.DELIVERY_SYNC_ENABLED;
+    else process.env.DELIVERY_SYNC_ENABLED = previousEnabled;
+  }
 });
 test("transitions reject lifecycle regressions and allow digital completion", () => {
   assert.equal(canTransition("NEW", "DELIVERED", "LOGIX_ONLY"), false);
