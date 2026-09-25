@@ -4,6 +4,8 @@ import { Order, OrderEvent, Shipment } from "../models/index.js";
 import {
   createOrder,
   editOrder,
+  deleteOrder,
+  refundOrder,
   transition,
   transaction,
 } from "../services/orderService.js";
@@ -46,11 +48,20 @@ router.use(async (req, _res, next) => {
   } else {
     const order = await Order.findById(objectId(id));
     assert(order, "Order not found", 404);
-    if (req.method === "GET")
+    if (req.method === "GET") {
       requireOwnOrAll(req.user, order, P.orders.viewOwn, P.orders.viewAll);
-    else {
+      if (order.deletedAt)
+        assert(can(req.user, P.orders.deleteAll), "Deleted order access denied", 403);
+    } else {
       requireBusinesses(req.user, orderBusinesses(order));
       const action = parts[1];
+      if (req.method === "DELETE")
+        requireOwnOrAll(req.user, order, P.orders.deleteOwn, P.orders.deleteAll);
+      else if (action === "refund")
+        requireOwnOrAll(req.user, order, P.orders.refundOwn, P.orders.refundAll);
+      else if (req.method === "PATCH")
+        requireOwnOrAll(req.user, order, P.orders.updateOwn, P.orders.updateAll);
+      else {
       const permission =
         action === "confirm"
           ? P.orders.confirm
@@ -70,10 +81,12 @@ router.use(async (req, _res, next) => {
       if (permission)
         assert(can(req.user, permission), "Order action denied", 403);
       else requireOwnOrAll(req.user, order);
+      }
       if (req.method === "PATCH")
         requireBusinesses(req.user, [
           ...new Set((req.body.items || []).map((item) => item.business)),
         ]);
+      assert(!order.deletedAt, "Deleted orders cannot be changed.", 409);
     }
   }
   next();
@@ -89,13 +102,17 @@ router.post("/", async (req, res) => {
   res.status(201).json({ ...(current || order.toObject()), ...delivery });
 });
 router.get("/", async (req, res) => {
+  if (req.query.deleted === "only")
+    assert(can(req.user, P.orders.deleteAll), "Trash access denied", 403);
   const filter = {
       $and: [
         orderFilter(req.query),
-        orderScope(req.user, !can(req.user, P.orders.viewAll)),
+        orderScope(req.user, !can(req.user, P.orders.viewAll), req.query.deleted === "only"),
       ],
     },
     p = pagination(req.query);
+  if (req.query.deleted === "only")
+    filter.$and[0].deletedAt = { $exists: true };
   if (req.query.tracking) {
     const ids = await Shipment.find({
       tracking: { $regex: escapeRegex(req.query.tracking), $options: "i" },
@@ -154,6 +171,17 @@ router.get("/:id", async (req, res) => {
 router.patch("/:id", async (req, res) =>
   res.json(await editOrder(req.params.id, req.body, req.actor)),
 );
+router.delete("/:id", async (req, res) => {
+  const body = z.object({ revision: z.number().int().min(0),
+    reason: z.string().max(2000).optional(), providerDeletionConfirmed: z.boolean().optional() }).parse(req.body);
+  res.json(await deleteOrder(req.params.id, body, req.actor));
+});
+router.post("/:id/refund", async (req, res) => {
+  const body = z.object({ revision: z.number().int().min(0),
+    amount: z.number().finite().positive(), note: z.string().max(2000).optional(),
+    allocation: z.enum(["LOGIX", "TAMQO", "WHOLE"]).optional() }).parse(req.body);
+  res.json(await refundOrder(req.params.id, body, req.actor));
+});
 router.get("/:id/timeline", async (req, res) =>
   res.json(
     await OrderEvent.find({ orderId: req.params.id })
@@ -222,6 +250,7 @@ router.post("/:id/activate", async (req, res) =>
     await transaction(async (session) => {
       const order = await Order.findById(req.params.id).session(session);
       assert(order, "Order not found", 404);
+      assert(!order.deletedAt, "Deleted orders cannot be changed.", 409);
       assert(
         order.items.some((i) => i.business === "TAMQO") &&
           !["NEW", "CANCELLED", "RETURNED", "RETURNING"].includes(order.status),
@@ -261,6 +290,10 @@ router.post("/:id/payment", async (req, res) =>
         .parse(req.body.amountCollected);
       const order = await Order.findById(req.params.id).session(session);
       assert(order, "Order not found", 404);
+      assert(!order.deletedAt, "Deleted orders cannot be changed.", 409);
+      assert(Math.round((order.refundedAmount || 0) * 100) <=
+        Math.round(order.payment.amountPaidOnline * 100) + Math.round(amount * 100),
+        "Collection cannot be below money already refunded.", 409);
       assert(
         !["CANCELLED", "RETURNED"].includes(order.status),
         "Cannot collect on a cancelled or returned order.",

@@ -69,6 +69,8 @@ export function Agencies() {
                 config: {},
                 capabilities: {
                   createShipment: true,
+                  updateShipment: false,
+                  deleteShipment: false,
                   tracking: true,
                   readyToShip: true,
                   pricing: true,
@@ -273,13 +275,12 @@ export function Agencies() {
             </Field>
             <fieldset>
               <legend>Capabilities</legend>
-              {Object.keys(editing.capabilities)
-                .filter((k) => k !== "_id")
+              {["createShipment", "updateShipment", "deleteShipment", "tracking", "readyToShip", "pricing"]
                 .map((k) => (
                   <label key={k}>
                     <input
                       type="checkbox"
-                      checked={editing.capabilities[k]}
+                      checked={Boolean(editing.capabilities?.[k])}
                       onChange={(e) =>
                         setEditing({
                           ...editing,

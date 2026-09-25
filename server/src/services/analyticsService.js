@@ -24,6 +24,10 @@ export const scopedItems = (o, scope) =>
   );
 export const scopedRevenue = (o, scope) =>
   round(scopedItems(o, scope).reduce((s, i) => s + i.subtotal, 0));
+export const scopedRefund = (o, scope) => round((o.refunds || []).reduce((s, refund) =>
+  s + (["LOGIX", "TAMQO"].includes(scope)
+    ? (refund.allocations?.[scope] || 0)
+    : refund.amount), 0));
 export const isConfirmed = (o) =>
   o.statusHistory.some((h) => h.status === "CONFIRMED");
 export const isRealized = (o) =>
@@ -56,6 +60,7 @@ function timing(orders, from, to) {
   );
 }
 export function summarize(orders, scope) {
+  orders = orders.filter((o) => !o.deletedAt);
   const n = orders.length,
     confirmed = orders.filter(isConfirmed),
     grossOrders = confirmed.filter((o) => o.status !== "CANCELLED"),
@@ -70,7 +75,9 @@ export function summarize(orders, scope) {
       .sort((a, b) => a - b),
     units = (o) => scopedItems(o, scope).reduce((s, i) => s + i.quantity, 0);
   const grossSales = sum(grossOrders, (o) => scopedRevenue(o, scope)),
-    netSales = sum(realized, (o) => scopedRevenue(o, scope));
+    totalRefunded = sum(orders, (o) => scopedRefund(o, scope)),
+    realizedRefunded = sum(realized, (o) => scopedRefund(o, scope)),
+    netSales = round(sum(realized, (o) => scopedRevenue(o, scope)) - realizedRefunded);
   const delivered = countStatus(orders, "DELIVERED"),
     cancelled = countStatus(orders, "CANCELLED"),
     returned = countStatus(orders, "RETURNED"),
@@ -102,6 +109,12 @@ export function summarize(orders, scope) {
     totalUnitsSold: sum(realized, units),
     totalUnitsOrdered: sum(orders, units),
     grossSales,
+    totalRefunded,
+    refundCount: orders.reduce((s, o) => s + (o.refunds || []).filter((refund) =>
+      !["LOGIX", "TAMQO"].includes(scope) || (refund.allocations?.[scope] || 0) > 0).length, 0),
+    refundedOrders: orders.filter((o) => (o.refunds || []).some((refund) =>
+      !["LOGIX", "TAMQO"].includes(scope) || (refund.allocations?.[scope] || 0) > 0)).length,
+    netAfterRefund: netSales,
     netSales,
     revenue: netSales,
     averageOrderValue: n
@@ -150,24 +163,24 @@ export function summarize(orders, scope) {
     codOrders: orders.filter((o) => o.payment.method === "COD").length,
     codRevenue: sum(
       realized.filter((o) => o.payment.method === "COD"),
-      (o) => scopedRevenue(o, scope),
+      (o) => scopedRevenue(o, scope) - scopedRefund(o, scope),
     ),
     prepaidOrders: prepaid.length,
     prepaidRevenue: sum(prepaid.filter(isRealized), (o) =>
-      scopedRevenue(o, scope),
+      scopedRevenue(o, scope) - scopedRefund(o, scope),
     ),
     prepaymentRate: ratio(prepaid.length, n),
     paymentSuccessRate: ratio(
       orders.filter(
         (o) =>
-          o.payment.amountPaidOnline + o.payment.amountCollected >=
+          o.payment.amountPaidOnline + o.payment.amountCollected - (o.refundedAmount || 0) >=
           o.totalOrderValue,
       ).length,
       n,
     ),
     amountCollected: sum(
       orders,
-      (o) => o.payment.amountPaidOnline + o.payment.amountCollected,
+      (o) => o.payment.amountPaidOnline + o.payment.amountCollected - (o.refundedAmount || 0),
     ),
     amountOutstanding: sum(
       orders.filter((o) => !["CANCELLED", "RETURNED"].includes(o.status)),
@@ -246,7 +259,8 @@ export function balanceBreakdown(orders, sales, expenses, scope = "ALL") {
     totalExpenses = sum(
       expenses.filter(
         (expense) =>
-          !["TAMQO", "LOGIX"].includes(scope) || expense.business === scope,
+          !expense.sourceOrderDeletedAt &&
+          (!["TAMQO", "LOGIX"].includes(scope) || expense.business === scope),
       ),
       (expense) => expense.amount,
     );
@@ -268,6 +282,7 @@ function addDirectSales(metrics, sales, scope) {
     directSalesUnits: units,
     grossSales: round(metrics.grossSales + revenue),
     netSales: round(metrics.netSales + revenue),
+    netAfterRefund: round(metrics.netAfterRefund + revenue),
     revenue: round(metrics.revenue + revenue),
     totalUnitsSold: metrics.totalUnitsSold + units,
   });
@@ -321,6 +336,9 @@ export function buildReport(
   sales = [],
   previousSales = [],
 ) {
+  orders = orders.filter((o) => !o.deletedAt);
+  previous = previous.filter((o) => !o.deletedAt);
+  history = history.filter((o) => !o.deletedAt);
   const metrics = summarizePerformance(orders, sales, scope),
     prior = summarizePerformance(previous, previousSales, scope),
     orderMetrics = summarize(orders, scope);
@@ -355,10 +373,10 @@ export function buildReport(
           86400000,
       );
     const customerLifetimeRevenue = sum(list.filter(isRealized), (o) =>
-      scopedRevenue(o, scope),
+      scopedRevenue(o, scope) - scopedRefund(o, scope),
     );
     const revenue = sum(selected.filter(isRealized), (o) =>
-      scopedRevenue(o, scope),
+      scopedRevenue(o, scope) - scopedRefund(o, scope),
     );
     if (list.length > 1) recurringCustomerRevenue += revenue;
     topCustomers.push({
@@ -391,8 +409,8 @@ export function buildReport(
   const partnership = orders.filter(
       (o) => o.businessType === "PARTNERSHIP" && isRealized(o),
     ),
-    tamqo = sum(partnership, (o) => o.tamqoRevenue),
-    logix = sum(partnership, (o) => o.logixRevenue);
+    tamqo = sum(partnership, (o) => o.tamqoRevenue - scopedRefund(o, "TAMQO")),
+    logix = sum(partnership, (o) => o.logixRevenue - scopedRefund(o, "LOGIX"));
   Object.assign(metrics, {
     tamqoRevenueThroughPartnership: tamqo,
     logixRevenueThroughPartnership: logix,
@@ -518,7 +536,7 @@ export function buildReport(
       grossSales:
         "Product value of orders that reached CONFIRMED, excluding cancelled orders, plus direct sales. Returns remain in gross sales.",
       netSales:
-        "Realized order product revenue plus direct sales. Cancelled, returning and returned orders are excluded.",
+        "Realized order product revenue plus direct sales, less refunds allocated to this scope. Cancelled, returning, returned and deleted orders are excluded.",
       averageOrderValue:
         "Product value of all selected orders / selected order count.",
       totalUnitsSold: "Units on realized orders plus direct-sale quantities.",
@@ -535,7 +553,7 @@ export function buildReport(
       partnershipShares:
         "Realized partnership product revenue, excluding shipping.",
       currentBalance:
-        "All-time realized order product revenue plus direct sales, less all-time expenses. It does not change with the report date filter.",
+        "All-time realized order product revenue plus direct sales, less allocated refunds and all-time expenses. It does not change with the report date filter.",
     },
   };
 }
@@ -656,10 +674,10 @@ export async function analytics(query, scope = "ALL", user) {
         ...(user ? saleScope(user) : {}),
         ...(["TAMQO", "LOGIX"].includes(scope) ? { business: scope } : {}),
       },
-      balanceExpenseFilter = ["TAMQO", "LOGIX"].includes(scope)
-        ? { business: scope }
-        : {};
+      balanceExpenseFilter = { sourceOrderDeletedAt: { $exists: false },
+        ...(["TAMQO", "LOGIX"].includes(scope) ? { business: scope } : {}) };
     if (user) balanceOrderFilter.$and = [analyticsScope(user, scope)];
+    balanceOrderFilter.deletedAt = { $exists: false };
     const [balanceOrders, balanceSales, balanceExpenses] = await Promise.all([
       Order.find(balanceOrderFilter, projection).lean(),
       Sale.find(balanceSaleFilter).lean(),
@@ -684,6 +702,7 @@ export async function analytics(query, scope = "ALL", user) {
       {
         $match: {
           business: scope,
+          sourceOrderDeletedAt: { $exists: false },
           expenseDate: { $gte: range.start, $lt: range.end },
         },
       },

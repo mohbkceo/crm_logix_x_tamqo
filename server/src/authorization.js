@@ -39,13 +39,14 @@ export function requireAnyBusiness(user, businesses) {
 export const orderBusinesses = (order) => [
   ...new Set(order.items.map((i) => i.business)),
 ];
-export function orderScope(user, own = false) {
+export function orderScope(user, own = false, includeDeleted = false) {
   const allowed =
     user.role === "SUPER_ADMIN" ? BUSINESSES : user.businessAccess;
   const types = allowed.map((b) => `${b}_ONLY`);
   if (BUSINESSES.every((b) => allowed.includes(b))) types.push("PARTNERSHIP");
   return {
     businessType: { $in: types },
+    ...(includeDeleted ? {} : { deletedAt: { $exists: false } }),
     ...(own ? { "createdBy.userId": user._id } : {}),
   };
 }

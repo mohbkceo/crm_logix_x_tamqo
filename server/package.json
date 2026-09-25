@@ -7,7 +7,7 @@
     "dev": "node --watch src/index.js",
     "start": "node src/index.js",
     "seed": "node src/seed.js",
-    "test": "node --test --test-concurrency=1 test/*.test.js"
+    "test": "node --import ./test/setup.js --test --test-concurrency=1 test/*.test.js"
   },
   "dependencies": {
     "axios": "^1.12.0",

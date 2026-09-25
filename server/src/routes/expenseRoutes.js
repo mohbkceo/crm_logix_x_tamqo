@@ -61,7 +61,7 @@ function filters(q) {
     ["TAMQO", "LOGIX"].includes(q.business),
     "Choose Tamqo or Logix expenses.",
   );
-  const f = { business: q.business };
+  const f = { business: q.business, sourceOrderDeletedAt: { $exists: false } };
   if (q.search) f.title = { $regex: escapeRegex(q.search), $options: "i" };
   if (q.addedBy) f["createdBy.userId"] = objectId(q.addedBy);
   if (q.category) f.categoryId = objectId(q.category);

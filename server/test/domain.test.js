@@ -4,6 +4,7 @@ import {
   normalizePhone,
   calculateFinancials,
   canTransition,
+  canProviderTransition,
 } from "../src/domain/order.js";
 import { reportingRange } from "../src/domain/period.js";
 import {
@@ -98,17 +99,14 @@ test("Excel situations normalize accents and map only observed safe CRM statuses
       delivered: true,
       known: true,
     });
-  for (const situation of [
-    "Retour Client",
-    "Retour Livreur",
-    "Retour Navette",
-    "Retour de Dispatche",
-  ]) {
+  for (const situation of ["Retour Livreur", "Retour Navette", "Retour de Dispatche"]) {
     const mapped = mapImportSituation(situation);
-    assert.equal(mapped.status, "RETURNED");
-    assert.equal(mapped.fee, true);
+    assert.equal(mapped.status, "RETURNING");
   }
+  assert.equal(mapImportSituation("Retour Stock").status, "RETURNED");
+  assert.equal(mapImportSituation("Retour Client").status, "RETURNED");
   assert.equal(mapImportSituation("Annuler par le Client").status, "CANCELLED");
+  assert.equal(mapImportSituation("Annuler par le Client").fee, undefined);
   assert.equal(mapImportSituation("En livraison").status, "OUT_FOR_DELIVERY");
   assert.equal(mapImportSituation("En Préparation").status, "PREPARING");
   assert.equal(mapImportSituation("En Traitement").status, "PREPARING");
@@ -396,6 +394,17 @@ test("transitions reject lifecycle regressions and allow digital completion", ()
   assert.equal(canTransition("NEW", "DELIVERED", "LOGIX_ONLY"), false);
   assert.equal(canTransition("RETURNED", "SHIPPED", "LOGIX_ONLY"), false);
   assert.equal(canTransition("CONFIRMED", "DELIVERED", "TAMQO_ONLY"), true);
+});
+
+test("provider transitions permit recovery and cancellation without reopening terminal orders", () => {
+  assert.equal(canProviderTransition("FAILED_DELIVERY", "CANCELLED"), true);
+  for (const to of ["OUT_FOR_DELIVERY", "SHIPPED", "FAILED_DELIVERY", "DELIVERED"])
+    assert.equal(canProviderTransition("RETURNING", to), true);
+  assert.equal(canProviderTransition("RETURNED", "DELIVERED"), false);
+  assert.equal(canProviderTransition("DELIVERED", "RETURNING"), false);
+  assert.equal(canProviderTransition("CANCELLED", "SHIPPED"), false);
+  assert.equal(canTransition("RETURNING", "DELIVERED", "LOGIX_ONLY"), false);
+  assert.equal(canTransition("FAILED_DELIVERY", "CANCELLED", "LOGIX_ONLY"), false);
 });
 
 test("Colis parser preserves status and rejects invented aliases", () => {

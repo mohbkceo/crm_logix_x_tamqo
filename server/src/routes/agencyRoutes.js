@@ -39,12 +39,16 @@ const schema = z.object({
   capabilities: z
     .object({
       createShipment: z.boolean(),
+      updateShipment: z.boolean().optional().default(false),
+      deleteShipment: z.boolean().optional().default(false),
       tracking: z.boolean(),
       readyToShip: z.boolean(),
       pricing: z.boolean(),
     })
     .default({
       createShipment: true,
+      updateShipment: false,
+      deleteShipment: false,
       tracking: true,
       readyToShip: true,
       pricing: true,

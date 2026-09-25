@@ -10,6 +10,7 @@ import {
   sanitizeProviderData,
 } from "./deliveryMapper.js";
 import { mapProviderStatus } from "./deliveryStatusMapper.js";
+import { ensureReturnExpense, reverseReturnExpense } from "./deliveryFinancialService.js";
 export class DeliverySyncService {
   constructor(client = deliveryClient) {
     this.client = client;
@@ -55,6 +56,7 @@ export class DeliverySyncService {
       async (session) => {
         const order = await Order.findById(orderId).session(session);
         assert(order, "Order not found", 404);
+        assert(!order.deletedAt, "Deleted orders cannot create shipments.", 409);
         let s = await Shipment.findOne({ orderId }).session(session);
         if (s?.tracking) return { order, shipment: s };
         assert(
@@ -322,6 +324,7 @@ export class DeliverySyncService {
       const s = await Shipment.findOne({ orderId }).session(session),
         order = await Order.findById(orderId).session(session);
       assert(s && order, "Shipment not found", 404);
+      assert(!order.deletedAt, "Deleted orders cannot synchronize shipments.", 409);
       const status = mapProviderStatus(parcel.providerStatus);
       const beforeProviderStatus = s.providerStatus || null,
         beforeOrderStatus = order.status;
@@ -349,6 +352,11 @@ export class DeliverySyncService {
             session,
           );
           afterOrderStatus = changedOrder.status;
+          if (["RETURNING", "RETURNED"].includes(afterOrderStatus)) {
+            await ensureReturnExpense(changedOrder, { session, actor: "courier", tracking: s.tracking });
+          } else if (afterOrderStatus === "DELIVERED") {
+            await reverseReturnExpense(changedOrder, { session, actor: "courier" });
+          }
         } else {
           s.lastError = `Provider reports ${status}; internal state is ${order.status}. Review the skipped or conflicting transition.`;
           s.syncStatus = "ERROR";
@@ -423,6 +431,7 @@ export class DeliverySyncService {
     const s = await Shipment.findOne({ orderId }),
       o = await Order.findById(orderId);
     assert(o, "Order not found", 404);
+    assert(!o.deletedAt, "Deleted orders cannot synchronize shipments.", 409);
     assert(
       o.status === "PREPARING" || o.status === "READY_TO_SHIP",
       "Prepare this order first.",

@@ -126,12 +126,18 @@ export function canTransition(from, to, businessType) {
   );
 }
 export function canProviderTransition(from, to) {
+  if (["DELIVERED", "RETURNED", "CANCELLED"].includes(from)) return false;
+  if (to === "CANCELLED") return true;
   // Polling can miss intermediate provider states. Record only the observed transition,
   // never invent timestamps for the stages that were not observed.
+  const providerTransitions = {
+    ...TRANSITIONS,
+    RETURNING: ["RETURNED", "OUT_FOR_DELIVERY", "SHIPPED", "FAILED_DELIVERY", "DELIVERED"],
+  };
   const seen = new Set([from]),
     queue = [from];
   while (queue.length) {
-    for (const next of TRANSITIONS[queue.shift()] || []) {
+    for (const next of providerTransitions[queue.shift()] || []) {
       if (next === to) return true;
       if (!seen.has(next)) {
         seen.add(next);

@@ -78,6 +78,7 @@ function publicRun(run) {
 async function context(id, capability, creating = false) {
   const order = await Order.findById(id);
   assert(order, "Order not found", 404);
+  assert(!order.deletedAt, "Deleted orders cannot synchronize shipments.", 409);
   const agency = await DeliveryAgency.findById(order.delivery.agencyId);
   assert(agency, "Order delivery agency is missing. Run the migration.", 409);
   if (creating) {
@@ -329,7 +330,7 @@ export const deliveryService = {
       if (!lockOwner) {
         return await finish("COMPLETED");
       }
-      const orders = await Order.find({ status: { $nin: TERMINAL } })
+      const orders = await Order.find({ status: { $nin: TERMINAL }, deletedAt: { $exists: false } })
           .sort({ createdAt: 1, _id: 1 })
           .lean(),
         orderIds = orders.map((order) => order._id),

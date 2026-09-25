@@ -44,6 +44,7 @@ import { createServer } from "node:http";
 import { encryptCredentials } from "../src/services/delivery/credentials.js";
 import { providerFor } from "../src/services/delivery/deliveryProviderFactory.js";
 import { deliveryService } from "../src/services/delivery/deliveryService.js";
+import { DeliveryClient } from "../src/services/delivery/deliveryClient.js";
 let replica, plan, product, plaque15, stand, source, wilaya, apiAgent;
 const request = () => apiAgent;
 before(
@@ -539,7 +540,7 @@ test("partnership failure fees use positive underlying-business expenses totalin
   assert.ok(expenses.every((expense) => expense.amount > 0));
 });
 
-test("Annuler par le Client imports CANCELLED and never duplicates its 150 DA fee", async () => {
+test("Annuler par le Client imports CANCELLED without a return fee", async () => {
   const row = importRow({
     Tracking: "CANCEL-001",
     Situation: "Annuler par le Client",
@@ -551,14 +552,110 @@ test("Annuler par le Client imports CANCELLED and never duplicates its 150 DA fe
     await commitWorkbook(apiAgent, buffer, "xlsx", importOptions(preview)),
   );
   assert.equal(first.cancelled, 1);
-  assert.equal(first.feesCreated, 1);
+  assert.equal(first.feesCreated, 0);
   const repeated = expectOk(
     await commitWorkbook(apiAgent, buffer, "xlsx", importOptions(preview)),
   );
   assert.equal(repeated.feesCreated, 0);
   assert.equal(await Order.countDocuments(), 1);
-  assert.equal(await Expense.countDocuments(), 1);
-  assert.equal((await Expense.findOne()).amount, 150);
+  assert.equal(await Expense.countDocuments(), 0);
+});
+
+test("provider return recovery reconciles one fee and realizes order revenue once", async () => {
+  const order = await createOrder(input());
+  await Order.updateOne({ _id: order._id }, { $set: { status: "FAILED_DELIVERY" } });
+  await Shipment.create({ orderId: order._id, tracking: "RECOVER-1", trackingKey: "RECOVER-1" });
+  const service = new DeliverySyncService();
+  const sync = (providerStatus) => service.applyWithResult(order._id, {
+    tracking: "RECOVER-1", providerStatus, raw: { providerStatus },
+  });
+  const feeQuery = { sourceOrderId: order._id, sourceType: "DELIVERY_FAILURE_FEE", systemGenerated: true };
+  const revenue = async () => (expectOk(await apiAgent.get("/api/analytics/all?period=today"))).metrics.netSales;
+  assert.equal(await revenue(), 0);
+  assert.equal((await sync("Retour Livreur")).outcome.afterOrderStatus, "RETURNING");
+  let fees = await Expense.find(feeQuery);
+  assert.equal(fees.reduce((sum, fee) => sum + fee.amount, 0), 150);
+  assert.equal(fees.length, 2);
+  assert.ok(fees.every((fee) => fee.amount > 0 && fee.sourceTracking === "RECOVER-1"));
+  await sync("Retour Livreur");
+  assert.equal(await Expense.countDocuments(feeQuery), 2);
+  assert.equal((await sync("En livraison")).outcome.afterOrderStatus, "OUT_FOR_DELIVERY");
+  assert.equal(await Expense.countDocuments(feeQuery), 2);
+  assert.equal(await revenue(), 0);
+  const manual = await Expense.create({ business: "LOGIX", title: "Manual courier expense", amount: 37,
+    sourceOrderId: order._id, sourceType: "DELIVERY_FAILURE_FEE", systemGenerated: false });
+  assert.equal((await sync("Livrée")).outcome.afterOrderStatus, "DELIVERED");
+  assert.equal(await Expense.countDocuments(feeQuery), 0);
+  assert.ok(await Expense.exists({ _id: manual._id }));
+  assert.equal(await revenue(), order.productRevenue);
+  await sync("Livrée [ Encaisser ]");
+  await sync("Livrée [ Recouvert ]");
+  assert.equal(await revenue(), order.productRevenue);
+  assert.equal(await Expense.countDocuments(feeQuery), 0);
+  assert.equal(await Sale.countDocuments(), 0);
+  assert.equal(await OrderEvent.countDocuments({ orderId: order._id, type: "DELIVERY_RETURN_FEE_REVERSED" }), 1);
+});
+
+test("provider cancellation has no return fee and a direct returned jump does", async () => {
+  const service = new DeliverySyncService();
+  const apply = async (order, tracking, providerStatus) => service.applyWithResult(order._id, {
+    tracking, providerStatus, raw: { providerStatus },
+  });
+  const cancelled = await createOrder(input("LOGIX_ONLY"));
+  await Order.updateOne({ _id: cancelled._id }, { $set: { status: "FAILED_DELIVERY" } });
+  await Shipment.create({ orderId: cancelled._id, tracking: "CANCEL-SYNC", trackingKey: "CANCEL-SYNC" });
+  assert.equal((await apply(cancelled, "CANCEL-SYNC", "Annuler par le Client")).outcome.afterOrderStatus, "CANCELLED");
+  assert.equal(await Expense.countDocuments({ sourceOrderId: cancelled._id }), 0);
+  const returned = await createOrder(input("LOGIX_ONLY"));
+  await Order.updateOne({ _id: returned._id }, { $set: { status: "FAILED_DELIVERY" } });
+  await Shipment.create({ orderId: returned._id, tracking: "RETURN-SYNC", trackingKey: "RETURN-SYNC" });
+  assert.equal((await apply(returned, "RETURN-SYNC", "Retour Stock")).outcome.afterOrderStatus, "RETURNED");
+  assert.equal((await Expense.findOne({ sourceOrderId: returned._id })).amount, 150);
+  assert.equal((await apply(returned, "RETURN-SYNC", "Livrée")).outcome.result, "ERROR");
+  assert.equal((await Order.findById(returned._id)).status, "RETURNED");
+});
+
+test("manual return transition uses the shared fee while keeping lifecycle rules strict", async () => {
+  const order = await createOrder(input("LOGIX_ONLY"));
+  await Order.updateOne({ _id: order._id }, { $set: { status: "FAILED_DELIVERY" } });
+  await transition(order._id, "RETURNING");
+  assert.equal((await Expense.findOne({ sourceOrderId: order._id })).amount, 150);
+  await assert.rejects(transition(order._id, "DELIVERED"), /Cannot change RETURNING to DELIVERED/);
+  await transition(order._id, "RETURNED");
+  assert.equal(await Expense.countDocuments({ sourceOrderId: order._id }), 1);
+});
+
+test("Excel return recovery uses the same fee reversal as live sync", async () => {
+  const returning = importRow({ Tracking: "EXCEL-RECOVER", Situation: "Retour Navette" });
+  const firstPreview = expectOk((await previewWorkbook(apiAgent, [returning])).response);
+  assert.equal(firstPreview.rows[0].mappedStatus, "RETURNING");
+  const first = expectOk(await commitWorkbook(apiAgent, importWorkbook([returning]), "xlsx", importOptions(firstPreview)));
+  assert.equal(first.feesCreated, 1);
+  const order = await Order.findOne();
+  assert.equal((await Expense.findOne({ sourceOrderId: order._id })).amount, 150);
+  const delivered = importRow({ Tracking: "EXCEL-RECOVER", Situation: "Livrée" });
+  const secondPreview = expectOk((await previewWorkbook(apiAgent, [delivered])).response);
+  assert.equal(secondPreview.rows[0].action, "UPDATE_EXISTING");
+  expectOk(await commitWorkbook(apiAgent, importWorkbook([delivered]), "xlsx", importOptions(secondPreview)));
+  assert.equal((await Order.findById(order._id)).status, "DELIVERED");
+  assert.equal(await Expense.countDocuments({ sourceOrderId: order._id }), 0);
+  assert.equal(await OrderEvent.countDocuments({ orderId: order._id, type: "DELIVERY_RETURN_FEE_REVERSED" }), 1);
+  assert.equal(await Sale.countDocuments(), 0);
+});
+
+test("live recovery reverses a return fee originally created by Excel import", async () => {
+  const row = importRow({ Tracking: "IMPORT-THEN-LIVE", Situation: "Retour Livreur" });
+  const preview = expectOk((await previewWorkbook(apiAgent, [row])).response);
+  expectOk(await commitWorkbook(apiAgent, importWorkbook([row]), "xlsx", importOptions(preview)));
+  const order = await Order.findOne();
+  assert.equal(await Expense.countDocuments({ sourceOrderId: order._id, sourceType: "DELIVERY_FAILURE_FEE" }), 1);
+  const service = new DeliverySyncService();
+  const result = await service.applyWithResult(order._id, {
+    tracking: "IMPORT-THEN-LIVE", providerStatus: "Livrée", raw: { Situation: "Livrée" },
+  });
+  assert.equal(result.outcome.afterOrderStatus, "DELIVERED");
+  assert.equal(await Expense.countDocuments({ sourceOrderId: order._id }), 0);
+  assert.equal(await OrderEvent.countDocuments({ orderId: order._id, type: "DELIVERY_RETURN_FEE_REVERSED" }), 1);
 });
 
 test("tracking deduplicates orders while Algerian phone normalization deduplicates customers", async () => {
@@ -2319,18 +2416,271 @@ test("API order automatically creates one unconfirmed parcel after local commit"
   assert.equal(o.revision, (await Order.findById(o._id)).revision);
   expectOk(await apiAgent.post(`/api/orders/${o._id}/shipment`));
   assert.equal(f.calls.length, 1);
-  assert.equal(
-    (
-      await apiAgent
-        .patch(`/api/orders/${o._id}`)
-        .send({ ...f.input, revision: o.revision })
-    ).status,
-    409,
-  );
+  const unchangedEdit = await apiAgent
+    .patch(`/api/orders/${o._id}`)
+    .send({ ...f.input, revision: o.revision });
+  assert.equal(unchangedEdit.status, 200);
+  assert.equal(unchangedEdit.body.revision, o.revision + 1);
+  assert.equal(f.calls.length, 1);
   assert.equal(
     (await apiAgent.post(`/api/orders/${o._id}/cancel`).send({})).status,
     409,
   );
+});
+
+test("full order edit recalculates totals and snapshots all courier fields without a shipment", async () => {
+  const created = await createOrder(input("PARTNERSHIP"), { userId: (await User.findOne({ email: "qa@example.com" }))._id, name: "Test Super Admin" });
+  const otherWilaya = await Wilaya.findOne({ agencyId: "31" });
+  const changed = input("PARTNERSHIP", {
+    customer: { name: "Changed Customer", phoneA: "0550998877", phoneB: "0660112233" },
+    location: { wilayaId: String(otherWilaya._id), commune: "New Commune", address: "New Street 42" },
+    sourceId: String(source._id), note: "New note",
+    items: [{ business: "TAMQO", catalogItemId: String(plan._id), quantity: 2, unitPrice: 1250.25 },
+      { business: "LOGIX", catalogItemId: String(product._id), quantity: 3, unitPrice: 1999.99 }],
+    deliveryCharged: 750, delivery: { agencyId: String(created.delivery.agencyId), type: "STOP_DESK", exchange: true },
+    payment: { method: "MIXED", amountPaidOnline: 1000 },
+  });
+  const response = await apiAgent.patch(`/api/orders/${created._id}`).send({ ...changed, revision: created.revision, totalOrderValue: 1 });
+  const edited = expectOk(response);
+  assert.equal(edited.customer.name, "Changed Customer");
+  assert.equal(edited.customer.phoneB, "0660112233");
+  assert.equal(edited.location.wilayaName, otherWilaya.name);
+  assert.equal(edited.location.address, "New Street 42");
+  assert.equal(edited.tamqoRevenue, 2500.5);
+  assert.equal(edited.logixRevenue, 5999.97);
+  assert.equal(edited.totalOrderValue, 9250.47);
+  assert.equal(edited.payment.amountToCollect, 8250.47);
+  assert.equal((await apiAgent.patch(`/api/orders/${created._id}`).send({ ...changed, revision: created.revision })).status, 409);
+  assert.equal(await OrderEvent.countDocuments({ orderId: created._id, kind: "EDITED" }), 1);
+  assert.equal(await AuditLog.countDocuments({ resourceId: String(created._id), action: "ORDER_UPDATED" }), 1);
+});
+
+test("manual and unsupported API shipments allow explicit synchronized edits", async (t) => {
+  const manual = await courierFixture(t, (_req, res) => jsonReply(res, 500, {}), { manual: true });
+  const created = expectOk(await apiAgent.post("/api/orders").send(manual.input));
+  expectOk(await apiAgent.post(`/api/orders/${created._id}/confirm`));
+  expectOk(await apiAgent.post(`/api/orders/${created._id}/shipment`).send({ tracking: "MANUAL-EDIT-1" }));
+  const current = await Order.findById(created._id);
+  const changed = { ...manual.input, location: { ...manual.input.location, address: "Updated manual address" }, revision: current.revision };
+  const edited = expectOk(await apiAgent.patch(`/api/orders/${created._id}`).send(changed));
+  assert.equal(edited.location.address, "Updated manual address");
+  assert.equal(await OrderEvent.countDocuments({ orderId: created._id, type: "SHIPMENT_MANUAL_UPDATE" }), 1);
+  assert.equal(await AuditLog.countDocuments({ resourceId: created._id, action: "SHIPMENT_MANUAL_UPDATE" }), 1);
+});
+
+test("unsupported API parcel changes require confirmation and never invent a provider endpoint", async (t) => {
+  const f = await courierFixture(t, (_req, res) => jsonReply(res, 200, { Colis: [{ Tracking: "API-EDIT-1", MessageRetour: "Good" }] }));
+  const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  const body = { ...f.input, location: { ...f.input.location, address: "Updated courier address" }, revision: created.revision };
+  assert.equal((await apiAgent.patch(`/api/orders/${created._id}`).send(body)).status, 409);
+  assert.equal((await Order.findById(created._id)).location.address, f.input.location.address);
+  const edited = expectOk(await apiAgent.patch(`/api/orders/${created._id}`).send({ ...body, providerUpdateConfirmed: true }));
+  assert.equal(edited.location.address, "Updated courier address");
+  assert.equal(f.calls.length, 1);
+  assert.equal(await OrderEvent.countDocuments({ orderId: created._id, type: "SHIPMENT_MANUAL_UPDATE_CONFIRMED" }), 1);
+});
+
+test("capability-backed API edits call the provider with canonical parcel mapping", async (t) => {
+  const f = await courierFixture(t, (_req, res) => jsonReply(res, 200, { Colis: [{ Tracking: "API-EDIT-2", MessageRetour: "Good" }] }));
+  f.agency.capabilities.updateShipment = true;
+  await f.agency.save();
+  const payloads = [];
+  const prior = DeliveryClient.prototype.updateShipment;
+  DeliveryClient.prototype.updateShipment = async function (_shipment, payload) { payloads.push(payload); return { success: true }; };
+  t.after(() => { if (prior) DeliveryClient.prototype.updateShipment = prior; else delete DeliveryClient.prototype.updateShipment; });
+  const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  const body = { ...f.input, customer: { ...f.input.customer, name: "Courier Edited" },
+    items: [{ business: "LOGIX", catalogItemId: String(product._id), quantity: 3, unitPrice: 2000 }], revision: created.revision };
+  const edited = expectOk(await apiAgent.patch(`/api/orders/${created._id}`).send(body));
+  assert.equal(payloads.length, 1);
+  assert.equal(payloads[0].Colis[0].Client, "Courier Edited");
+  assert.equal(payloads[0].Colis[0].Total, "6500");
+  assert.equal(edited.totalOrderValue, 6500);
+  assert.equal(await OrderEvent.countDocuments({ orderId: created._id, type: "SHIPMENT_UPDATE" }), 1);
+});
+
+test("failed provider edit preserves CRM data and exposes shipment error", async (t) => {
+  const f = await courierFixture(t, (_req, res) => jsonReply(res, 200, { Colis: [{ Tracking: "API-EDIT-FAIL", MessageRetour: "Good" }] }));
+  f.agency.capabilities.updateShipment = true;
+  await f.agency.save();
+  const prior = DeliveryClient.prototype.updateShipment;
+  DeliveryClient.prototype.updateShipment = async () => { throw new AppError("Provider update failed", 502); };
+  t.after(() => { if (prior) DeliveryClient.prototype.updateShipment = prior; else delete DeliveryClient.prototype.updateShipment; });
+  const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  const response = await apiAgent.patch(`/api/orders/${created._id}`).send({ ...f.input,
+    location: { ...f.input.location, address: "Should not save" }, revision: created.revision });
+  assert.equal(response.status, 502);
+  assert.equal((await Order.findById(created._id)).location.address, f.input.location.address);
+  const shipment = await Shipment.findOne({ orderId: created._id });
+  assert.equal(shipment.syncStatus, "ERROR");
+  assert.match(shipment.lastError, /Provider update failed/);
+  assert.equal(await OrderEvent.countDocuments({ orderId: created._id, type: "SHIPMENT_UPDATE_FAILED" }), 1);
+  assert.equal(await AuditLog.countDocuments({ resourceId: created._id, action: "SHIPMENT_UPDATE_FAILED" }), 1);
+});
+
+test("terminal orders reject content edits while in-delivery orders remain editable", async () => {
+  const created = await createOrder(input("LOGIX_ONLY"), { userId: (await User.findOne({ email: "qa@example.com" }))._id,
+    name: "Test Super Admin" });
+  await Order.updateOne({ _id: created._id }, { $set: { status: "SHIPPED" } });
+  const shipped = expectOk(await apiAgent.patch(`/api/orders/${created._id}`).send({
+    ...input("LOGIX_ONLY", { location: { ...input("LOGIX_ONLY").location, address: "In delivery update" } }),
+    revision: created.revision,
+  }));
+  assert.equal(shipped.location.address, "In delivery update");
+  await Order.updateOne({ _id: created._id }, { $set: { status: "DELIVERED" } });
+  assert.equal((await apiAgent.patch(`/api/orders/${created._id}`).send({ ...input("LOGIX_ONLY"), revision: shipped.revision })).status, 409);
+});
+
+test("agency changes require old parcel deletion before linking the new shipment", async (t) => {
+  const f = await courierFixture(t, (_req, res) => jsonReply(res, 200, { Colis: [{ Tracking: "AGENCY-OLD-1", MessageRetour: "Good" }] }));
+  const next = await DeliveryAgency.create({ name: "New manual agency", code: "NEW_MANUAL_EDIT", active: true,
+    businesses: ["LOGIX"], integrationType: "MANUAL", apiProvider: "MANUAL",
+    capabilities: { createShipment: true, tracking: true, readyToShip: true, pricing: false } });
+  t.after(() => DeliveryAgency.deleteOne({ _id: next._id }));
+  const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  const body = { ...f.input, delivery: { ...f.input.delivery, agencyId: String(next._id) }, revision: created.revision };
+  assert.equal((await apiAgent.patch(`/api/orders/${created._id}`).send(body)).status, 409);
+  assert.equal(String((await Shipment.findOne({ orderId: created._id })).agencyId), String(f.agency._id));
+  const edited = expectOk(await apiAgent.patch(`/api/orders/${created._id}`).send({ ...body, providerDeletionConfirmed: true }));
+  assert.equal(edited.delivery.agencyId, String(next._id));
+  const shipment = await Shipment.findOne({ orderId: created._id });
+  assert.equal(shipment.provider, "MANUAL");
+  assert.equal(shipment.tracking, undefined);
+  assert.equal(await OrderEvent.countDocuments({ orderId: created._id, type: "SHIPMENT_MANUAL_DELETE_CONFIRMED" }), 1);
+  assert.equal(f.calls.length, 1);
+});
+
+test("supported provider deletion runs first and failures remain visible", async (t) => {
+  const f = await courierFixture(t, (_req, res) => jsonReply(res, 200, { Colis: [{ Tracking: "DELETE-API-1", MessageRetour: "Good" }] }));
+  f.agency.capabilities.deleteShipment = true;
+  await f.agency.save();
+  let fail = true, calls = 0;
+  const prior = DeliveryClient.prototype.deleteShipment;
+  DeliveryClient.prototype.deleteShipment = async function () {
+    calls++;
+    if (fail) throw new AppError("Provider deletion failed", 502);
+    return { success: true };
+  };
+  t.after(() => { if (prior) DeliveryClient.prototype.deleteShipment = prior; else delete DeliveryClient.prototype.deleteShipment; });
+  const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  assert.equal((await apiAgent.delete(`/api/orders/${created._id}`).send({ revision: created.revision })).status, 502);
+  assert.equal((await Order.findById(created._id)).deletedAt, undefined);
+  assert.equal((await Shipment.findOne({ orderId: created._id })).syncStatus, "ERROR");
+  assert.equal(await OrderEvent.countDocuments({ orderId: created._id, type: "SHIPMENT_DELETE_FAILED" }), 1);
+  fail = false;
+  const removed = expectOk(await apiAgent.delete(`/api/orders/${created._id}`).send({ revision: created.revision }));
+  assert.ok(removed.deletedAt);
+  assert.equal(calls, 2);
+  assert.equal(f.calls.length, 1);
+});
+
+test("soft deletion retains records and excludes orders from lists, analytics, customers and sync", async () => {
+  const created = await createOrder(input("PARTNERSHIP"), { userId: (await User.findOne({ email: "qa@example.com" }))._id, name: "Test Super Admin" });
+  const removed = expectOk(await apiAgent.delete(`/api/orders/${created._id}`).send({ revision: created.revision, reason: "Duplicate" }));
+  assert.ok(removed.deletedAt);
+  assert.equal((await Order.findById(created._id)).deleteReason, "Duplicate");
+  assert.equal((await apiAgent.get("/api/orders")).body.total, 0);
+  assert.equal((await apiAgent.get("/api/orders?deleted=only")).body.total, 1);
+  assert.equal((await apiAgent.get("/api/analytics/all?period=year")).body.metrics.totalOrders, 0);
+  assert.equal((await apiAgent.get("/api/analytics/all?period=year&export=true")).body.metrics.totalOrders, 0);
+  assert.equal((await apiAgent.get("/api/customers")).body.total, 0);
+  assert.equal((await deliveryService.syncBatch()).scanned, 0);
+  assert.equal((await apiAgent.post(`/api/orders/${created._id}/refund`).send({ revision: removed.revision, amount: 1 })).status, 409);
+  assert.equal((await apiAgent.patch(`/api/orders/${created._id}`).send({ ...input(), revision: removed.revision })).status, 409);
+  assert.equal((await apiAgent.post(`/api/orders/${created._id}/confirm`)).status, 409);
+  assert.equal(await OrderEvent.countDocuments({ orderId: created._id, kind: "DELETED" }), 1);
+  assert.equal(await AuditLog.countDocuments({ resourceId: String(created._id), action: "ORDER_DELETED" }), 1);
+});
+
+test("shipment soft deletion requires provider confirmation and retains tracking", async () => {
+  const created = await createOrder(input("LOGIX_ONLY"), { userId: (await User.findOne({ email: "qa@example.com" }))._id, name: "Test Super Admin" });
+  await Shipment.create({ orderId: created._id, agencyId: created.delivery.agencyId,
+    agencyName: created.delivery.agencyName, provider: "PROCOLIS", tracking: "DELETE-TRACKING-1",
+    trackingKey: "DELETE-TRACKING-1", creationAttemptedAt: new Date(), providerAccepted: true });
+  assert.equal((await apiAgent.delete(`/api/orders/${created._id}`).send({ revision: created.revision })).status, 409);
+  const removed = expectOk(await apiAgent.delete(`/api/orders/${created._id}`).send({ revision: created.revision,
+    providerDeletionConfirmed: true }));
+  assert.ok(removed.deletedAt);
+  assert.equal((await Shipment.findOne({ orderId: created._id })).tracking, "DELETE-TRACKING-1");
+  assert.equal(await OrderEvent.countDocuments({ orderId: created._id, kind: "DELETED" }), 1);
+});
+
+test("deleting an order excludes its retained system return fee from balance", async () => {
+  const created = await createOrder(input("LOGIX_ONLY"), { userId: (await User.findOne({ email: "qa@example.com" }))._id,
+    name: "Test Super Admin" });
+  await Expense.create({ business: "LOGIX", title: "Delivery Return Fee", amount: 150,
+    systemGenerated: true, sourceType: "DELIVERY_FAILURE_FEE", sourceOrderId: created._id });
+  const before = expectOk(await apiAgent.get("/api/analytics/all?period=year"));
+  assert.equal(before.balance.currentBalance, -150);
+  expectOk(await apiAgent.delete(`/api/orders/${created._id}`).send({ revision: created.revision }));
+  const after = expectOk(await apiAgent.get("/api/analytics/all?period=year"));
+  assert.equal(after.balance.currentBalance, 0);
+  assert.equal(await Expense.countDocuments({ sourceOrderId: created._id }), 1);
+});
+
+test("refunds validate received money, retain gross sales and allocate partnership net revenue", async () => {
+  const created = await createOrder(input("PARTNERSHIP", { payment: { method: "ONLINE", amountPaidOnline: 11500 } }),
+    { userId: (await User.findOne({ email: "qa@example.com" }))._id, name: "Test Super Admin" });
+  await Order.updateOne({ _id: created._id }, { $set: { status: "DELIVERED" },
+    $push: { statusHistory: { status: "CONFIRMED", at: new Date(), actor: "admin" } } });
+  const first = expectOk(await apiAgent.post(`/api/orders/${created._id}/refund`).send({
+    revision: created.revision, amount: 1000.25, allocation: "LOGIX", note: "Partial" }));
+  assert.equal(first.refundedAmount, 1000.25);
+  const second = expectOk(await apiAgent.post(`/api/orders/${created._id}/refund`).send({
+    revision: first.revision, amount: 500, allocation: "TAMQO" }));
+  assert.equal(second.refundedAmount, 1500.25);
+  assert.equal(second.refunds.length, 2);
+  assert.equal(second.totalOrderValue, 11500);
+  assert.equal((await apiAgent.post(`/api/orders/${created._id}/refund`).send({ revision: second.revision, amount: 0.001 })).status, 400);
+  assert.equal((await apiAgent.post(`/api/orders/${created._id}/refund`).send({ revision: second.revision, amount: 10000 })).status, 409);
+  assert.equal((await apiAgent.post(`/api/orders/${created._id}/refund`).send({ revision: first.revision, amount: 1 })).status, 409);
+  const all = expectOk(await apiAgent.get("/api/analytics/all?period=year"));
+  const logix = expectOk(await apiAgent.get("/api/analytics/logix?period=year"));
+  const tamqo = expectOk(await apiAgent.get("/api/analytics/tamqo?period=year"));
+  assert.equal(all.metrics.grossSales, 11000);
+  assert.equal(all.metrics.totalRefunded, 1500.25);
+  assert.equal(all.metrics.netSales, 9499.75);
+  assert.equal(all.metrics.refundCount, 2);
+  assert.equal(logix.metrics.netSales, 5999.75);
+  assert.equal(tamqo.metrics.netSales, 3500);
+  assert.equal(all.balance.currentBalance, 9499.75);
+  assert.equal((await apiAgent.get("/api/customers")).body.items[0].lifetimeRevenue, 9499.75);
+  assert.equal(await Expense.countDocuments({ sourceOrderId: created._id }), 0);
+  assert.equal(await OrderEvent.countDocuments({ orderId: created._id, kind: "REFUND" }), 2);
+  assert.equal(await AuditLog.countDocuments({ resourceId: String(created._id), action: "ORDER_REFUND" }), 2);
+});
+
+test("whole-order partnership refund is allocated proportionally with exact cents", async () => {
+  const created = await createOrder(input("PARTNERSHIP", { payment: { method: "ONLINE", amountPaidOnline: 11500 } }),
+    { userId: (await User.findOne({ email: "qa@example.com" }))._id, name: "Test Super Admin" });
+  const refunded = expectOk(await apiAgent.post(`/api/orders/${created._id}/refund`).send({
+    revision: created.revision, amount: 100.01, allocation: "WHOLE" }));
+  assert.equal(refunded.refunds[0].allocations.LOGIX, 63.64);
+  assert.equal(refunded.refunds[0].allocations.TAMQO, 36.37);
+  assert.equal(Math.round((refunded.refunds[0].allocations.LOGIX + refunded.refunds[0].allocations.TAMQO) * 100), 10001);
+});
+
+test("edit, delete and refund enforce own/all permissions and business access", async () => {
+  const employee = expectOk(await apiAgent.post("/api/users").send({ name: "Order Mutator",
+    email: "order-mutator@example.com", password: "employee-password", role: "EMPLOYEE",
+    businessAccess: ["LOGIX"], permissions: [P.orders.viewOwn, P.orders.updateOwn,
+      P.orders.deleteOwn, P.orders.refundOwn] }));
+  const employeeAgent = supertest.agent(app);
+  expectOk(await employeeAgent.post("/api/auth/login").send({ email: employee.email, password: "employee-password" }));
+  const paid = input("LOGIX_ONLY", { payment: { method: "ONLINE", amountPaidOnline: 7500 } });
+  const own = await createOrder(paid, { userId: employee._id, name: employee.name });
+  const other = await createOrder(paid, { userId: (await User.findOne({ email: "qa@example.com" }))._id,
+    name: "Test Super Admin" });
+  assert.equal((await employeeAgent.patch(`/api/orders/${other._id}`).send({ ...paid, revision: other.revision })).status, 403);
+  assert.equal((await employeeAgent.post(`/api/orders/${other._id}/refund`).send({ revision: other.revision, amount: 10 })).status, 403);
+  assert.equal((await employeeAgent.delete(`/api/orders/${other._id}`).send({ revision: other.revision })).status, 403);
+  const edited = expectOk(await employeeAgent.patch(`/api/orders/${own._id}`).send({ ...paid, note: "Employee edit", revision: own.revision }));
+  const refunded = expectOk(await employeeAgent.post(`/api/orders/${own._id}/refund`).send({ revision: edited.revision, amount: 10 }));
+  expectOk(await employeeAgent.delete(`/api/orders/${own._id}`).send({ revision: refunded.revision }));
+  const tamqo = await createOrder(input("TAMQO_ONLY", { payment: { method: "ONLINE", amountPaidOnline: 4500 } }),
+    { userId: employee._id, name: employee.name });
+  assert.equal((await employeeAgent.post(`/api/orders/${tamqo._id}/refund`).send({ revision: tamqo.revision, amount: 10 })).status, 403);
+  assert.equal((await employeeAgent.delete(`/api/orders/${tamqo._id}`).send({ revision: tamqo.revision })).status, 403);
 });
 
 test("manual and capability-disabled agencies do not automatically send parcels", async (t) => {

@@ -26,9 +26,10 @@ import {
   materialize,
   transaction,
 } from "./orderService.js";
+import { ensureReturnExpense, reverseReturnExpense, RETURN_FEE } from "./delivery/deliveryFinancialService.js";
+import { mapProviderStatus } from "./delivery/deliveryStatusMapper.js";
 
 const MAX_ROWS = 5000;
-const FAILURE_FEE = 150;
 
 /*
  * Commune is intentionally NOT critical.
@@ -99,25 +100,17 @@ export function mapImportSituation(value) {
     };
   }
 
-  if (
-    [
-      "retour client",
-      "retour livreur",
-      "retour navette",
-      "retour de dispatche",
-    ].includes(normalized)
-  ) {
-    return {
-      status: "RETURNED",
-      fee: true,
-      known: true,
-    };
+  const providerStatus = mapProviderStatus(value);
+  if (["RETURNING", "RETURNED"].includes(providerStatus)) {
+    return { status: providerStatus, known: true };
+  }
+  if (normalized === "retour client") {
+    return { status: "RETURNED", known: true };
   }
 
   if (normalized === "annuler par le client") {
     return {
       status: "CANCELLED",
-      fee: true,
       known: true,
     };
   }
@@ -1038,6 +1031,7 @@ export async function analyzeImport(parsed, user, supplied = {}) {
     : [];
 
   const existingOrders = await Order.find({
+    deletedAt: { $exists: false },
     $or: [
       {
         _id: {
@@ -1132,7 +1126,7 @@ export async function analyzeImport(parsed, user, supplied = {}) {
     let action = "CREATE";
     let validationResult = "Ready to import";
 
-    if (row.situationMapping.delivered) {
+    if (row.situationMapping.delivered && !existing) {
       action = "IGNORE_DELIVERED";
       validationResult = "Delivered row will be ignored";
     } else if (errors.length) {
@@ -1160,7 +1154,8 @@ export async function analyzeImport(parsed, user, supplied = {}) {
       );
 
       const needsFee =
-        row.situationMapping.fee && !feeOrders.has(String(existing._id));
+        ["RETURNING", "RETURNED"].includes(row.situationMapping.status) &&
+        !feeOrders.has(String(existing._id));
 
       if (sameStatus && needsFee) {
         action = "UPDATE_EXISTING";
@@ -1224,7 +1219,7 @@ export async function analyzeImport(parsed, user, supplied = {}) {
         : false,
       inFileDuplicate,
       feeRequired:
-        Boolean(row.situationMapping.fee) &&
+        ["RETURNING", "RETURNED"].includes(row.situationMapping.status) &&
         (!visibleExisting || !feeOrders.has(String(visibleExisting._id))),
     };
   });
@@ -1303,7 +1298,7 @@ export async function analyzeImport(parsed, user, supplied = {}) {
           (row) =>
             row.feeRequired &&
             !["INVALID", "DUPLICATE", "IGNORE_DELIVERED"].includes(row.action),
-        ).length * FAILURE_FEE,
+        ).length * RETURN_FEE,
     },
 
     rows,
@@ -1587,149 +1582,19 @@ async function createImportedOrder(
   return order;
 }
 
-async function failureFee(order, row, batch, actor, session) {
-  if (!row.situationMapping.fee) {
-    return {
-      created: false,
-      amount: 0,
-    };
+async function reconcileImportedFinancials(order, row, batch, actor, session) {
+  if (order.status === "DELIVERED") {
+    await reverseReturnExpense(order, { session, actor, source: "EXCEL_IMPORT" });
+    return { created: false, amount: 0 };
   }
-
-  const existing = await Expense.exists({
-    systemGenerated: true,
-    sourceType: "DELIVERY_FAILURE_FEE",
-    sourceOrderId: order._id,
-  }).session(session);
-
-  if (existing) {
-    return {
-      created: false,
-      amount: 0,
-    };
-  }
-
-  const totals = new Map();
-
-  for (const item of order.items) {
-    totals.set(
-      item.business,
-      round((totals.get(item.business) || 0) + item.subtotal),
-    );
-  }
-
-  const businesses = [...totals.keys()];
-
-  const all = [...totals.values()].reduce((sum, value) => sum + value, 0);
-
-  let assigned = 0;
-
-  const baseKey = `DELIVERY_FAILURE_FEE:${row.trackingKey || row.fingerprint}`;
-
-  const allocations = businesses.map((business, index) => {
-    const amount =
-      index === businesses.length - 1
-        ? round(FAILURE_FEE - assigned)
-        : round(
-            FAILURE_FEE *
-              (all ? totals.get(business) / all : 1 / businesses.length),
-          );
-
-    assigned = round(assigned + amount);
-
-    return {
-      business,
-      amount,
-    };
+  return ensureReturnExpense(order, {
+    session, actor, tracking: row.tracking, source: "EXCEL_IMPORT",
+    date: row.actionDate || row.date || new Date(),
+    importBatchId: batch._id,
+    sourceKey: `DELIVERY_FAILURE_FEE:${row.trackingKey || row.fingerprint}`,
+    sourceLabel: `Client: ${row.client}\nOriginal Situation: ${row.situation}\nImport source: ${batch.filename}`,
   });
-
-  let createdAmount = 0;
-
-  for (const allocation of allocations) {
-    if (allocation.amount <= 0) {
-      continue;
-    }
-
-    const sourceKey =
-      allocations.length === 1 ? baseKey : `${baseKey}:${allocation.business}`;
-
-    const result = await Expense.updateOne(
-      {
-        sourceKey,
-      },
-      {
-        $setOnInsert: {
-          business: allocation.business,
-
-          title: "Delivery Return / Cancellation Fee",
-
-          description: [
-            `Tracking: ${row.tracking || "Unavailable"}`,
-            `Client: ${row.client}`,
-            `Original Situation: ${row.situation}`,
-            `Import source: ${batch.filename}`,
-          ].join("\n"),
-
-          amount: allocation.amount,
-
-          date: row.actionDate || row.date || new Date(),
-
-          expenseDate: row.actionDate || row.date || new Date(),
-
-          paymentMethod: "CASH",
-
-          note: `System generated by import ${batch._id}`,
-
-          createdBy: actor,
-          updatedBy: actor,
-
-          systemGenerated: true,
-
-          sourceType: "DELIVERY_FAILURE_FEE",
-
-          sourceOrderId: order._id,
-
-          sourceTracking: row.tracking || undefined,
-
-          sourceKey,
-
-          sourceGroupKey: baseKey,
-
-          importBatchId: batch._id,
-        },
-      },
-      {
-        upsert: true,
-        session,
-        runValidators: true,
-      },
-    );
-
-    if (result.upsertedCount) {
-      createdAmount = round(createdAmount + allocation.amount);
-
-      await audit(
-        actor,
-        "IMPORT_RETURN_FEE_CREATED",
-        "Expense",
-        result.upsertedId,
-        allocation.business,
-        {
-          importBatchId: batch._id,
-          orderId: order._id,
-          sourceKey,
-          amount: allocation.amount,
-        },
-        session,
-      );
-    }
-  }
-
-  return {
-    created: createdAmount > 0,
-    amount: createdAmount,
-  };
 }
-
 async function updateImportedStatus(order, row, batch, actor, session) {
   if (order.status === row.situationMapping.status) {
     return false;
@@ -2129,10 +1994,12 @@ export async function commitImport(parsed, user, actor, input) {
 
           if (shipment) {
             order = await Order.findById(shipment.orderId).session(session);
+            assert(!order?.deletedAt, "Deleted orders cannot be updated by imports.", 409);
           }
         } else {
           order = await Order.findOne({
             importFingerprint: row.fingerprint,
+            deletedAt: { $exists: false },
           }).session(session);
         }
 
@@ -2149,7 +2016,7 @@ export async function commitImport(parsed, user, actor, input) {
 
           const fee =
             order.status === row.situationMapping.status
-              ? await failureFee(order, row, batch, actor, session)
+              ? await reconcileImportedFinancials(order, row, batch, actor, session)
               : {
                   created: false,
                   amount: 0,
@@ -2177,7 +2044,7 @@ export async function commitImport(parsed, user, actor, input) {
           orderNumber,
         );
 
-        const fee = await failureFee(created, row, batch, actor, session);
+        const fee = await reconcileImportedFinancials(created, row, batch, actor, session);
 
         return {
           created: true,

@@ -173,6 +173,7 @@ export function Reports({ scope }) {
       ? [
           ["Partnership orders", "totalOrders", "number", ShoppingBag],
           ["Partnership net sales", "netSales", "money", Wallet],
+          ["Refunded", "totalRefunded", "money"],
           ["Delivered orders", "deliveredOrders", "number", PackageCheck],
           ["Average order value", "averageOrderValue", "money", Box],
           ["Tamqo revenue", "tamqoRevenueThroughPartnership", "money"],
@@ -183,6 +184,7 @@ export function Reports({ scope }) {
       : [
           ["Total orders", "totalOrders", "number", ShoppingBag],
           ["Net sales", "netSales", "money", Wallet],
+          ["Refunded", "totalRefunded", "money"],
           ["Delivered orders", "deliveredOrders", "number", PackageCheck],
           ["Units sold", "totalUnitsSold", "number", Box],
           ["Average order value", "averageOrderValue", "money"],
@@ -545,6 +547,7 @@ export function Reports({ scope }) {
                   <div className="summary-strip">
                     {[
                       ["Gross sales", "grossSales"],
+                      ["Refunded", "totalRefunded"],
                       ["Pending value", "pendingSalesValue"],
                       ["Cancelled value", "cancelledOrderValue"],
                       ["Returned value", "returnedOrderValue"],

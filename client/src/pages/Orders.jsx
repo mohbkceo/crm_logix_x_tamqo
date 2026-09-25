@@ -383,6 +383,9 @@ export function OrderForm() {
     [form, setForm] = useState(blankForm),
     [error, setError] = useState(""),
     [busy, setBusy] = useState(false),
+    [original, setOriginal] = useState(null),
+    [editDialog, setEditDialog] = useState(false),
+    [providerConfirmed, setProviderConfirmed] = useState(false),
     [loaded, setLoaded] = useState(!id);
   useEffect(() => {
     if (id) {
@@ -390,6 +393,7 @@ export function OrderForm() {
       api("/orders/" + id)
         .then((o) => {
           if (!active) return;
+          setOriginal(o);
           setForm({ ...o, sourceId: o.source.id });
           setLoaded(true);
         })
@@ -486,17 +490,44 @@ export function OrderForm() {
           ? 0
           : Number(form.payment.amountPaidOnline),
     balance = Math.round((total - paid) * 100) / 100;
-  async function submit(e) {
-    e.preventDefault();
+  const courierFields = (value, current = false) =>
+    JSON.stringify({
+      customer: [
+        value.customer.name,
+        value.customer.phoneA,
+        value.customer.phoneB || "",
+      ],
+      location: [
+        current
+          ? config.wilayas.find((w) => w._id === value.location.wilayaId)
+              ?.agencyId || value.location.agencyId
+          : value.location.agencyId,
+        value.location.commune,
+        value.location.address,
+      ],
+      source: current
+        ? config.sources.find((s) => s._id === value.sourceId)?.name ||
+          value.source?.name
+        : value.source?.name,
+      note: value.note || "",
+      delivery: [value.delivery.type, Boolean(value.delivery.exchange)],
+      collect: current ? balance : value.payment.amountToCollect,
+      products: value.items.map((item) => [
+        current
+          ? [...config.plans, ...config.products].find(
+              (p) => p._id === item.catalogItemId,
+            )?.name || item.name
+          : item.name,
+        item.quantity,
+      ]),
+    });
+  const courierFieldsChanged = Boolean(
+    original && courierFields(original) !== courierFields(form, true),
+  );
+  async function save(body) {
     setError("");
     setBusy(true);
     try {
-      if (!eligible.some((a) => a._id === form.delivery.agencyId))
-        throw new Error("Select an eligible delivery agency.");
-      const body = {
-        ...form,
-        payment: { method: form.payment.method, amountPaidOnline: paid },
-      };
       const order = await api(id ? `/orders/${id}` : "/orders", {
         method: id ? "PATCH" : "POST",
         body,
@@ -510,6 +541,37 @@ export function OrderForm() {
       setBusy(false);
     }
   }
+  async function submit(e) {
+    e.preventDefault();
+    setError("");
+    if (!eligible.some((a) => a._id === form.delivery.agencyId)) {
+      setError("Select an eligible delivery agency.");
+      return;
+    }
+    if (
+      id &&
+      original?.shipment &&
+      (original.delivery.agencyId !== form.delivery.agencyId ||
+        (original.deliveryAgency?.integrationType === "API" &&
+          courierFieldsChanged))
+    ) {
+      setProviderConfirmed(false);
+      setEditDialog(true);
+      return;
+    }
+    await save({
+      ...form,
+      payment: { method: form.payment.method, amountPaidOnline: paid },
+    });
+  }
+  const agencyChange = Boolean(
+    original?.shipment && original.delivery.agencyId !== form.delivery.agencyId,
+  );
+  const manualProviderStep = agencyChange
+    ? !original?.deliveryAgency?.capabilities?.deleteShipment ||
+      original?.deliveryAgency?.integrationType === "MANUAL"
+    : original?.deliveryAgency?.integrationType === "API" &&
+      !original?.deliveryAgency?.capabilities?.updateShipment;
   if (!loaded)
     return (
       <>
@@ -1012,6 +1074,66 @@ export function OrderForm() {
           </aside>
         </div>
       </form>
+      {editDialog && (
+        <Modal
+          title={
+            agencyChange
+              ? "Change delivery agency?"
+              : "Synchronize courier parcel?"
+          }
+          onClose={() => setEditDialog(false)}
+        >
+          <div className="modal-body">
+            <p>
+              {agencyChange
+                ? "The old parcel must be deleted or cancelled at its agency before this order can move to the new agency. A new shipment will then be created or linked."
+                : "These order changes may affect the courier parcel."}
+            </p>
+            {manualProviderStep ? (
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={providerConfirmed}
+                  onChange={(e) => setProviderConfirmed(e.target.checked)}
+                />
+                {agencyChange
+                  ? "I marked the old parcel Supprimée at the delivery agency."
+                  : "I updated the courier parcel to match this order."}
+              </label>
+            ) : (
+              <p>
+                The delivery agency supports automatic synchronization. A
+                provider error will be shown on the order.
+              </p>
+            )}
+            <ErrorBox error={error} />
+            <div className="modal-actions">
+              <button type="button" onClick={() => setEditDialog(false)}>
+                Keep editing
+              </button>
+              <button
+                type="button"
+                className="primary"
+                disabled={busy || (manualProviderStep && !providerConfirmed)}
+                onClick={() =>
+                  save({
+                    ...form,
+                    payment: {
+                      method: form.payment.method,
+                      amountPaidOnline: paid,
+                    },
+                    providerUpdateConfirmed: !agencyChange && providerConfirmed,
+                    providerDeletionConfirmed:
+                      agencyChange && providerConfirmed,
+                  })
+                }
+              >
+                Save order
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
     </>
   );
 }
@@ -1019,6 +1141,7 @@ export function OrderDetails() {
   const user = useUser();
   const location = useLocation();
   const { id } = useParams(),
+    navigate = useNavigate(),
     order = useApi("/orders/" + id),
     timeline = useApi(`/orders/${id}/timeline`),
     [error, setError] = useState(""),
@@ -1027,7 +1150,12 @@ export function OrderDetails() {
     [dialog, setDialog] = useState(""),
     [tracking, setTracking] = useState(""),
     [collected, setCollected] = useState(0),
-    [providerCancelled, setProviderCancelled] = useState(false);
+    [providerCancelled, setProviderCancelled] = useState(false),
+    [providerDeleted, setProviderDeleted] = useState(false),
+    [deleteReason, setDeleteReason] = useState(""),
+    [refundAmount, setRefundAmount] = useState(""),
+    [refundNote, setRefundNote] = useState(""),
+    [refundAllocation, setRefundAllocation] = useState("WHOLE");
   async function action(path, body = {}) {
     setBusy(true);
     setError("");
@@ -1044,16 +1172,67 @@ export function OrderDetails() {
       timeline.reload();
     }
   }
+  async function removeOrder() {
+    setBusy(true);
+    setError("");
+    try {
+      await api(`/orders/${id}`, {
+        method: "DELETE",
+        body: {
+          revision: order.data.revision,
+          reason: deleteReason,
+          providerDeletionConfirmed: providerDeleted,
+        },
+      });
+      navigate("/orders");
+    } catch (e) {
+      setError(e.message);
+      order.reload();
+      timeline.reload();
+    } finally {
+      setBusy(false);
+    }
+  }
   const o = order.data;
   if (order.loading && !o) return <Loading />;
   if (!o) return <ErrorBox error={order.error} />;
   const s = o.shipment,
     agency = o.deliveryAgency,
     canEdit =
-      ["NEW", "CONFIRMED", "PREPARING"].includes(o.status) &&
-      !s &&
+      [
+        "NEW",
+        "CONFIRMED",
+        "PREPARING",
+        "READY_TO_SHIP",
+        "SHIPPED",
+        "OUT_FOR_DELIVERY",
+        "FAILED_DELIVERY",
+      ].includes(o.status) &&
+      !o.deletedAt &&
       (can(user, P.orders.updateAll) ||
-        (can(user, P.orders.updateOwn) && o.createdBy?.userId === user._id));
+        (can(user, P.orders.updateOwn) && o.createdBy?.userId === user._id)),
+    canDelete =
+      !o.deletedAt &&
+      (can(user, P.orders.deleteAll) ||
+        (can(user, P.orders.deleteOwn) && o.createdBy?.userId === user._id)),
+    canRefund =
+      !o.deletedAt &&
+      (can(user, P.orders.refundAll) ||
+        (can(user, P.orders.refundOwn) && o.createdBy?.userId === user._id)),
+    refundable = Math.max(
+      0,
+      Math.round(
+        ((o.payment.amountPaidOnline || 0) +
+          (o.payment.amountCollected || 0) -
+          (o.refundedAmount || 0)) *
+          100,
+      ) / 100,
+    ),
+    manualDeletion = Boolean(
+      s &&
+      (agency?.integrationType === "MANUAL" ||
+        !agency?.capabilities?.deleteShipment),
+    );
   return (
     <>
       <Link className="back-link" to="/orders">
@@ -1065,7 +1244,7 @@ export function OrderDetails() {
         title={o.orderNumber}
         description={`${o.customer.name} · ${human(o.businessType)}`}
       >
-        <Badge>{o.status}</Badge>
+        <Badge>{o.deletedAt ? "Deleted" : o.status}</Badge>
         {canEdit && <Link to={`/orders/${id}/edit`}>Edit order</Link>}
       </PageHeader>
       <ErrorBox error={error || order.error} />
@@ -1079,80 +1258,121 @@ export function OrderDetails() {
         </div>
       )}
       <div className="order-actions">
-        {o.allowedStatuses
-          .filter(
-            (status) =>
-              !["CANCELLED", "READY_TO_SHIP"].includes(status) &&
-              can(
-                user,
-                status === "CONFIRMED" ? P.orders.confirm : P.orders.prepare,
-              ),
-          )
-          .map((status) => (
-            <button
-              key={status}
-              className={status === "CONFIRMED" ? "primary" : ""}
-              disabled={busy}
-              onClick={() =>
-                action(status === "CONFIRMED" ? "confirm" : "status", {
-                  status,
-                })
-              }
-            >
-              {status === "CONFIRMED"
-                ? "Confirm"
-                : status === "PREPARING"
-                  ? "Prepare"
-                  : `Mark ${human(status)}`}
-            </button>
-          ))}
-        {can(user, P.orders.markReady) &&
-          o.allowedStatuses.includes("READY_TO_SHIP") && (
-            <button disabled={busy} onClick={() => action("shipment/ready")}>
-              Mark ready to ship
-            </button>
-          )}
-        {(o.status === "NEW"
-          ? agency?.integrationType === "API"
-          : ["CONFIRMED", "PREPARING", "READY_TO_SHIP"].includes(o.status)) &&
-          agency?.capabilities?.createShipment &&
-          s?.provider !== "MANUAL" &&
-          !s?.uncertain &&
-          !s?.tracking &&
-          !s?.creationAttemptedAt &&
-          can(user, P.orders.createShipment) && (
-            <button disabled={busy} onClick={() => action("shipment")}>
-              <Truck size={15} />
-              {s ? "Retry shipment" : "Create shipment"}
-            </button>
-          )}
-        {(s?.tracking || s?.uncertain) &&
-          can(user, P.orders.refreshTracking) && (
-            <button disabled={busy} onClick={() => action("shipment/refresh")}>
-              <RefreshCw size={15} />
-              Refresh tracking
-            </button>
-          )}
-        {o.items.some((i) => i.business === "TAMQO") &&
-          !o.tamqoActivatedAt &&
-          (can(user, P.orders.updateAll) ||
-            (can(user, P.orders.updateOwn) &&
-              o.createdBy?.userId === user._id)) &&
-          !["NEW", "CANCELLED", "RETURNED", "RETURNING"].includes(o.status) && (
-            <button disabled={busy} onClick={() => action("activate")}>
-              Activate Tamqo
-            </button>
-          )}
-        {can(user, P.orders.cancel) &&
-          o.allowedStatuses.includes("CANCELLED") && (
-            <button
-              className="danger-text"
-              disabled={busy}
-              onClick={() => setDialog("cancel")}
-            >
-              Cancel order
-            </button>
-          )}
+        {canRefund && (
+          <button
+            disabled={busy || refundable <= 0}
+            onClick={() => {
+              setRefundAmount("");
+              setRefundNote("");
+              setRefundAllocation("WHOLE");
+              setDialog("refund");
+            }}
+          >
+            Refund
+          </button>
+        )}
+        {canDelete && (
+          <button
+            className="danger-text"
+            disabled={busy}
+            onClick={() => {
+              setProviderDeleted(false);
+              setDialog("delete");
+            }}
+          >
+            <Trash2 size={15} /> Delete order
+          </button>
+        )}
+        {!o.deletedAt && (
+          <>
+            {o.allowedStatuses
+              .filter(
+                (status) =>
+                  !["CANCELLED", "READY_TO_SHIP"].includes(status) &&
+                  can(
+                    user,
+                    status === "CONFIRMED"
+                      ? P.orders.confirm
+                      : P.orders.prepare,
+                  ),
+              )
+              .map((status) => (
+                <button
+                  key={status}
+                  className={status === "CONFIRMED" ? "primary" : ""}
+                  disabled={busy}
+                  onClick={() =>
+                    action(status === "CONFIRMED" ? "confirm" : "status", {
+                      status,
+                    })
+                  }
+                >
+                  {status === "CONFIRMED"
+                    ? "Confirm"
+                    : status === "PREPARING"
+                      ? "Prepare"
+                      : `Mark ${human(status)}`}
+                </button>
+              ))}
+            {can(user, P.orders.markReady) &&
+              o.allowedStatuses.includes("READY_TO_SHIP") && (
+                <button
+                  disabled={busy}
+                  onClick={() => action("shipment/ready")}
+                >
+                  Mark ready to ship
+                </button>
+              )}
+            {(o.status === "NEW"
+              ? agency?.integrationType === "API"
+              : ["CONFIRMED", "PREPARING", "READY_TO_SHIP"].includes(
+                  o.status,
+                )) &&
+              agency?.capabilities?.createShipment &&
+              s?.provider !== "MANUAL" &&
+              !s?.uncertain &&
+              !s?.tracking &&
+              !s?.creationAttemptedAt &&
+              can(user, P.orders.createShipment) && (
+                <button disabled={busy} onClick={() => action("shipment")}>
+                  <Truck size={15} />
+                  {s ? "Retry shipment" : "Create shipment"}
+                </button>
+              )}
+            {(s?.tracking || s?.uncertain) &&
+              can(user, P.orders.refreshTracking) && (
+                <button
+                  disabled={busy}
+                  onClick={() => action("shipment/refresh")}
+                >
+                  <RefreshCw size={15} />
+                  Refresh tracking
+                </button>
+              )}
+            {o.items.some((i) => i.business === "TAMQO") &&
+              !o.tamqoActivatedAt &&
+              (can(user, P.orders.updateAll) ||
+                (can(user, P.orders.updateOwn) &&
+                  o.createdBy?.userId === user._id)) &&
+              !["NEW", "CANCELLED", "RETURNED", "RETURNING"].includes(
+                o.status,
+              ) && (
+                <button disabled={busy} onClick={() => action("activate")}>
+                  Activate Tamqo
+                </button>
+              )}
+            {can(user, P.orders.cancel) &&
+              o.allowedStatuses.includes("CANCELLED") && (
+                <button
+                  className="danger-text"
+                  disabled={busy}
+                  onClick={() => setDialog("cancel")}
+                >
+                  Cancel order
+                </button>
+              )}
+          </>
+        )}
       </div>
       <div className="order-form-layout">
         <div>
@@ -1262,15 +1482,14 @@ export function OrderDetails() {
                             ? "Shipment synchronized"
                             : "Shipment awaiting verification"}
                   </p>
-                  <p>
-                    Provider Status: {s.providerStatus || "Not reported"}
-                  </p>
+                  <p>Provider Status: {s.providerStatus || "Not reported"}</p>
                   <p>CRM Status: {s.status ? human(s.status) : "Not mapped"}</p>
                   {s.providerStatus && !s.status && (
                     <Badge tone="confirmed">Unmapped provider status</Badge>
                   )}
                   <p>
-                    Provider Situation ID: {s.providerSituationId || "Not reported"}
+                    Provider Situation ID:{" "}
+                    {s.providerSituationId || "Not reported"}
                   </p>
                   <p>
                     Last sync:{" "}
@@ -1288,7 +1507,8 @@ export function OrderDetails() {
                       retrying creation.
                     </div>
                   )}
-                  {!s.tracking &&
+                  {!o.deletedAt &&
+                    !s.tracking &&
                     (s.provider === "MANUAL" || s.creationAttemptedAt) &&
                     can(user, P.orders.refreshTracking) && (
                       <button
@@ -1353,7 +1573,7 @@ export function OrderDetails() {
                 <b>{money(o.deliveryCharged)}</b>
               </div>
               <div className="summary-total">
-                <span>Total value</span>
+                <span>Original total</span>
                 <b>{money(o.totalOrderValue)}</b>
               </div>
               <div>
@@ -1372,6 +1592,20 @@ export function OrderDetails() {
                 <span>Courier collected</span>
                 <b>{money(o.payment.amountCollected)}</b>
               </div>
+              <div>
+                <span>Refunded</span>
+                <b>{money(o.refundedAmount || 0)}</b>
+              </div>
+              <div>
+                <span>Net received</span>
+                <b>
+                  {money(
+                    (o.payment.amountPaidOnline || 0) +
+                      (o.payment.amountCollected || 0) -
+                      (o.refundedAmount || 0),
+                  )}
+                </b>
+              </div>
               <div className="collection">
                 <span>Outstanding</span>
                 <b>
@@ -1384,7 +1618,8 @@ export function OrderDetails() {
                 </b>
               </div>
             </div>
-            {!["CANCELLED", "RETURNED"].includes(o.status) &&
+            {!o.deletedAt &&
+              !["CANCELLED", "RETURNED"].includes(o.status) &&
               (can(user, P.orders.updateAll) ||
                 (can(user, P.orders.updateOwn) &&
                   o.createdBy?.userId === user._id)) && (
@@ -1403,6 +1638,122 @@ export function OrderDetails() {
           </Panel>
         </aside>
       </div>
+      {dialog === "refund" && (
+        <Modal title="Refund received payment" onClose={() => setDialog("")}>
+          <form
+            className="modal-body"
+            onSubmit={(e) => {
+              e.preventDefault();
+              action("refund", {
+                revision: o.revision,
+                amount: Number(refundAmount),
+                allocation: refundAllocation,
+                note: refundNote,
+              });
+            }}
+          >
+            <p>
+              Available to refund: <b>{money(refundable)}</b>. The original
+              items and order total stay intact.
+            </p>
+            <Field label="Refund amount (DA)">
+              <input
+                required
+                type="number"
+                min="0.01"
+                max={refundable}
+                step="0.01"
+                value={refundAmount}
+                onChange={(e) => setRefundAmount(e.target.value)}
+              />
+            </Field>
+            {o.businessType === "PARTNERSHIP" && (
+              <Field label="Allocate refund to">
+                <select
+                  value={refundAllocation}
+                  onChange={(e) => setRefundAllocation(e.target.value)}
+                >
+                  <option value="WHOLE">Whole order (proportional)</option>
+                  <option value="LOGIX">Logix</option>
+                  <option value="TAMQO">Tamqo</option>
+                </select>
+              </Field>
+            )}
+            <Field label="Reason / note (optional)">
+              <textarea
+                maxLength={2000}
+                value={refundNote}
+                onChange={(e) => setRefundNote(e.target.value)}
+              />
+            </Field>
+            <ErrorBox error={error} />
+            <div className="modal-actions">
+              <button type="button" onClick={() => setDialog("")}>
+                Keep order
+              </button>
+              <button
+                className="primary"
+                disabled={
+                  busy ||
+                  Number(refundAmount) <= 0 ||
+                  Number(refundAmount) > refundable
+                }
+              >
+                Record refund
+              </button>
+            </div>
+          </form>
+        </Modal>
+      )}
+      {dialog === "delete" && (
+        <Modal
+          title="Delete this order from CRM?"
+          onClose={() => setDialog("")}
+        >
+          <div className="modal-body">
+            <p>
+              The order will be hidden from normal lists, reports and delivery
+              sync. Its record, shipment and audit history remain available to
+              administrators.
+            </p>
+            {s && (
+              <div className="note">
+                {manualDeletion
+                  ? "First mark the parcel Supprimée at the delivery agency. CRM deletion does not delete the agency parcel for you."
+                  : "The delivery agency parcel will be deleted first through its supported integration."}
+              </div>
+            )}
+            {manualDeletion && (
+              <label className="checkbox-field">
+                <input
+                  type="checkbox"
+                  checked={providerDeleted}
+                  onChange={(e) => setProviderDeleted(e.target.checked)}
+                />
+                I marked the agency parcel Supprimée.
+              </label>
+            )}
+            <Field label="Delete reason (optional)">
+              <textarea
+                maxLength={2000}
+                value={deleteReason}
+                onChange={(e) => setDeleteReason(e.target.value)}
+              />
+            </Field>
+            <ErrorBox error={error} />
+            <div className="modal-actions">
+              <button onClick={() => setDialog("")}>Keep order</button>
+              <button
+                className="danger"
+                disabled={busy || (manualDeletion && !providerDeleted)}
+                onClick={removeOrder}
+              >
+                Delete order
+              </button>
+            </div>
+          </div>
+        </Modal>
+      )}
       {dialog === "cancel" && (
         <Modal title="Cancel this order?" onClose={() => setDialog("")}>
           <div className="modal-body">

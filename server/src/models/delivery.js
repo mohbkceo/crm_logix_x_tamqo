@@ -24,6 +24,8 @@ export const DeliveryAgency = mongoose.model(
       credentialsConfigured: { type: Boolean, default: false },
       capabilities: {
         createShipment: Boolean,
+        updateShipment: Boolean,
+        deleteShipment: Boolean,
         tracking: Boolean,
         readyToShip: Boolean,
         pricing: Boolean,

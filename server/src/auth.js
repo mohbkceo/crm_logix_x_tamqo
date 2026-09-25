@@ -79,7 +79,7 @@ router.get("/session", async (req, res) =>
 router.get("/me", requireAuth, (req, res) => res.json({ user: req.user }));
 const limit = rateLimit({
   windowMs: 15 * 60000,
-  limit: 20,
+  limit: process.env.NODE_ENV === "test" ? 100 : 20,
   standardHeaders: true,
   legacyHeaders: false,
 });

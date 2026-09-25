@@ -23,7 +23,7 @@ export function pagination(q) {
   return { page, limit, skip: (page - 1) * limit };
 }
 export function orderFilter(q = {}) {
-  const f = {};
+  const f = { deletedAt: { $exists: false } };
   for (const [key, values, path] of [
     ["business", BUSINESS_TYPES, "businessType"],
     ["status", STATUSES, "status"],

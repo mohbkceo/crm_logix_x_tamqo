@@ -41,7 +41,7 @@ app.use(
   "/api",
   rateLimit({
     windowMs: 60000,
-    limit: 600,
+    limit: process.env.NODE_ENV === "test" ? 1200 : 600,
     standardHeaders: true,
     legacyHeaders: false,
   }),
@@ -141,7 +141,8 @@ app.get(
           _id: "$customerId",
           orders: { $sum: 1 },
           lifetimeRevenue: {
-            $sum: { $cond: [realizedExpression, "$productRevenue", 0] },
+            $sum: { $cond: [realizedExpression,
+              { $subtract: ["$productRevenue", { $ifNull: ["$refundedAmount", 0] }] }, 0] },
           },
           lastOrder: { $max: "$createdAt" },
           firstOrder: { $min: "$createdAt" },
