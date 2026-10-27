@@ -39,7 +39,7 @@ try {
     res.end(
       JSON.stringify(
         mode === "success"
-          ? { Tracking: `BROWSER-${calls}` }
+          ? { Colis: [{ Tracking: `BROWSER-${calls}`, MessageRetour: 'Good' }] }
           : mode === "error"
             ? { message: "Invalid courier parcel" }
             : { received: true },
@@ -154,8 +154,8 @@ try {
       await expect(
         page.getByText(
           outcome === "pending"
-            ? "Courier parcel awaiting verification"
-            : "Courier synchronization failed",
+            ? "Shipment awaiting verification"
+            : "Shipment synchronization failed",
           { exact: true },
         ),
       ).toBeVisible();

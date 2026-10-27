@@ -1,4 +1,5 @@
 import mongoose from "mongoose";
+import { COURIER_STAGES } from '../../../shared/tracking.js';
 import { DeliveryAgency, DeliveryRate } from "../models/delivery.js";
 import { audit } from "../models/security.js";
 import {
@@ -78,6 +79,7 @@ export async function materialize(input, session, existing, { persistCustomer = 
       subtotal: round(price * item.quantity),
       durationDays: old?.durationDays ?? catalog.durationDays,
       isRenewal: item.business === "TAMQO" && item.isRenewal,
+      specifications: item.specifications ?? old?.specifications ?? '',
     });
   }
   const customer = {
@@ -159,6 +161,9 @@ export async function createOrder(input, actor = "admin") {
       [
         {
           ...data,
+          ...(data.items.some(i => i.business === 'LOGIX' && i.type === 'PRODUCT') ? {
+            tracking: { stage: 'PREPARING', stageEnteredAt: new Date(), initializedAt: new Date() },
+          } : {}),
           orderNumber,
           createdBy: typeof actor === "object" ? actor : undefined,
           lastUpdatedBy: typeof actor === "object" ? actor : undefined,
@@ -224,6 +229,8 @@ async function reserveProviderAction(id, revision, shipment) {
       { $set: { lockUntil: new Date(Date.now() + 60000), syncStatus: "PENDING", lastError: "" } },
       { session, new: true });
     assert(reserved, "A courier request is in progress. Reload later.", 409);
+    order.increment();
+    await order.save({ session });
   });
 }
 export async function editOrder(id, input, actor = "admin") {
@@ -303,6 +310,11 @@ export async function editOrder(id, input, actor = "admin") {
       data.payment.amountCollected = collected;
       const before = current.toObject();
       Object.assign(current, data);
+      if (!current.tracking && data.items.some(i => i.business === 'LOGIX' && i.type === 'PRODUCT') && !before.items.some(i => i.business === 'LOGIX' && i.type === 'PRODUCT')) {
+        current.tracking = COURIER_STAGES.includes(current.status)
+          ? { stage: 'LEGACY_UNINITIALIZED', courierOwned: true }
+          : { stage: 'PREPARING', stageEnteredAt: new Date(), initializedAt: new Date() };
+      }
       current.lastUpdatedBy = typeof actor === "object" ? actor : current.lastUpdatedBy;
       current.revision++;
       await current.save({ session });
@@ -487,6 +499,7 @@ export async function transition(id, to, actor = "admin", sessionOverride) {
       session,
     );
     order.status = to;
+    if (order.tracking && COURIER_STAGES.includes(to)) order.tracking.courierOwned = true;
     order.statusHistory.push({ status: to, at: new Date(), actor });
     order.revision++;
     await order.save({ session });

@@ -19,6 +19,8 @@ import { PERMISSIONS, ROLES, BUSINESSES } from "../../../shared/permissions.js";
 import { assert } from "../errors.js";
 import { pagination, objectId } from "../services/filters.js";
 import { transaction } from "../services/orderService.js";
+import { OPERATIONAL_ROLES } from '../../../shared/tracking.js';
+import { validateWhatsApp, validateOperationalRoles } from '../services/profileService.js';
 export const securityRoutes = Router();
 const r = securityRoutes;
 const superOnly = (req, _res, next) => {
@@ -53,7 +55,7 @@ r.get("/users", requirePermission(P.users.view), async (req, res) => {
     "Administrator required",
     403,
   );
-  res.json(await User.find(userFilter(req.user)).sort({ name: 1 }));
+  res.json(await User.find(userFilter(req.user)).select(can(req.user, P['tracking.contacts'].view) ? '+whatsappPhone' : '').sort({ name: 1 }));
 });
 r.get("/users/:id", requirePermission(P.users.view), async (req, res) => {
   const user = await User.findById(objectId(req.params.id));
@@ -66,9 +68,10 @@ const accessSchema = z.object({
   status: z.enum(["ACTIVE", "DISABLED"]).optional(),
   businessAccess: z.array(z.enum(BUSINESSES)).max(2).optional(),
   permissions: z.array(z.enum(PERMISSIONS)).optional(),
+  operationalRoles: z.array(z.enum(OPERATIONAL_ROLES)).max(4).optional(),
 });
 function validateAccess(req, data, existing) {
-  if (data.permissions !== undefined || data.businessAccess !== undefined)
+  if (data.permissions !== undefined || data.businessAccess !== undefined || data.operationalRoles !== undefined)
     assert(
       can(req.user, P.users.permissions),
       "Permission assignment denied",
@@ -112,12 +115,15 @@ r.post("/users", requirePermission(P.users.create), async (req, res) => {
   const identity = identityInput.parse(req.body),
     access = accessSchema.parse(req.body);
   validateAccess(req, access);
+  await validateOperationalRoles(access.operationalRoles);
+  const whatsappPhone = await validateWhatsApp(identity.whatsappPhone);
   const user = await transaction(async (session) => {
     const [u] = await User.create(
       [
         {
           name: identity.name,
           email: identity.email,
+          whatsappPhone,
           passwordHash: await bcrypt.hash(identity.password, 12),
           ...access,
           createdBy: req.actor,
@@ -150,8 +156,11 @@ r.patch("/users/:id", async (req, res) => {
         .transform((s) => s.toLowerCase())
         .optional(),
       password: z.string().min(12).max(72).optional(),
+      whatsappPhone: z.string().max(40).optional(),
     })
     .parse(req.body);
+  await validateOperationalRoles(access.operationalRoles);
+  if (profile.whatsappPhone !== undefined) profile.whatsappPhone = await validateWhatsApp(profile.whatsappPhone);
   if (
     Object.values(profile).some((v) => v !== undefined) ||
     access.role !== undefined
@@ -164,6 +173,10 @@ r.patch("/users/:id", async (req, res) => {
     assert(user, "User not found", 404);
     manageable(req.user, user);
     validateAccess(req, access, user);
+    if (access.operationalRoles !== undefined || profile.whatsappPhone !== undefined) {
+      const expectedRevision = z.number().int().min(0).parse(req.body.expectedRevision);
+      assert(user.__v === expectedRevision, 'Employee profile changed. Reload before saving.', 409);
+    }
     const events = [
       ["role", "USER_ROLE_CHANGED"],
       ["permissions", "USER_PERMISSIONS_CHANGED"],

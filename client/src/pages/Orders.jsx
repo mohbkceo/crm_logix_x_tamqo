@@ -374,6 +374,7 @@ const blankForm = () => ({
   payment: { method: "COD", amountPaidOnline: 0 },
 });
 export function OrderForm() {
+  const [optionalImages, setOptionalImages] = useState([]);
   const user = useUser();
   const agencies = useApi("/delivery-agencies");
   const [rates, setRates] = useState([]);
@@ -532,8 +533,16 @@ export function OrderForm() {
         method: id ? "PATCH" : "POST",
         body,
       });
+      let imageWarning = '';
+      let imageRevision = order.revision;
+      for (const image of optionalImages) {
+        try {
+          const upload = new FormData(); upload.append('image', image); upload.append('expectedRevision', imageRevision);
+          const saved = await api(`/order-media/${order._id}`, { method: 'POST', body: upload }); imageRevision = saved.revision;
+        } catch (e) { imageWarning = `Order saved. Optional image upload failed: ${e.message} You can attach it from Edit order.`; break; }
+      }
       navigate("/orders/" + order._id, {
-        state: { shipmentSync: order.shipmentSync },
+        state: { shipmentSync: order.shipmentSync, imageWarning },
       });
     } catch (e) {
       setError(e.message);
@@ -705,6 +714,8 @@ export function OrderForm() {
                       placeholder="Anything the team or courier should know"
                     />
                   </Field>
+                  <Field label="Order images (optional)" hint="Up to six JPEG, PNG or WebP images, 5 MB each. Images upload after the order is saved."><input type="file" multiple accept="image/jpeg,image/png,image/webp" onChange={e => { const files = Array.from(e.target.files || []); if (files.length > 6 || files.some(f => f.size > 5 * 1024 * 1024)) { setError('Select up to six images, 5 MB each.'); e.target.value = ''; setOptionalImages([]); } else { setOptionalImages(files); setError(''); } }} /></Field>
+                  <div className="tracking-image-strip">{original?.images?.map(i => <img key={i._id} src={`/api/order-media/${original._id}/${i._id}`} alt="Order reference" />)}{optionalImages.map((file, index) => <OptionalImagePreview key={index} file={file} />)}</div>
                 </div>
               </div>
             </Panel>
@@ -844,6 +855,7 @@ export function OrderForm() {
                                   }
                                 />
                               </Field>
+                              {b === 'LOGIX' && <div className="item-specifications"><Field label="Specifications"><input maxLength={1000} value={item.specifications || ''} onChange={e => editItem(index, { specifications: e.target.value })} placeholder="Size, finish, design…" /></Field></div>}
                               <div className="item-subtotal">
                                 <small>Subtotal</small>
                                 <b>{money(item.unitPrice * item.quantity)}</b>
@@ -1251,6 +1263,8 @@ export function OrderDetails() {
       {!s && location.state?.shipmentSync?.error && (
         <ErrorBox error={`Order saved. ${location.state.shipmentSync.error}`} />
       )}
+      <ErrorBox error={location.state?.imageWarning} />
+      {o.images?.length > 0 && <div className="tracking-image-strip">{o.images.map(i => <a key={i._id} href={`/api/order-media/${o._id}/${i._id}`} target="_blank" rel="noopener noreferrer"><img src={`/api/order-media/${o._id}/${i._id}`} alt="Order reference" /></a>)}</div>}
       {message && (
         <div className="success" role="status">
           <Check size={16} />
@@ -1870,4 +1884,9 @@ export function OrderDetails() {
       )}
     </>
   );
+}
+function OptionalImagePreview({ file }) {
+  const [url, setUrl] = useState('');
+  useEffect(() => { const next = URL.createObjectURL(file); setUrl(next); return () => URL.revokeObjectURL(next); }, [file]);
+  return url ? <img src={url} alt={file.name} /> : null;
 }

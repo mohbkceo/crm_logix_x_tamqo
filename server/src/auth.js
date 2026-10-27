@@ -12,6 +12,10 @@ import {
   audit,
 } from "./models/security.js";
 import { requirePermission, P } from "./authorization.js";
+import { OPERATIONAL_ROLES } from '../../shared/tracking.js';
+import { TrackingSetting } from './models/tracking.js';
+import { validateWhatsApp } from './services/profileService.js';
+import { transaction } from './services/orderService.js';
 const router = Router(),
   cookie = "workspace_session";
 const options = {
@@ -30,6 +34,8 @@ export const identityInput = z.object({
     .email()
     .transform((s) => s.toLowerCase()),
   password: z.string().min(12).max(72),
+  whatsappPhone: z.string().max(40).optional(),
+  requestedOperationalRole: z.enum(OPERATIONAL_ROLES).optional(),
 });
 export async function authenticated(req) {
   const token = req.cookies[cookie];
@@ -40,7 +46,7 @@ export async function authenticated(req) {
     expiresAt: { $gt: new Date() },
   });
   if (!session) return null;
-  const user = await User.findOne({ _id: session.userId, status: "ACTIVE" });
+  const user = await User.findOne({ _id: session.userId, status: "ACTIVE" }).select('+whatsappPhone');
   if (!user) return null;
   req.session = session;
   await Session.updateOne(
@@ -71,12 +77,27 @@ async function signIn(user, req, res) {
   );
   res
     .cookie(cookie, token, options)
-    .json({ user: await User.findById(user._id) });
+    .json({ user: await User.findById(user._id).select('+whatsappPhone') });
 }
 router.get("/session", async (req, res) =>
   res.json({ user: await authenticated(req) }),
 );
 router.get("/me", requireAuth, (req, res) => res.json({ user: req.user }));
+router.get('/profile-policy', async (_req, res) => {
+  const settings = await TrackingSetting.findById('tracking') || new TrackingSetting();
+  res.json({ requireWhatsApp: settings.requireWhatsApp, operationalRoles: settings.operationalRoles.filter(r => r.enabled) });
+});
+router.patch('/profile', requireAuth, async (req, res) => {
+  const data = z.object({ whatsappPhone: z.string().max(40), expectedRevision: z.number().int().min(0) }).strict().parse(req.body);
+  const phone = await validateWhatsApp(data.whatsappPhone);
+  const user = await transaction(async session => {
+    const updated = await User.findOneAndUpdate({ _id: req.user._id, __v: data.expectedRevision }, { $set: { whatsappPhone: phone }, $inc: { __v: 1 } }, { new: true, session }).select('+whatsappPhone');
+    assert(updated, 'Profile changed. Reload and try again.', 409);
+    await audit(req.actor, 'USER_PROFILE_COMPLETED', 'User', updated._id, undefined, {}, session);
+    return updated;
+  });
+  res.json({ user });
+});
 const limit = rateLimit({
   windowMs: 15 * 60000,
   limit: process.env.NODE_ENV === "test" ? 100 : 20,
@@ -124,6 +145,9 @@ router.post("/register", limit, async (req, res) => {
     role: "EMPLOYEE",
     businessAccess: [],
     permissions: [],
+    operationalRoles: [],
+    requestedOperationalRole: data.requestedOperationalRole,
+    whatsappPhone: await validateWhatsApp(data.whatsappPhone),
   });
   await audit(
     { userId: user._id, name: user.name },

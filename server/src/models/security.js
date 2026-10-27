@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import { ROLES, BUSINESSES, PERMISSIONS } from "../../../shared/permissions.js";
+import { OPERATIONAL_ROLES } from '../../../shared/tracking.js';
 const { Schema } = mongoose;
 export const actorSchema = new Schema(
   { userId: { type: Schema.Types.ObjectId, ref: "User" }, name: String },
@@ -25,6 +26,9 @@ const userSchema = new Schema(
     },
     businessAccess: [{ type: String, enum: BUSINESSES }],
     permissions: [{ type: String, enum: PERMISSIONS }],
+    operationalRoles: [{ type: String, enum: OPERATIONAL_ROLES }],
+    requestedOperationalRole: { type: String, enum: OPERATIONAL_ROLES },
+    whatsappPhone: { type: String, default: '', select: false },
     lastLoginAt: Date,
     createdBy: actorSchema,
   },

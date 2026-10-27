@@ -38,6 +38,10 @@ export function useApi(path) {
   const [version, setVersion] = useState(0);
   const reload = useCallback(() => setVersion((v) => v + 1), []);
   useEffect(() => {
+    if (!path) {
+      setState({ data: null, loading: false, error: '' });
+      return;
+    }
     const controller = new AbortController();
     setState((s) => ({ ...s, loading: true, error: "" }));
     api(path, { signal: controller.signal })

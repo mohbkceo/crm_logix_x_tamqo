@@ -36,6 +36,7 @@ function Checks({ values, options, onChange, disabled = false }) {
   );
 }
 export function UserManagement() {
+  const policy = useApi('/auth/profile-policy');
   const result = useApi("/users"),
     user = useUser(),
     [editing, setEditing] = useState(null),
@@ -57,6 +58,7 @@ export function UserManagement() {
       if (!can(user, P.users.permissions)) {
         delete body.permissions;
         delete body.businessAccess;
+        delete body.operationalRoles;
       }
       if (editing._id && !can(user, P.users.disable)) delete body.status;
       if (editing._id && !can(user, P.users.update)) {
@@ -64,6 +66,7 @@ export function UserManagement() {
         delete body.email;
         delete body.role;
         delete body.password;
+        delete body.whatsappPhone;
       }
       await api("/users" + (editing._id ? "/" + editing._id : ""), {
         method: editing._id ? "PATCH" : "POST",
@@ -95,6 +98,8 @@ export function UserManagement() {
                 status: "ACTIVE",
                 businessAccess: [],
                 permissions: [],
+                operationalRoles: [],
+                whatsappPhone: '',
               })
             }
           >
@@ -109,6 +114,7 @@ export function UserManagement() {
           { key: "name", label: "Name" },
           { key: "email", label: "Email" },
           { key: "role", label: "Role" },
+          { key: 'operationalRoles', label: 'Operational roles', render: r => r.operationalRoles?.map(human).join(', ') || (r.requestedOperationalRole ? `Requested: ${human(r.requestedOperationalRole)}` : 'Unassigned') },
           {
             key: "businessAccess",
             label: "Businesses",
@@ -137,12 +143,15 @@ export function UserManagement() {
                     onClick={() =>
                       setEditing({
                         _id: r._id,
+                        expectedRevision: r.__v,
                         name: r.name,
                         email: r.email,
                         role: r.role,
                         status: r.status,
                         businessAccess: r.businessAccess,
                         permissions: r.permissions,
+                        operationalRoles: r.operationalRoles || [],
+                        ...(r.whatsappPhone !== undefined ? { whatsappPhone: r.whatsappPhone } : {}),
                       })
                     }
                   >
@@ -209,6 +218,10 @@ export function UserManagement() {
                 ))}
               </select>
             </Field>
+            {(can(user, P.users.update) || !editing._id) && <Field label="WhatsApp phone" hint="Algerian mobile or international E.164. Leave unchanged if contact access is unavailable."><input type="tel" required={policy.data?.requireWhatsApp && !editing._id} value={editing.whatsappPhone || ''} onChange={e => setEditing({ ...editing, whatsappPhone: e.target.value })} /></Field>}
+            <h3>Operational roles</h3>
+            <Checks disabled={!can(user, P.users.permissions)} values={editing.operationalRoles || []} options={policy.data?.operationalRoles.map(r => r.code) || []} onChange={operationalRoles => setEditing({ ...editing, operationalRoles })} />
+            <p>Roles identify the operational team. Grant only the required Tracking permissions below.</p>
             {editing.role === "SUPER_ADMIN" ? (
               <p>Full system access</p>
             ) : (

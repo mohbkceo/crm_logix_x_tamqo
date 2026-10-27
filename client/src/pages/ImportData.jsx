@@ -12,7 +12,7 @@ import { Badge, DataTable, ErrorBox, PageHeader, Panel } from "../components";
 import { P, can, useUser } from "../access";
 
 const flow = ["Upload", "Analyze", "Preview", "Resolve", "Import", "Results"];
-const selectableActions = new Set(["CREATE", "UPDATE_EXISTING"]);
+const selectableActions = new Set(["CREATE", "UPDATE_EXISTING", "NEEDS_MAPPING"]);
 
 function rowSelectable(row) {
   return selectableActions.has(row.action) && !row.inFileDuplicate;

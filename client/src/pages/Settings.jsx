@@ -141,6 +141,7 @@ export function Settings() {
         description="Manage your catalog, shipping prices, sources, and expense categories."
       />
       <div className="tabs">
+        {['ADMIN', 'SUPER_ADMIN'].includes(user.role) && (can(user, P['tracking.settings'].manage) || can(user, P['tracking.issueTypes'].manage)) && <Link to="/settings/tracking">Tracking · Issue Types</Link>}
         {resources
           .filter(([key]) => can(user, resourcePermissions[key]))
           .map(([key, label]) => (

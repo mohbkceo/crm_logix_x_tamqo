@@ -11,9 +11,10 @@ export function Can({ permission, children }) {
     ? children
     : null;
 }
-export function Guard({ permissions, business, children }) {
+export function Guard({ permissions, business, roles, children }) {
   const user = useUser();
   return permissions.some((p) => can(user, p)) &&
+    (!roles || roles.includes(user.role)) &&
     (!business || hasBusinessAccess(user, business)) ? (
     children
   ) : (

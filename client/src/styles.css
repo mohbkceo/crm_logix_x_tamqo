@@ -3573,3 +3573,79 @@ main,
     grid-template-columns: 1fr;
   }
 }
+.tracking-panel { overflow: visible; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0, 0, 0, 0); white-space: nowrap; border: 0; }
+.tracking-filters { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 16px; border-bottom: 1px solid var(--line); }
+.tracking-filters > select { width: auto; max-width: 230px; }
+.tracking-search { display: flex; align-items: center; gap: 8px; flex: 1 1 310px; }
+.tracking-filter-details { width: 100%; }
+.tracking-filter-details summary, .tracking-report-form summary { cursor: pointer; padding: 8px 0; }
+.tracking-filter-details .filter-grid { padding: 12px 0 0; }
+.tracking-bulk { display: flex; align-items: center; flex-wrap: wrap; gap: 12px; padding: 10px 16px; border-bottom: 1px solid var(--line); }
+.tracking-bulk label, .tracking-checkbox { display: flex; align-items: center; gap: 8px; }
+.tracking-checkbox { padding: 10px 0; }
+.tracking-bulk input, .tracking-selection input, .tracking-checkbox input, .tracking-severity input { width: 16px; height: 16px; flex: 0 0 16px; }
+.tracking-order-row { display: grid; grid-template-columns: 22px minmax(145px, 1.05fr) minmax(130px, 1.2fr) minmax(155px, 1fr) minmax(140px, 1fr) 112px; align-items: start; gap: 14px; padding: 16px; border-bottom: 1px solid var(--line); }
+.tracking-head { padding-top: 10px; padding-bottom: 10px; color: var(--muted); font-size: 11px; background: #fafafa; }
+.tracking-order-row.stage-preparing, .tracking-order-row.stage-legacy_uninitialized { background: #fff; }
+.tracking-order-row.stage-at_production { background: #eff8ff; }
+.tracking-order-row.stage-ready_to_ship { background: #effbf1; }
+.tracking-order-row small { display: block; color: var(--muted); margin-top: 5px; font-size: 11px; overflow-wrap: anywhere; }
+.tracking-person { display: flex; gap: 8px; align-items: start; min-width: 0; }
+.tracking-person strong { display: block; font-weight: 500; margin-top: 6px; }
+.tracking-person b { font-size: 12px; }
+.tracking-products { display: grid; gap: 7px; overflow-wrap: anywhere; }
+.tracking-products b { font-weight: 500; }
+.tracking-thumb { padding: 0; border-radius: 4px; overflow: hidden; flex: 0 0 36px; }
+.tracking-thumb img { width: 36px; height: 42px; object-fit: cover; }
+.tracking-stage > button:first-child { font-size: 12px; background: #ffffffa8; white-space: normal; text-align: left; }
+.tracking-stage > button:first-child:disabled { opacity: 1; color: #52525b; }
+.tracking-actions { display: flex; align-items: start; gap: 5px; }
+.tracking-actions > button { font-size: 12px; padding: 8px; }
+.tracking-issue-count { margin-top: 8px; font-size: 10px; padding: 4px 6px; white-space: normal; }
+.tracking-issue-count.blocking { background: #fff4d4; color: #854d0e; border-color: #edcd81; }
+.tracking-issue-count.critical { background: #fff0f0; color: #b91c1c; border-color: #f5b5b5; }
+.tracking-more { position: relative; }
+.tracking-more summary { display: flex; align-items: center; cursor: pointer; padding: 7px 5px; border: 1px solid #d4d4d8; border-radius: 5px; background: white; list-style: none; }
+.tracking-more[open] > div { position: absolute; z-index: 15; right: 0; top: 34px; width: 240px; padding: 6px; background: white; border: 1px solid var(--line); border-radius: 6px; box-shadow: 0 3px 8px #0000000d; }
+.tracking-more a, .tracking-more button, .tracking-more .unavailable-contact { display: block; text-align: left; padding: 9px; width: 100%; border: 0; font-size: 12px; white-space: normal; }
+.tracking-more a:hover { background: var(--soft); }
+.unavailable-contact { color: #71717a; }
+.unavailable-contact small { display: block; font-size: 10px; margin-top: 4px; }
+.tracking-order-row .tracking-sync-error { color: #9a3412; }
+.tracking-report-form { display: grid; gap: 16px; }
+.tracking-severity { display: grid; gap: 10px; padding: 12px; border: 1px solid var(--line); border-radius: 5px; }
+.tracking-severity label { display: flex; gap: 8px; align-items: center; }
+.tracking-report-form textarea { resize: vertical; min-height: 65px; margin-top: 8px; }
+.tracking-send { min-height: 46px; font-size: 15px; }
+.tracking-report { display: grid; gap: 8px; border: 1px solid var(--line); border-left: 3px solid #a1a1aa; padding: 14px; border-radius: 5px; margin-bottom: 10px; overflow-wrap: anywhere; }
+.tracking-report p { white-space: pre-wrap; margin: 0; }
+.tracking-report a { text-decoration: underline; width: fit-content; }
+.tracking-report button { width: fit-content; }
+.tracking-report.severity-warning { border-left-color: #d49b26; }
+.tracking-report.severity-critical { border-left-color: #dc2626; }
+.tracking-preview { display: block; width: 100%; max-height: 65vh; object-fit: contain; margin: 10px 0; }
+.tracking-role-setting { display: flex; align-items: center; gap: 20px; }
+.tracking-role-setting > .field { flex: 1; }
+.tracking-image-strip { display: flex; gap: 8px; flex-wrap: wrap; margin: 10px 0; }
+.tracking-image-strip img { width: 72px; height: 72px; object-fit: cover; border: 1px solid var(--line); border-radius: 5px; }
+.item-specifications { grid-column: 1 / -1; grid-row: 2; }
+@media (max-width: 1150px) {
+  .tracking-order-row { grid-template-columns: 20px minmax(140px, 1fr) minmax(140px, 1fr) minmax(150px, 1fr) 106px; gap: 10px; }
+  .tracking-responsible { grid-column: 2 / 5; display: flex; flex-wrap: wrap; gap: 8px; }
+  .tracking-actions { grid-column: 5; grid-row: 1; }
+  .tracking-head { display: none; }
+}
+@media (max-width: 760px) {
+  .tracking-list { padding: 10px; background: var(--soft); display: grid; gap: 10px; }
+  .tracking-order-row { grid-template-columns: 20px minmax(0, 1fr) auto; padding: 12px; border: 1px solid var(--line); border-radius: 6px; }
+  .tracking-order-row .tracking-person { grid-column: 2; }
+  .tracking-actions { grid-column: 3; grid-row: 1; }
+  .tracking-products, .tracking-stage, .tracking-responsible { grid-column: 2 / 4; }
+  .tracking-stage { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+  .tracking-stage small { margin: 0; }
+  .tracking-filters { padding: 12px; }
+  .tracking-filters > select { flex: 1; max-width: none; min-width: 125px; }
+  .tracking-role-setting { display: block; }
+  .tracking-order-row.tracking-head { display: none; }
+}

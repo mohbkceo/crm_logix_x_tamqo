@@ -1,6 +1,11 @@
 export const ROLES = ['SUPER_ADMIN', 'ADMIN', 'EMPLOYEE'];
 export const BUSINESSES = ['LOGIX', 'TAMQO'];
 const groups = {
+  tracking: ['view','viewAll','moveToProduction','moveToPreparing','markReady','revertReady','bulkUpdate','assign'],
+  'tracking.issue': ['create','resolve','view'],
+  'tracking.issueTypes': ['manage'],
+  'tracking.settings': ['manage'],
+  'tracking.contacts': ['view'],
   orders: ['viewOwn','viewAll','create','updateOwn','updateAll','deleteOwn','deleteAll','refundOwn','refundAll','confirm','prepare','cancel','createShipment','markReady','refreshTracking'],
   sales: ['viewOwn','viewAll','create','updateOwn','updateAll','deleteOwn','deleteAll'],
   analytics: ['viewOwn','viewBusiness','viewGlobal','export'], partnership: ['view'],

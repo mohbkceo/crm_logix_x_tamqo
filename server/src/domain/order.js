@@ -49,6 +49,7 @@ export const orderInput = z.object({
         unitPrice: amount.optional(),
         quantity: z.number().int().min(1).max(10000),
         isRenewal: z.boolean().optional().default(false),
+        specifications: z.string().trim().max(1000).optional(),
       }),
     )
     .min(1)

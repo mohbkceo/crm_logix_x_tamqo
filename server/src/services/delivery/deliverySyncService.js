@@ -11,6 +11,7 @@ import {
 } from "./deliveryMapper.js";
 import { mapProviderStatus } from "./deliveryStatusMapper.js";
 import { ensureReturnExpense, reverseReturnExpense } from "./deliveryFinancialService.js";
+import { COURIER_STAGES } from '../../../../shared/tracking.js';
 export class DeliverySyncService {
   constructor(client = deliveryClient) {
     this.client = client;
@@ -328,6 +329,18 @@ export class DeliverySyncService {
       const status = mapProviderStatus(parcel.providerStatus);
       const beforeProviderStatus = s.providerStatus || null,
         beforeOrderStatus = order.status;
+      s.lastObservation = { providerStatus: parcel.providerStatus, providerUpdatedAt: parcel.providerUpdatedAt, receivedAt: new Date(), raw: this.sanitize(parcel.raw) };
+      const incomingDate = parcel.providerUpdatedAt ? new Date(parcel.providerUpdatedAt) : null;
+      const stale = incomingDate && (!Number.isFinite(+incomingDate) || (s.providerUpdatedAt && (+incomingDate < +s.providerUpdatedAt || (+incomingDate === +s.providerUpdatedAt && status && status !== order.status))));
+      const conflicting = status && status !== order.status && !canProviderTransition(order.status, status);
+      const wrongTracking = s.tracking && String(s.tracking).toUpperCase() !== String(parcel.tracking).toUpperCase();
+      if (stale || conflicting || wrongTracking) {
+        s.lastSyncedAt = new Date();
+        s.lastError = stale ? 'Stale or invalid provider timestamp; last accepted state preserved.' : wrongTracking ? 'Provider tracking mismatch; linked parcel preserved.' : `Provider reports ${status}; internal state is ${order.status}. Review the conflicting transition.`;
+        s.syncStatus = 'ERROR';
+        await s.save({ session });
+        return { shipment: s, outcome: { beforeProviderStatus, afterProviderStatus: s.providerStatus || null, beforeOrderStatus, afterOrderStatus: order.status, changed: false, terminalReached: false, result: 'ERROR', error: s.lastError } };
+      }
       s.tracking = parcel.tracking;
       s.trackingKey = parcel.tracking.toUpperCase();
       s.uncertain = false;
@@ -336,7 +349,7 @@ export class DeliverySyncService {
       if (parcel.messageRetour) s.messageRetour = parcel.messageRetour;
       s.providerStatus = parcel.providerStatus;
       s.providerSituationId = parcel.providerSituationId;
-      s.providerUpdatedAt = parcel.providerUpdatedAt;
+      if (incomingDate && status) s.providerUpdatedAt = incomingDate;
       s.sanitizedProviderData = parcel.raw;
       s.lastSyncedAt = new Date();
       s.lastError = "";
@@ -364,6 +377,11 @@ export class DeliverySyncService {
         }
       } else if (!status && (options.requireStatus || parcel.providerStatus)) {
         result = "UNKNOWN_STATUS";
+      }
+      if (status === order.status && COURIER_STAGES.includes(status) && order.tracking && !order.tracking.courierOwned) {
+        order.tracking.courierOwned = true;
+        order.revision++;
+        await order.save({ session });
       }
       // Unknown provider values are retained without guessing a normalized order status.
       s.status = status || null;
@@ -443,6 +461,14 @@ export class DeliverySyncService {
       409,
     );
     if (!s?.tracking) return transition(orderId, "READY_TO_SHIP", actor);
+    if (o.status === 'READY_TO_SHIP' && s.status === 'READY_TO_SHIP') return s;
+    await transaction(async session => {
+      const current = await Order.findById(orderId).session(session);
+      assert(current && !current.deletedAt && ['PREPARING', 'READY_TO_SHIP'].includes(current.status), 'Order changed before courier readiness', 409);
+      const reserved = await Shipment.findOneAndUpdate({ _id: s._id, $or: [{ lockUntil: null }, { lockUntil: { $lte: new Date() } }] }, { $set: { lockUntil: new Date(Date.now() + 60000) } }, { session });
+      assert(reserved, 'A courier operation is already in progress', 409);
+      current.increment(); await current.save({ session });
+    });
     try {
       const raw = this.sanitize(await this.client.readyPackages([s.tracking]));
       const messageRetour = Array.isArray(raw?.Colis)
@@ -461,6 +487,7 @@ export class DeliverySyncService {
         await transition(orderId, "READY_TO_SHIP", actor, session);
         const shipment = await Shipment.findOne({ orderId }).session(session);
         shipment.status = "READY_TO_SHIP";
+        shipment.lockUntil = null;
         shipment.syncStatus = "SYNCED";
         shipment.lastError = "";
         shipment.lastSyncedAt = new Date();
@@ -479,6 +506,7 @@ export class DeliverySyncService {
               error instanceof AppError
                 ? error.message
                 : "Ready request could not be verified.",
+            lockUntil: null,
             ...(error.providerData
               ? { sanitizedProviderData: this.sanitize(error.providerData) }
               : {}),

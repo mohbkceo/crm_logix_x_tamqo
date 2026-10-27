@@ -13,6 +13,7 @@ import {
   ImportMapping,
 } from "./models/index.js";
 import { encryptCredentials } from "./services/delivery/credentials.js";
+import { migrateTracking } from './services/trackingMigration.js';
 export async function bootstrap() {
   const email = (
     process.env.BOOTSTRAP_SUPER_ADMIN_EMAIL ||
@@ -147,6 +148,7 @@ export async function migrate() {
     { upsert: true },
   );
   await bootstrap();
+  await migrateTracking();
 }
 if (
   process.argv[1] &&

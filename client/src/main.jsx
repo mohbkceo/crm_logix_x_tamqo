@@ -47,8 +47,11 @@ import {
   TeamAnalytics,
 } from "./pages/Administration";
 import { Agencies } from "./pages/Agencies";
+import { Tracking } from './pages/Tracking';
+import { TrackingSettings, MyProfile } from './pages/TrackingSettings';
 import "./styles.css";
 function Login({ reload }) {
+  const profilePolicy = useApi('/auth/profile-policy');
   const [register, setRegister] = useState(false),
     [name, setName] = useState("");
   const [email, setEmail] = useState(""),
@@ -67,7 +70,7 @@ function Login({ reload }) {
         body: {
           email,
           password,
-          ...(register ? { name, registrationKey: key } : {}),
+          ...(register ? { name, registrationKey: key, whatsappPhone: e.currentTarget.elements.whatsappPhone?.value || '', ...(e.currentTarget.elements.requestedOperationalRole?.value ? { requestedOperationalRole: e.currentTarget.elements.requestedOperationalRole.value } : {}) } : {}),
         },
       });
       reload();
@@ -108,6 +111,9 @@ function Login({ reload }) {
                 autoComplete="off"
               />
             </Field>
+            <Field label="WhatsApp phone"><input name="whatsappPhone" type="tel" autoComplete="tel" required={profilePolicy.data?.requireWhatsApp} placeholder="0550123456 or +213550123456" /></Field>
+            <Field label="Requested operational role"><select name="requestedOperationalRole"><option value="">No request</option>{profilePolicy.data?.operationalRoles.map(r => <option key={r.code} value={r.code}>{r.label}</option>)}</select></Field>
+            <small>An administrator must authorize your role and permissions.</small>
           </>
         )}
         <Field label="Email">
@@ -140,6 +146,7 @@ function Login({ reload }) {
   );
 }
 function Workspace({ user, logout }) {
+  const profilePolicy = useApi('/auth/profile-policy');
   const configuration = useApi("/config"),
     [collapsed, setCollapsed] = useState(() => window.innerWidth <= 760),
     location = useLocation();
@@ -193,6 +200,7 @@ function Workspace({ user, logout }) {
       [P.analytics.viewOwn, P.analytics.viewBusiness, P.analytics.viewGlobal],
     ],
     ["/orders", "Orders", ShoppingBag, [P.orders.viewOwn, P.orders.viewAll]],
+    ['/tracking', 'Tracking', Layers, [P.tracking.view]],
     ["/sales", "Sales", BadgeDollarSign, [P.sales.viewOwn, P.sales.viewAll]],
     ["/customers", "Customers", Users, [P.customers.view]],
     [
@@ -343,6 +351,8 @@ function Workspace({ user, logout }) {
                     <span>Settings</span>
                   </NavLink>
                 </Can>
+                {['ADMIN', 'SUPER_ADMIN'].includes(user.role) && <Can permission={[P['tracking.settings'].manage, P['tracking.issueTypes'].manage]}><NavLink to="/settings/tracking">Tracking settings</NavLink></Can>}
+                <NavLink to="/settings/profile">My profile</NavLink>
                 <Can permission={P.imports.view}>
                   <NavLink to="/settings/import-data">
                     <FileSpreadsheet size={17} />
@@ -422,11 +432,15 @@ function Workspace({ user, logout }) {
               </div>
             </header>
             <main id="workspace-content" tabIndex={-1}>
+              {profilePolicy.data?.requireWhatsApp && !user.whatsappPhone && <p className="note">Complete your WhatsApp contact in <Link className="text-link" to="/settings/profile">My profile</Link>. Your account remains active.</p>}
               <ErrorBox error={configuration.error} />
               {configuration.loading && !configuration.data ? (
                 <Loading />
               ) : (
                 <Routes>
+                  <Route path="/tracking" element={<Guard permissions={[P.tracking.view]}><Tracking /></Guard>} />
+                  <Route path="/settings/tracking" element={<Guard roles={['ADMIN', 'SUPER_ADMIN']} permissions={[P['tracking.settings'].manage, P['tracking.issueTypes'].manage]}><TrackingSettings /></Guard>} />
+                  <Route path="/settings/profile" element={<MyProfile />} />
                   <Route
                     path="/"
                     element={

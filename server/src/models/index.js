@@ -1,5 +1,6 @@
 import mongoose from "mongoose";
 import { actorSchema } from "./security.js";
+import { trackingSchema, imageSchema } from './tracking.js';
 import {
   BUSINESS,
   BUSINESS_TYPES,
@@ -87,6 +88,7 @@ const itemSchema = new Schema(
     subtotal: money,
     durationDays: Number,
     isRenewal: { type: Boolean, default: false },
+    specifications: { type: String, maxlength: 1000, default: '' },
   },
   { _id: false },
 );
@@ -141,6 +143,8 @@ export const Order = create(
       address: String,
     },
     note: String,
+    tracking: { type: trackingSchema, default: undefined },
+    images: { type: [imageSchema], default: [] },
     source: { id: ref("OrderSource"), name: String },
     businessType: { type: String, enum: BUSINESS_TYPES, required: true },
     items: { type: [itemSchema], required: true },
@@ -186,6 +190,9 @@ export const Order = create(
     [{ "createdBy.userId": 1, createdAt: -1 }, {}],
     [{ createdAt: -1, _id: -1 }, {}],
     [{ status: 1, createdAt: -1 }, {}],
+    [{ 'tracking.stage': 1, createdAt: -1, _id: -1 }, {}],
+    [{ 'tracking.designerId': 1, 'tracking.stage': 1 }, {}],
+    [{ 'tracking.productionId': 1, 'tracking.stage': 1 }, {}],
     [{ businessType: 1, createdAt: -1 }, {}],
     [{ "source.id": 1, createdAt: -1 }, {}],
     [{ "customer.normalizedPhone": 1 }, {}],
@@ -258,6 +265,7 @@ export const Shipment = create("Shipment", {
   lastSyncedAt: Date,
   providerCreatedAt: Date,
   providerUpdatedAt: Date,
+  lastObservation: Schema.Types.Mixed,
   lastError: String,
   sanitizedProviderData: Schema.Types.Mixed,
   creationAttemptedAt: Date,
