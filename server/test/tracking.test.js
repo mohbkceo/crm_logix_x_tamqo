@@ -38,10 +38,12 @@ import {
   createIssue,
   resolveIssue,
   assignTracking,
+  markImportant,
 } from "../src/services/trackingService.js";
 import { migrateTracking } from "../src/services/trackingMigration.js";
 import { normalizeWhatsApp } from "../src/domain/whatsapp.js";
 import { P } from "../../shared/permissions.js";
+import { defaultTrackingFilters } from "../../shared/trackingFilters.js";
 
 let replica,
   agency,
@@ -681,24 +683,20 @@ test("WhatsApp validation, requirement and safe profile completion retain existi
   const self = await production.api.get("/api/auth/me");
   assert.equal(
     (
-      await production.api
-        .patch("/api/auth/profile")
-        .send({
-          whatsappPhone: "+213770123456",
-          expectedRevision: self.body.user.__v,
-        })
+      await production.api.patch("/api/auth/profile").send({
+        whatsappPhone: "+213770123456",
+        expectedRevision: self.body.user.__v,
+      })
     ).status,
     200,
   );
   assert.equal(
     (
-      await production.api
-        .patch("/api/auth/profile")
-        .send({
-          whatsappPhone: "0550123456",
-          expectedRevision: self.body.user.__v,
-          permissions: [P.tracking.viewAll],
-        })
+      await production.api.patch("/api/auth/profile").send({
+        whatsappPhone: "0550123456",
+        expectedRevision: self.body.user.__v,
+        permissions: [P.tracking.viewAll],
+      })
     ).status,
     400,
   );
@@ -971,4 +969,304 @@ test("tracking pagination is stable and query validation rejects invalid filters
     (await admin.api.get("/api/tracking?from=not-a-date")).status,
     400,
   );
+});
+
+const filterNow = new Date("2026-10-28T23:30:00Z");
+async function datedOrder(createdAt, fields = {}, business) {
+  const o = await order(business);
+  await Order.collection.updateOne(
+    { _id: o._id },
+    { $set: { createdAt: new Date(createdAt), ...fields } },
+  );
+  return Order.findById(o._id);
+}
+const filterIds = (result) => result.items.map((o) => String(o._id));
+test("operational defaults apply even with viewAll; security admins retain the complete view", async () => {
+  assert.equal(defaultTrackingFilters(designer.user).stage, "PREPARING");
+  assert.equal(defaultTrackingFilters(production.user).stage, "AT_PRODUCTION");
+  assert.equal(defaultTrackingFilters(sales.user).sort, "issuesFirst");
+  assert.equal(
+    defaultTrackingFilters({
+      ...admin.user.toObject(),
+      operationalRoles: ["DESIGNER"],
+    }).stage,
+    undefined,
+  );
+  const oldest = await datedOrder("2026-10-20T10:00:00Z");
+  const newer = await datedOrder("2026-10-21T10:00:00Z");
+  const atProduction = await datedOrder("2026-10-22T10:00:00Z", {
+    "tracking.stage": "AT_PRODUCTION",
+  });
+  await datedOrder("2026-10-23T10:00:00Z", { status: "DELIVERED" });
+  await datedOrder("2026-10-24T10:00:00Z", { "tracking.courierOwned": true });
+  assert.deepEqual(filterIds(await listTracking(designer.user, {})), [
+    String(oldest._id),
+    String(newer._id),
+  ]);
+  assert.deepEqual(filterIds(await listTracking(production.user, {})), [
+    String(atProduction._id),
+  ]);
+  assert.equal((await listTracking(admin.user, {})).total, 5);
+  assert.equal(
+    (await listTracking(designer.user, { view: "custom" })).total,
+    5,
+  );
+  const response = await production.api.get("/api/tracking");
+  assert.equal(response.status, 200);
+  assert.equal(response.body.items[0]._id, String(atProduction._id));
+});
+test("Sales sees all active orders, unresolved reports first, Sales intervention next, then oldest within groups", async () => {
+  const oldest = await datedOrder("2026-10-20T10:00:00Z");
+  const genericOlder = await datedOrder("2026-10-21T10:00:00Z");
+  const salesOlder = await datedOrder("2026-10-22T10:00:00Z");
+  const salesNewer = await datedOrder("2026-10-23T10:00:00Z");
+  const genericNewer = await datedOrder("2026-10-24T10:00:00Z");
+  await report(genericOlder);
+  await report(genericNewer);
+  await IssueType.updateOne(
+    { code: "OTHER" },
+    { responsibleTeam: "SALES_CONFIRMATION" },
+  );
+  await report(salesOlder);
+  await report(salesNewer);
+  for (const status of ["DELIVERED", "RETURNED", "CANCELLED"])
+    await datedOrder("2026-10-19T10:00:00Z", { status });
+  const result = await listTracking(sales.user, {});
+  assert.deepEqual(
+    filterIds(result),
+    [salesOlder, salesNewer, genericOlder, genericNewer, oldest].map((o) =>
+      String(o._id),
+    ),
+  );
+  assert.equal(
+    (await listTracking(sales.user, { lifecycle: "COMPLETED" })).total,
+    3,
+  );
+  assert.equal(
+    (await listTracking(sales.user, { view: "custom", sort: "oldest" })).total,
+    8,
+  );
+  const issue = await TrackingIssue.findOne({ orderId: salesOlder._id });
+  await resolveIssue(sales.user, String(salesOlder._id), String(issue._id), {
+    expectedRevision: 1,
+  });
+  assert.deepEqual(
+    filterIds(await listTracking(sales.user, {})).slice(0, 3),
+    [salesNewer, genericOlder, genericNewer].map((o) => String(o._id)),
+  );
+});
+test("Important is authorized, persisted, audited, revision-protected and independent of courier/production data", async () => {
+  const o = await order(),
+    s = await parcel(o),
+    shipmentBefore = snapshot(s);
+  const endpoint = `/api/tracking/${o._id}/important`;
+  assert.equal(
+    (
+      await production.api
+        .patch(endpoint)
+        .send({ important: true, expectedRevision: 0 })
+    ).status,
+    403,
+  );
+  assert.equal(
+    (
+      await admin.api
+        .patch(endpoint)
+        .send({ important: true, expectedRevision: 0 })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await admin.api
+        .patch(endpoint)
+        .send({ important: false, expectedRevision: 0 })
+    ).status,
+    409,
+  );
+  const current = await Order.findById(o._id);
+  assert.equal(current.tracking.important, true);
+  assert.equal(current.tracking.importantUpdatedBy.name, "admin");
+  assert.ok(current.tracking.importantUpdatedAt);
+  assert.equal(current.tracking.stage, o.tracking.stage);
+  assert.equal(current.status, o.status);
+  assert.deepEqual(snapshot(current.payment), snapshot(o.payment));
+  assert.deepEqual(snapshot(await Shipment.findById(s._id)), shipmentBefore);
+  assert.equal(
+    (await listTracking(admin.user, { tags: "IMPORTANT" })).total,
+    1,
+  );
+  const event = await TrackingEvent.findOne({ orderId: o._id });
+  assert.equal(event.kind, "TRACKING_PRIORITY_CHANGED");
+  assert.deepEqual(event.data, { important: true });
+  assert.equal(
+    (await production.api.get(`/api/tracking/${o._id}`)).body.canMarkImportant,
+    false,
+  );
+  await markImportant(admin.user, String(o._id), {
+    important: true,
+    expectedRevision: 1,
+  });
+  assert.equal(await TrackingEvent.countDocuments(), 1);
+  await markImportant(admin.user, String(o._id), {
+    important: false,
+    expectedRevision: 1,
+  });
+  assert.equal(
+    (await listTracking(admin.user, { tags: "IMPORTANT" })).total,
+    0,
+  );
+});
+test("age tags honor exact 24-hour/four-day boundaries and Today uses Algeria midnight", async () => {
+  const today = await datedOrder("2026-10-28T23:00:00Z");
+  const beforeToday = await datedOrder("2026-10-28T22:59:59.999Z");
+  const dayBoundary = await datedOrder(new Date(+filterNow - 86400000));
+  const beforeDay = await datedOrder(new Date(+filterNow - 86400001));
+  const fourBoundary = await datedOrder(new Date(+filterNow - 4 * 86400000));
+  const underFour = await datedOrder(new Date(+filterNow - 4 * 86400000 + 1));
+  const future = await datedOrder("2026-10-30T00:00:00Z");
+  const get = (tags) =>
+    listTracking(admin.user, { tags, sort: "oldest" }, filterNow);
+  assert.deepEqual(filterIds(await get("TODAY")), [String(today._id)]);
+  assert.deepEqual(
+    new Set(filterIds(await get("NEW"))),
+    new Set([today, beforeToday, dayBoundary].map((o) => String(o._id))),
+  );
+  assert.deepEqual(filterIds(await get("GTE4D")), [String(fourBoundary._id)]);
+  const less = filterIds(await get("LT4D"));
+  assert.ok(less.includes(String(underFour._id)));
+  assert.ok(less.includes(String(beforeDay._id)));
+  assert.ok(!less.includes(String(fourBoundary._id)));
+  assert.ok(!less.includes(String(future._id)));
+  assert.equal((await get("LT4D,GTE4D")).total, 6);
+});
+test("quick tags combine OR within categories and AND across categories; My Orders uses assignments only", async () => {
+  const assigned = await datedOrder("2026-10-28T20:00:00Z", {
+    "tracking.designerId": sales.user._id,
+    "tracking.important": true,
+  });
+  const creatorOnly = await datedOrder("2026-10-20T20:00:00Z", {
+    "tracking.important": true,
+  });
+  const blocked = await datedOrder("2026-10-28T20:00:00Z");
+  await report(blocked, { severity: "CRITICAL" });
+  const warning = await datedOrder("2026-10-28T20:00:00Z");
+  await report(warning);
+  const q = {
+    view: "custom",
+    tags: "MY_ORDERS,IMPORTANT,LT4D,GTE4D,ISSUES,NO_ISSUES",
+  };
+  assert.deepEqual(filterIds(await listTracking(sales.user, q, filterNow)), [
+    String(assigned._id),
+  ]);
+  assert.equal(
+    (
+      await listTracking(
+        sales.user,
+        { view: "custom", tags: "MY_ORDERS" },
+        filterNow,
+      )
+    ).total,
+    1,
+  );
+  assert.equal(
+    (await listTracking(admin.user, { tags: "ISSUES,BLOCKED" }, filterNow))
+      .total,
+    2,
+  );
+  assert.equal(
+    (
+      await listTracking(
+        admin.user,
+        { issue: "NONE", tags: "ISSUES" },
+        filterNow,
+      )
+    ).total,
+    4,
+  );
+  assert.deepEqual(
+    filterIds(await listTracking(admin.user, { tags: "BLOCKED" }, filterNow)),
+    [String(blocked._id)],
+  );
+  assert.equal(
+    (await listTracking(admin.user, { tags: "NO_ISSUES" }, filterNow)).total,
+    2,
+  );
+  assert.ok(
+    !filterIds(await listTracking(sales.user, q, filterNow)).includes(
+      String(creatorOnly._id),
+    ),
+  );
+});
+test("combined tags preserve search, stage, date, business scope, stable pagination and contextual counts", async () => {
+  const matching = [];
+  for (let n = 0; n < 3; n++)
+    matching.push(
+      await datedOrder("2026-10-28T20:00:00Z", {
+        "tracking.stage": "AT_PRODUCTION",
+        "tracking.important": true,
+      }),
+    );
+  await datedOrder("2026-10-28T20:00:00Z", { "tracking.important": true });
+  await datedOrder(
+    "2026-10-28T20:00:00Z",
+    { "tracking.stage": "AT_PRODUCTION", "tracking.important": true },
+    "PARTNERSHIP",
+  );
+  await datedOrder("2026-10-28T20:00:00Z", {}, "TAMQO_ONLY");
+  const scoped = { ...designer.user.toObject(), businessAccess: ["LOGIX"] };
+  const q = {
+    view: "custom",
+    search: "Plaque",
+    stage: "AT_PRODUCTION",
+    tags: "IMPORTANT,LT4D,NO_ISSUES",
+    from: "2026-10-28",
+    to: "2026-10-28",
+    sort: "oldest",
+    limit: 1,
+  };
+  const first = await listTracking(scoped, { ...q, page: 1 }, filterNow),
+    second = await listTracking(scoped, { ...q, page: 2 }, filterNow);
+  assert.equal(first.total, 3);
+  assert.equal(second.total, 3);
+  assert.equal(first.items[0]._id.toString(), matching[0]._id.toString());
+  assert.equal(second.items[0]._id.toString(), matching[1]._id.toString());
+  assert.equal(first.tagCounts.IMPORTANT, 3);
+  assert.equal(first.tagCounts.NO_ISSUES, 3);
+  assert.equal(first.tagCounts.BLOCKED, 0);
+  assert.equal(first.tagCounts.GTE4D, 0);
+  assert.equal(
+    (await listTracking(scoped, { ...q, search: "no match" }, filterNow))
+      .tagCounts.IMPORTANT,
+    0,
+  );
+  assert.equal(
+    (await outsider.api.get("/api/tracking?tags=IMPORTANT")).status,
+    403,
+  );
+  const forbidden = await datedOrder("2026-10-28T20:00:00Z", {}, "PARTNERSHIP");
+  const limitedAdmin = {
+    ...admin.user.toObject(),
+    role: "ADMIN",
+    businessAccess: ["LOGIX"],
+    permissions: [P.tracking.view, P.tracking.viewAll, P.tracking.assign],
+  };
+  await assert.rejects(
+    markImportant(limitedAdmin, String(forbidden._id), {
+      important: true,
+      expectedRevision: 0,
+    }),
+    { status: 404 },
+  );
+});
+test("quick filter payload validation rejects unknown/duplicate tags and malformed filters", async () => {
+  for (const query of [
+    "tags=UNKNOWN",
+    "tags=NEW,NEW",
+    "sort=unsafe",
+    "lifecycle=unknown",
+    "from=2026-10-29&to=2026-10-28",
+  ]) {
+    assert.equal((await admin.api.get("/api/tracking?" + query)).status, 400);
+  }
 });

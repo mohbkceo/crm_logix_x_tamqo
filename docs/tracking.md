@@ -1,5 +1,27 @@
 # Tracking module
 
+## Quick filters and operational defaults
+
+The Tracking view applies shared defaults on entry and when navigating back. Security Admin/Super Admin sees every authorized order. Designer starts at Preparing and Production/Production Manager at At Production, oldest first, with courier-owned/completed work excluded from the internal-attention queue. `tracking.viewAll` does not override an employee's operational default. For multiple operational roles, Designer takes precedence, then Production/Manager, then Sales. These are convenience defaults; the original authorization scope always applies.
+
+Sales starts with active orders and Issues first sorting. All unresolved reports precede orders without reports; within the unresolved group, reports whose saved responsible team is Sales / Confirmation come first. Each priority group sorts by createdAt ascending and ID ascending. Other active orders remain visible. Active excludes Delivered, Returned and Cancelled; Order lifecycle exposes completed/cancelled history. Clear Filters shows the full authorized queue; Reset to My Default View reapplies the employee's defaults.
+
+Quick tags are evaluated by the backend before pagination. Categories combine with AND; selected tags within a category combine with OR:
+
+- Priority: Important.
+- Age: New (last 24 hours), < 4 Days, ≥ 4 Days. Exactly four days belongs to ≥ 4 Days. Future timestamps do not match New or < 4 Days.
+- Reports: Issues, Blocked, No Issues (and the existing Issue status dropdown).
+- Assignment: My Orders matches designer/production assignments, not order creation.
+- Calendar: Today uses the existing Africa/Algiers day boundary.
+
+Search, production stage, courier status, employee, business, date range and sorting continue to compose with tags. Filters survive pagination and changing any filter returns to page 1 and clears bulk selection. Faceted chip counts apply all other filter categories and the chip itself, replacing other selections in its own category. Counts never include orders outside the user's scope. The mobile chip strip scrolls horizontally within the page.
+
+`Order.tracking.important` stores the optional priority flag plus the actor/time of its latest change. `PATCH /api/tracking/:orderId/important` accepts `{ important, expectedRevision }`, uses the existing `tracking.assign` permission, enforces scope/revision checks, and records `TRACKING_PRIORITY_CHANGED`. It changes neither stage nor courier/commercial data. Existing order records need no reset or priority migration; a missing flag means unmarked.
+
+List requests support `tags` (comma-separated normalized tag values), `lifecycle=ALL|ACTIVE|COMPLETED`, `attention=all|internal`, and `sort=oldest|newest|issuesFirst`. Omitting `view` applies role defaults; `view=custom` requests explicit filters. These options change only query convenience, never authorization.
+
+Quick-filter validation on 2026-10-28: lint and production build passed; all 137 automated tests passed (including 35 Tracking tests). The expanded Tracking browser suite passed role defaults, AND/OR tags, clearing/resetting, navigating back to defaults, permission-controlled Important actions, mobile layout and the existing reports/bulk workflow, with no console/API errors or courier requests. Desktop and mobile screenshots were inspected.
+
 Tracking is part of the existing CRM. `/tracking` uses the original `Order` documents and the existing authenticated session, business scoping, permission catalogue and transaction infrastructure. There is no second order store, browser persistence, batch/cutting workflow or new courier endpoint.
 
 ## Persistence and concurrency

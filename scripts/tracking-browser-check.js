@@ -148,6 +148,13 @@ async function login(name) {
 }
 try {
   await login("sales");
+  await page.locator(".tracking-filter-details > summary").click();
+  await expect(page.getByLabel("Order lifecycle", { exact: true })).toHaveValue(
+    "ACTIVE",
+  );
+  await expect(page.getByLabel("Sort", { exact: true })).toHaveValue(
+    "issuesFirst",
+  );
   await page.getByRole("link", { name: "Tracking", exact: true }).waitFor();
   await goto("/orders/new");
   await page.getByLabel("Customer name *").fill("Browser Tracking Customer");
@@ -167,13 +174,11 @@ try {
   })
     .png()
     .toBuffer();
-  await page
-    .getByLabel("Order images (optional)")
-    .setInputFiles({
-      name: "design.png",
-      mimeType: "image/png",
-      buffer: image,
-    });
+  await page.getByLabel("Order images (optional)").setInputFiles({
+    name: "design.png",
+    mimeType: "image/png",
+    buffer: image,
+  });
   await page.getByRole("button", { name: "Create order", exact: true }).click();
   await page.waitForURL(/\/orders\/[a-f0-9]{24}$/);
   const saved = await Order.findOne({
@@ -195,6 +200,35 @@ try {
     }),
   ).toBeDisabled();
   await login("designer");
+  await expect(
+    page.getByLabel("Production stage", { exact: true }),
+  ).toHaveValue("PREPARING");
+  const chips = page.getByRole("group", { name: "Quick filters", exact: true });
+  await chips.getByRole("button", { name: /^≥ 4 Days/ }).click();
+  await expect(
+    chips.getByRole("button", { name: /^≥ 4 Days/ }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await page
+    .getByRole("heading", { name: "No orders in this queue", exact: true })
+    .waitFor();
+  await chips.getByRole("button", { name: /^New(?:\s|$)/ }).click();
+  await row.waitFor(); // New OR >= 4 Days, not an impossible age intersection.
+  await page
+    .getByRole("button", { name: "Clear Filters", exact: true })
+    .click();
+  await expect(
+    page.getByLabel("Production stage", { exact: true }),
+  ).toHaveValue("");
+  await page
+    .getByRole("button", { name: "Reset to My Default View", exact: true })
+    .click();
+  await expect(
+    page.getByLabel("Production stage", { exact: true }),
+  ).toHaveValue("PREPARING");
+  await expect(chips.locator('[aria-pressed="true"]')).toHaveCount(0);
+  await expect(row.getByRole("button", { name: /as Important/ })).toHaveCount(
+    0,
+  );
   const moveToProduction = `${saved.orderNumber}: Preparing → At Production`;
   await page
     .getByRole("button", { name: moveToProduction, exact: true })
@@ -245,6 +279,12 @@ try {
     .filter({ hasText: "Moved to At Production" })
     .waitFor();
   await login("production");
+  await expect(
+    page.getByLabel("Production stage", { exact: true }),
+  ).toHaveValue("AT_PRODUCTION");
+  await row.waitFor();
+  await chips.getByRole("button", { name: /^New(?:\s|$)/ }).click();
+  await chips.getByRole("button", { name: /^No Issues/ }).click();
   await row.waitFor();
   await page
     .getByRole("button", {
@@ -305,6 +345,44 @@ try {
   await page.keyboard.press("Escape");
   await page.setViewportSize({ width: 1440, height: 1000 });
   await login("admin");
+  await row
+    .getByRole("button", {
+      name: `Mark ${saved.orderNumber} as Important`,
+      exact: true,
+    })
+    .click();
+  await expect(
+    row.getByRole("button", {
+      name: `Unmark ${saved.orderNumber} as Important`,
+      exact: true,
+    }),
+  ).toHaveAttribute("aria-pressed", "true");
+  await chips.getByRole("button", { name: /^Important/ }).click();
+  await row.waitFor();
+  await row
+    .getByRole("button", {
+      name: `Unmark ${saved.orderNumber} as Important`,
+      exact: true,
+    })
+    .click();
+  await page
+    .getByRole("heading", { name: "No orders in this queue", exact: true })
+    .waitFor();
+  await page
+    .getByRole("button", { name: "Reset to My Default View", exact: true })
+    .click();
+  await page
+    .getByLabel("Production stage", { exact: true })
+    .selectOption("PREPARING");
+  await page.getByRole("link", { name: "My profile", exact: true }).click();
+  await page
+    .getByRole("heading", { name: "My profile", exact: true })
+    .waitFor();
+  await page.getByRole("link", { name: "Tracking", exact: true }).click();
+  await expect(
+    page.getByLabel("Production stage", { exact: true }),
+  ).toHaveValue("");
+  await row.waitFor();
   await goto("/settings");
   await page.getByRole("link", { name: "Tracking · Issue Types" }).click();
   await page

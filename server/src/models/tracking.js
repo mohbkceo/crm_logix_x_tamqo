@@ -21,6 +21,9 @@ export const trackingSchema = new Schema(
     openIssues: { type: Number, default: 0 },
     blockingIssues: { type: Number, default: 0 },
     criticalIssues: { type: Number, default: 0 },
+    important: { type: Boolean, default: false },
+    importantUpdatedBy: actorSchema,
+    importantUpdatedAt: Date,
   },
   { _id: false },
 );

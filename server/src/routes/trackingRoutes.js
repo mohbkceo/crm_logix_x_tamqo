@@ -21,6 +21,7 @@ import {
   trackingHistory,
   employeeOptions,
   revisionInput,
+  markImportant,
 } from "../services/trackingService.js";
 const router = Router();
 const admin = (req, _res, next) => {
@@ -256,6 +257,12 @@ router.get("/:orderId", async (req, res) =>
 );
 router.patch("/:orderId/stage", async (req, res) =>
   res.json(await moveStage(req.user, req.params.orderId, req.body)),
+);
+router.patch(
+  "/:orderId/important",
+  requirePermission(P.tracking.assign),
+  async (req, res) =>
+    res.json(await markImportant(req.user, req.params.orderId, req.body)),
 );
 router.post("/:orderId/initialize", async (req, res) =>
   res.json(await initializeTracking(req.user, req.params.orderId, req.body)),

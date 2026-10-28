@@ -438,7 +438,7 @@ function Workspace({ user, logout }) {
                 <Loading />
               ) : (
                 <Routes>
-                  <Route path="/tracking" element={<Guard permissions={[P.tracking.view]}><Tracking /></Guard>} />
+                  <Route path="/tracking" element={<Guard permissions={[P.tracking.view]}><Tracking key={location.key} /></Guard>} />
                   <Route path="/settings/tracking" element={<Guard roles={['ADMIN', 'SUPER_ADMIN']} permissions={[P['tracking.settings'].manage, P['tracking.issueTypes'].manage]}><TrackingSettings /></Guard>} />
                   <Route path="/settings/profile" element={<MyProfile />} />
                   <Route

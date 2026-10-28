@@ -25,6 +25,15 @@ import {
 } from "../../../shared/tracking.js";
 import { mapProviderStatus } from "./delivery/deliveryStatusMapper.js";
 import { whatsAppUrl } from "../domain/whatsapp.js";
+import { QUICK_TAGS } from "../../../shared/trackingFilters.js";
+import {
+  parseTrackingFilters,
+  lifecycleFilter,
+  internalQueueFilter,
+  quickTagFilters,
+  tagCategories,
+  matchTagCategories,
+} from "./trackingFilters.js";
 
 export const revisionInput = z.number().int().min(0);
 export const stageInput = z
@@ -183,6 +192,27 @@ export async function moveStage(user, id, payload) {
     order.tracking.stage = data.targetStage;
     order.tracking.stageEnteredAt = new Date();
     await writeEvent(order, user, "TRACKING_STAGE_CHANGED", previous, session);
+  });
+}
+export async function markImportant(user, id, payload) {
+  assert(can(user, P.tracking.assign), "Priority update denied", 403);
+  const data = z
+    .object({ important: z.boolean(), expectedRevision: revisionInput })
+    .strict()
+    .parse(payload);
+  return mutate(user, id, data.expectedRevision, async (order, session) => {
+    if (Boolean(order.tracking.important) === data.important) return;
+    order.tracking.important = data.important;
+    order.tracking.importantUpdatedBy = actor(user);
+    order.tracking.importantUpdatedAt = new Date();
+    await writeEvent(
+      order,
+      user,
+      "TRACKING_PRIORITY_CHANGED",
+      order.tracking.stage,
+      session,
+      { important: data.important },
+    );
   });
 }
 export async function initializeTracking(user, id, payload) {
@@ -496,6 +526,7 @@ export async function presentOrders(user, orders) {
         (can(user, P.orders.viewOwn) &&
           String(o.createdBy?.userId) === String(user._id)),
       tracking: state,
+      canMarkImportant: can(user, P.tracking.assign),
       courierOwned: owned,
       images: (o.images || []).map((i) => ({
         _id: i._id,
@@ -533,25 +564,11 @@ export async function presentOrders(user, orders) {
     };
   });
 }
-export async function listTracking(user, query) {
-  const q = z
-    .object({
-      search: z.string().max(200).optional(),
-      stage: z.enum([...PRODUCTION_STAGES, "LEGACY_UNINITIALIZED"]).optional(),
-      courierStatus: z.string().max(100).optional(),
-      issue: z.enum(["OPEN", "BLOCKING", "NONE"]).optional(),
-      employee: z.string().optional(),
-      business: z.enum(["LOGIX_ONLY", "PARTNERSHIP"]).optional(),
-      from: z.iso.date().optional(),
-      to: z.iso.date().optional(),
-      page: z.coerce.number().optional(),
-      limit: z.coerce.number().optional(),
-      sort: z.enum(["oldest", "newest"]).optional(),
-    })
-    .strict()
-    .parse(query);
-  const filter = trackingScope(user),
+export async function listTracking(user, query, now = new Date()) {
+  const q = parseTrackingFilters(user, query),
+    filter = trackingScope(user),
     p = pagination(q);
+  filter.$and.push(lifecycleFilter(q));
   if (q.business) filter.$and.push({ businessType: q.business });
   if (q.stage === "LEGACY_UNINITIALIZED")
     filter.$and.push({
@@ -566,19 +583,6 @@ export async function listTracking(user, query) {
         { "createdBy.userId": objectId(q.employee) },
       ],
     });
-  if (q.issue)
-    filter.$and.push(
-      q.issue === "BLOCKING"
-        ? { "tracking.blockingIssues": { $gt: 0 } }
-        : q.issue === "OPEN"
-          ? { "tracking.openIssues": { $gt: 0 } }
-          : {
-              $or: [
-                { "tracking.openIssues": 0 },
-                { "tracking.openIssues": { $exists: false } },
-              ],
-            },
-    );
   if (q.from || q.to)
     filter.$and.push({
       createdAt: {
@@ -589,7 +593,7 @@ export async function listTracking(user, query) {
       },
     });
   const pipeline = [{ $match: filter }];
-  if (q.search || q.courierStatus) {
+  if (q.search || q.courierStatus || q.attention === "internal") {
     pipeline.push({
       $lookup: {
         from: Shipment.collection.name,
@@ -615,32 +619,101 @@ export async function listTracking(user, query) {
     }
     if (q.courierStatus)
       pipeline.push({ $match: { "parcel.status": q.courierStatus } });
+    if (q.attention === "internal")
+      pipeline.push({ $match: internalQueueFilter });
   }
-  const direction = q.sort === "oldest" ? 1 : -1;
-  pipeline.push({
-    $facet: {
-      items: [
-        { $sort: { createdAt: direction, _id: direction } },
-        { $skip: p.skip },
-        { $limit: p.limit },
-        {
-          $project: {
-            originalData: 0,
-            statusHistory: 0,
-            refunds: 0,
-            parcel: 0,
+  const predicates = quickTagFilters(user, now),
+    groups = tagCategories(q);
+  const match = matchTagCategories(groups, predicates);
+  const priorityStages =
+    q.sort === "issuesFirst"
+      ? [
+          {
+            $lookup: {
+              from: TrackingIssue.collection.name,
+              let: { order: "$_id" },
+              pipeline: [
+                {
+                  $match: {
+                    $expr: { $eq: ["$orderId", "$$order"] },
+                    status: "OPEN",
+                    "typeSnapshot.responsibleTeam": "SALES_CONFIRMATION",
+                  },
+                },
+                { $limit: 1 },
+                { $project: { _id: 1 } },
+              ],
+              as: "_salesReports",
+            },
           },
+          {
+            $set: {
+              _hasIssues: {
+                $cond: [
+                  { $gt: [{ $ifNull: ["$tracking.openIssues", 0] }, 0] },
+                  1,
+                  0,
+                ],
+              },
+              _salesAttention: { $size: "$_salesReports" },
+            },
+          },
+        ]
+      : [];
+  const direction = q.sort === "newest" ? -1 : 1;
+  const facet = {
+    items: [
+      { $match: match },
+      ...priorityStages,
+      {
+        $sort: {
+          ...(q.sort === "issuesFirst"
+            ? { _hasIssues: -1, _salesAttention: -1 }
+            : {}),
+          createdAt: direction,
+          _id: direction,
         },
-      ],
-      total: [{ $count: "value" }],
-    },
-  });
+      },
+      { $skip: p.skip },
+      { $limit: p.limit },
+      {
+        $project: {
+          originalData: 0,
+          statusHistory: 0,
+          refunds: 0,
+          parcel: 0,
+          _salesReports: 0,
+          _hasIssues: 0,
+          _salesAttention: 0,
+        },
+      },
+    ],
+    total: [{ $match: match }, { $count: "value" }],
+  };
+  // Faceted counts apply the other categories, replacing this chip's category.
+  // Every facet starts from the same authorized, searched and staged records.
+  for (const tag of QUICK_TAGS)
+    facet[tag.value] = [
+      {
+        $match: {
+          $and: [
+            matchTagCategories(groups, predicates, tag.category),
+            predicates[tag.value],
+          ],
+        },
+      },
+      { $count: "value" },
+    ];
+  pipeline.push({ $facet: facet });
   const [result] = await Order.aggregate(pipeline);
   return {
     items: await presentOrders(user, result.items),
     total: result.total[0]?.value || 0,
     page: p.page,
     limit: p.limit,
+    tagCounts: Object.fromEntries(
+      QUICK_TAGS.map((t) => [t.value, result[t.value][0]?.value || 0]),
+    ),
   };
 }
 export async function employeeOptions(user, query = {}) {

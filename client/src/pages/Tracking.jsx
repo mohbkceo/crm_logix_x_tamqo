@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { MoreHorizontal, RefreshCw, Search, Flag } from "lucide-react";
+import { MoreHorizontal, RefreshCw, Search, Flag, Star } from "lucide-react";
 import { api, useApi, params, human, date } from "../api";
 import { P, can, useUser } from "../access";
 import {
@@ -17,6 +17,11 @@ import {
   SEVERITIES,
   SEVERITY_LABELS,
 } from "../../../shared/tracking.js";
+import {
+  QUICK_TAGS,
+  defaultTrackingFilters,
+  clearTrackingFilters,
+} from "../../../shared/trackingFilters.js";
 
 function ContactLink({ contact, children }) {
   return contact?.url ? (
@@ -44,20 +49,7 @@ const age = (value) => {
 };
 export function Tracking() {
   const user = useUser();
-  const [filters, setFilters] = useState(() => ({
-    page: 1,
-    limit: 20,
-    sort: "oldest",
-    stage: can(user, P.tracking.viewAll)
-      ? ""
-      : user.operationalRoles?.includes("DESIGNER")
-        ? "PREPARING"
-        : user.operationalRoles?.some((r) =>
-              ["PRODUCTION", "PRODUCTION_MANAGER"].includes(r),
-            )
-          ? "AT_PRODUCTION"
-          : "",
-  }));
+  const [filters, setFilters] = useState(() => defaultTrackingFilters(user));
   const result = useApi("/tracking?" + params(filters));
   const types = useApi(
     can(user, P["tracking.issue"].create)
@@ -78,9 +70,50 @@ export function Tracking() {
     return () => clearInterval(timer);
   }, [result.reload]);
   const change = (key, value) => {
-    setFilters((f) => ({ ...f, [key]: value, page: 1 }));
+    setFilters((f) => ({
+      ...f,
+      [key]: value,
+      page: 1,
+      ...(key === "issue"
+        ? {
+            tags: (f.tags || "")
+              .split(",")
+              .filter(
+                (t) =>
+                  t &&
+                  QUICK_TAGS.find((tag) => tag.value === t).category !==
+                    "issue",
+              )
+              .join(","),
+          }
+        : {}),
+    }));
     setSelected([]);
   };
+  const issueTag = { OPEN: "ISSUES", BLOCKING: "BLOCKED", NONE: "NO_ISSUES" };
+  const activeTags = new Set((filters.tags || "").split(",").filter(Boolean));
+  if (filters.issue) activeTags.add(issueTag[filters.issue]);
+  function toggleTag(tag) {
+    setFilters((f) => {
+      const tags = new Set((f.tags || "").split(",").filter(Boolean));
+      if (tag.category === "issue" && f.issue) tags.add(issueTag[f.issue]);
+      if (tags.has(tag.value)) tags.delete(tag.value);
+      else tags.add(tag.value);
+      return {
+        ...f,
+        tags: [...tags].join(","),
+        page: 1,
+        ...(tag.category === "issue" ? { issue: "" } : {}),
+      };
+    });
+    setSelected([]);
+  }
+  function resetFilters(defaults) {
+    setFilters(
+      defaults ? defaultTrackingFilters(user) : clearTrackingFilters(),
+    );
+    setSelected([]);
+  }
   async function perform(operation, success = "Saved", close = false) {
     if (inFlight.current) return false;
     inFlight.current = true;
@@ -274,10 +307,73 @@ export function Tracking() {
                 >
                   <option value="oldest">Oldest first</option>
                   <option value="newest">Newest first</option>
+                  <option value="issuesFirst">
+                    Issues first · oldest within priority
+                  </option>
+                </select>
+              </Field>
+              <Field label="Order lifecycle">
+                <select
+                  value={filters.lifecycle || "ALL"}
+                  onChange={(e) => change("lifecycle", e.target.value)}
+                >
+                  <option value="ALL">All orders</option>
+                  <option value="ACTIVE">Active orders</option>
+                  <option value="COMPLETED">
+                    Completed / cancelled orders
+                  </option>
+                </select>
+              </Field>
+              <Field label="Production queue">
+                <select
+                  value={filters.attention || "all"}
+                  onChange={(e) => change("attention", e.target.value)}
+                >
+                  <option value="all">Include delivery agency orders</option>
+                  <option value="internal">Internal attention only</option>
                 </select>
               </Field>
             </div>
           </details>
+        </div>
+        <div
+          className="tracking-quick-filters"
+          role="group"
+          aria-label="Quick filters"
+        >
+          {QUICK_TAGS.map((tag) => (
+            <button
+              key={tag.value}
+              className={`tracking-filter-chip ${activeTags.has(tag.value) ? "active" : ""}`}
+              aria-pressed={activeTags.has(tag.value)}
+              disabled={busy}
+              onClick={() => toggleTag(tag)}
+              title="Counts include other filter categories; tags in this category are combined with OR."
+            >
+              {tag.label}
+              {!result.loading &&
+                result.data?.tagCounts?.[tag.value] !== undefined && (
+                  <span className="tracking-chip-count">
+                    {result.data.tagCounts[tag.value]}
+                  </span>
+                )}
+            </button>
+          ))}
+        </div>
+        <div className="tracking-filter-tools">
+          <span role="status" aria-live="polite">
+            {result.loading
+              ? "Updating results…"
+              : result.data
+                ? `${result.data.total} matching order${result.data.total === 1 ? "" : "s"}`
+                : ""}
+          </span>
+          <button disabled={busy} onClick={() => resetFilters(false)}>
+            Clear Filters
+          </button>
+          <button disabled={busy} onClick={() => resetFilters(true)}>
+            Reset to My Default View
+          </button>
         </div>
         <ErrorBox
           error={error || result.error || types.error || employees.error}
@@ -340,7 +436,10 @@ export function Tracking() {
           />
         ) : (
           <div className="tracking-list">
-            <div className="tracking-order-row tracking-head" aria-hidden="true">
+            <div
+              className="tracking-order-row tracking-head"
+              aria-hidden="true"
+            >
               <span />
               <span>Order & customer</span>
               <span>Products & specifications</span>
@@ -391,6 +490,44 @@ export function Tracking() {
                     )}
                     <div>
                       <b>{o.orderNumber}</b>
+                      {o.canMarkImportant ? (
+                        <button
+                          className={`tracking-important ${o.tracking.important ? "active" : ""}`}
+                          aria-label={`${o.tracking.important ? "Unmark" : "Mark"} ${o.orderNumber} as Important`}
+                          aria-pressed={Boolean(o.tracking.important)}
+                          disabled={busy}
+                          onClick={() =>
+                            perform(
+                              () =>
+                                api(`/tracking/${o._id}/important`, {
+                                  method: "PATCH",
+                                  body: {
+                                    important: !o.tracking.important,
+                                    expectedRevision: o.revision,
+                                  },
+                                }),
+                              o.tracking.important
+                                ? "Important flag removed"
+                                : "Marked as Important",
+                            )
+                          }
+                        >
+                          <Star
+                            size={14}
+                            fill={
+                              o.tracking.important ? "currentColor" : "none"
+                            }
+                          />
+                        </button>
+                      ) : o.tracking.important ? (
+                        <span
+                          className="tracking-important-indicator"
+                          title="Important"
+                          aria-label="Important"
+                        >
+                          <Star size={14} fill="currentColor" />
+                        </span>
+                      ) : null}
                       <strong>{o.customer.name}</strong>
                       <small>{o.customer.phoneA}</small>
                     </div>

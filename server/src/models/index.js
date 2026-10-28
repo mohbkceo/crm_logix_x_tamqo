@@ -193,6 +193,7 @@ export const Order = create(
     [{ 'tracking.stage': 1, createdAt: -1, _id: -1 }, {}],
     [{ 'tracking.designerId': 1, 'tracking.stage': 1 }, {}],
     [{ 'tracking.productionId': 1, 'tracking.stage': 1 }, {}],
+    [{ 'tracking.important': 1, createdAt: 1, _id: 1 }, {}],
     [{ businessType: 1, createdAt: -1 }, {}],
     [{ "source.id": 1, createdAt: -1 }, {}],
     [{ "customer.normalizedPhone": 1 }, {}],
