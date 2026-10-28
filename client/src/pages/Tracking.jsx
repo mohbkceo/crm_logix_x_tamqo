@@ -495,6 +495,7 @@ export function Tracking() {
                           className={`tracking-important ${o.tracking.important ? "active" : ""}`}
                           aria-label={`${o.tracking.important ? "Unmark" : "Mark"} ${o.orderNumber} as Important`}
                           aria-pressed={Boolean(o.tracking.important)}
+                          title={o.tracking.important ? "Remove Important flag" : "Mark as Important"}
                           disabled={busy}
                           onClick={() =>
                             perform(
