@@ -3,6 +3,7 @@ import { Link } from "react-router-dom";
 import { MoreHorizontal, RefreshCw, Search, Flag, Star } from "lucide-react";
 import { api, useApi, params, human, date } from "../api";
 import { P, can, useUser } from "../access";
+import { MediaGallery } from "../MediaGallery";
 import {
   PageHeader,
   ErrorBox,
@@ -482,7 +483,7 @@ export function Tracking() {
                         onClick={() => open("image", o)}
                       >
                         <img
-                          src={o.images[0].url}
+                          src={o.images[0].url + "?thumbnail=true"}
                           alt="Order reference"
                           loading="lazy"
                         />
@@ -861,7 +862,7 @@ function IssueList({ order, busy, perform }) {
   return (
     <>
       <ErrorBox error={result.error} />
-      {result.loading ? (
+      {result.loading && !result.data ? (
         <Loading />
       ) : (
         <>
@@ -894,6 +895,17 @@ function IssueList({ order, busy, perform }) {
               <ContactLink contact={i.reporterContact}>
                 Contact Reporter
               </ContactLink>
+              <details>
+                <summary>Attachments ({i.attachments?.length || 0})</summary>
+                <MediaGallery
+                  endpoint={`/issue-media/${order._id}/${i._id}`}
+                  images={i.attachments}
+                  revision={result.data.revision}
+                  editable={i.canManageAttachments}
+                  disabled={busy}
+                  onChange={result.reload}
+                />
+              </details>
               {i.status === "OPEN" &&
                 can(user, P["tracking.issue"].resolve) && (
                   <button

@@ -194,6 +194,7 @@ export const Order = create(
     [{ 'tracking.designerId': 1, 'tracking.stage': 1 }, {}],
     [{ 'tracking.productionId': 1, 'tracking.stage': 1 }, {}],
     [{ 'tracking.important': 1, createdAt: 1, _id: 1 }, {}],
+    [{ 'images.public_id': 1 }, { sparse: true }],
     [{ businessType: 1, createdAt: -1 }, {}],
     [{ "source.id": 1, createdAt: -1 }, {}],
     [{ "customer.normalizedPhone": 1 }, {}],

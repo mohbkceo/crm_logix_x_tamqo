@@ -26,6 +26,7 @@ import {
 import { mapProviderStatus } from "./delivery/deliveryStatusMapper.js";
 import { whatsAppUrl } from "../domain/whatsapp.js";
 import { QUICK_TAGS } from "../../../shared/trackingFilters.js";
+import { canManageIssueMedia } from "./mediaAccess.js";
 import {
   parseTrackingFilters,
   lifecycleFilter,
@@ -424,6 +425,11 @@ export async function listIssues(user, id, query) {
   return {
     items: items.map((i) => ({
       ...i,
+      canManageAttachments: canManageIssueMedia(user, i),
+      attachments: (i.attachments || []).map((image) => ({
+        _id: image._id,
+        url: `/api/issue-media/${order._id}/${i._id}/${image._id}`,
+      })),
       reporterContact: contact(
         contacts.find((u) => String(u._id) === String(i.reporter.userId)),
         can(user, P["tracking.contacts"].view),

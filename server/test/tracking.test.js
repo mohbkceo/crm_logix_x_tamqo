@@ -1,4 +1,5 @@
-import { before, after, beforeEach, test } from "node:test";
+import { before, after, beforeEach, test, mock } from "node:test";
+import { fakeCloudinary } from "./fixtures/cloudinary.js";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
 import { mkdtemp, rm } from "node:fs/promises";
@@ -67,6 +68,7 @@ const basePermissions = [
 ];
 before(
   async () => {
+    fakeCloudinary(mock);
     delete process.env.DELIVERY_API_TOKEN;
     delete process.env.DELIVERY_API_KEY;
     replica = await MongoMemoryReplSet.create({

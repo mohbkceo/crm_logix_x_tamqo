@@ -28,7 +28,16 @@ export const trackingSchema = new Schema(
   { _id: false },
 );
 export const imageSchema = new Schema({
-  key: { type: String, required: true },
+  // Retained for historical files and migration rollback; new uploads have no key.
+  key: String,
+  public_id: String,
+  secure_url: String,
+  resource_type: { type: String, enum: ["image"] },
+  type: { type: String, enum: ["authenticated"] },
+  version: Number,
+  format: String,
+  sha256: String,
+  migratedAt: Date,
   mime: String,
   size: Number,
   width: Number,
@@ -76,6 +85,7 @@ const issueSchema = new Schema(
     severity: { type: String, enum: SEVERITIES, required: true },
     blocking: { type: Boolean, required: true },
     description: { type: String, maxlength: 2000, default: "" },
+    attachments: { type: [imageSchema], default: [] },
     reporter: { type: actorSchema, required: true },
     reporterRoles: [{ type: String, enum: OPERATIONAL_ROLES }],
     status: { type: String, enum: ["OPEN", "RESOLVED"], default: "OPEN" },
@@ -87,6 +97,7 @@ const issueSchema = new Schema(
 );
 issueSchema.index({ orderId: 1, requestId: 1 }, { unique: true });
 issueSchema.index({ orderId: 1, status: 1, createdAt: -1 });
+issueSchema.index({ "attachments.public_id": 1 }, { sparse: true });
 export const TrackingIssue = mongoose.model("TrackingIssue", issueSchema);
 const eventSchema = new Schema({
   orderId: { type: Schema.Types.ObjectId, ref: "Order", required: true },

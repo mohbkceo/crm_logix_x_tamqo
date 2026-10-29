@@ -20,7 +20,8 @@
     "test:delivery-browser": "node scripts/delivery-browser-check.js",
     "test:tracking-browser": "node scripts/tracking-browser-check.js",
     "format": "prettier --write \"client/src/**/*.{js,jsx,css}\" \"server/**/*.js\" \"scripts/*.js\"",
-    "migrate": "node server/src/migrate.js"
+    "migrate": "node server/src/migrate.js",
+    "media:migrate": "node server/src/media.js"
   },
   "devDependencies": {
     "@eslint/js": "^9.39.1",

@@ -48,6 +48,7 @@ import {
   Modal,
 } from "../components";
 import { P, Can, useUser, can, hasBusinessAccess } from "../access";
+import { MediaGallery, OptionalImagePreview } from "../MediaGallery";
 const statuses = [
   "NEW",
   "CONFIRMED",
@@ -1264,7 +1265,21 @@ export function OrderDetails() {
         <ErrorBox error={`Order saved. ${location.state.shipmentSync.error}`} />
       )}
       <ErrorBox error={location.state?.imageWarning} />
-      {o.images?.length > 0 && <div className="tracking-image-strip">{o.images.map(i => <a key={i._id} href={`/api/order-media/${o._id}/${i._id}`} target="_blank" rel="noopener noreferrer"><img src={`/api/order-media/${o._id}/${i._id}`} alt="Order reference" /></a>)}</div>}
+      {(o.images?.length > 0 || canEdit) && (
+        <Panel title="Order images">
+          <div className="detail-body">
+            <MediaGallery
+              key={o._id}
+              endpoint={`/order-media/${o._id}`}
+              images={o.images}
+              revision={o.revision}
+              editable={canEdit}
+              disabled={busy}
+              onChange={order.reload}
+            />
+          </div>
+        </Panel>
+      )}
       {message && (
         <div className="success" role="status">
           <Check size={16} />
@@ -1884,9 +1899,4 @@ export function OrderDetails() {
       )}
     </>
   );
-}
-function OptionalImagePreview({ file }) {
-  const [url, setUrl] = useState('');
-  useEffect(() => { const next = URL.createObjectURL(file); setUrl(next); return () => URL.revokeObjectURL(next); }, [file]);
-  return url ? <img src={url} alt={file.name} /> : null;
 }

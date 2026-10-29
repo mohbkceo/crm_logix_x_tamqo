@@ -241,6 +241,8 @@ Order filters: `search`, `business` (`TAMQO_ONLY`, `LOGIX_ONLY`, `PARTNERSHIP`),
 
 ## Production deployment
 
+Image storage requires the backend-only `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY`, and `CLOUDINARY_API_SECRET` variables. Existing image volumes must remain mounted during migration. See [Cloudinary setup and safe migration](docs/cloudinary.md) for dry-run/apply/verify commands, private previews, Tracking attachments and cleanup recovery.
+
 1. Provision a backed-up MongoDB replica set or Atlas database; restrict database network access and use an application-specific account.
 2. Install locked dependencies with `npm ci`; build with `npm run build`.
 3. Configure `NODE_ENV=production`, first-Super-Admin bootstrap credentials, a random session secret, the delivery encryption key, `MONGODB_URI`, and `CLIENT_URL` matching the HTTPS public origin. Set only verified provider mappings.

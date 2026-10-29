@@ -82,9 +82,11 @@ Existing employees may still sign in when WhatsApp becomes required. The profile
 
 ## Images and deployment
 
-No media credentials are required. The storage adapter defaults to `server/storage/order-images`; set `MEDIA_STORAGE_DIR` to durable storage in production and share that volume across API replicas. Back up that directory with MongoDB. Uploads are authenticated, limited to six images per order and 5 MB per file, decoded with Sharp (maximum 25 megapixels), checked against JPEG/PNG/WebP MIME, stripped of original metadata and re-encoded as WebP up to 1600px. Server-generated filenames and validated references prevent path traversal. Image responses recheck Order/business access and use private, no-store caching.
+New images use Cloudinary with backend-only `CLOUDINARY_CLOUD_NAME`, `CLOUDINARY_API_KEY` and `CLOUDINARY_API_SECRET`. Keep `MEDIA_STORAGE_DIR` mounted for historical files until migration is verified. Uploads remain limited to six JPEG/PNG/WebP images per order/report, 5 MB each and 25 megapixels. Previews recheck access and use private, no-store caching. See [Cloudinary configuration, migration and cleanup](cloudinary.md).
 
 Order creation commits before optional image uploads. Upload failures leave the order intact and display a warning with a retry route through Edit order. MongoDB transactions require a replica set, as the existing CRM already does. No new external service configuration blocks startup.
+
+Order details supports replacement/removal with existing update permissions. The Reports modal supports attachments after report submission, using existing report permissions. Media mutations do not change production stages or report resolution. Cloudinary replacement/removal queues reference-checked deletion; historical local files remain untouched.
 
 ## API
 

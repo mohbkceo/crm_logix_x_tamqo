@@ -7,10 +7,13 @@ import assert from "node:assert/strict";
 import { mkdir, mkdtemp, rm } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { mock } from "node:test";
+import { fakeCloudinary } from "../server/test/fixtures/cloudinary.js";
 process.env.NODE_ENV = "test";
 process.env.CLIENT_URL = "http://127.0.0.1:4023";
 const media = await mkdtemp(path.join(os.tmpdir(), "crm-tracking-browser-"));
 process.env.MEDIA_STORAGE_DIR = media;
+fakeCloudinary(mock);
 const replica = await MongoMemoryReplSet.create({
   replSet: { count: 1, storageEngine: "wiredTiger" },
 });
@@ -266,6 +269,19 @@ try {
   await expect(
     dialog.getByRole("link", { name: "Contact Reporter" }),
   ).toHaveAttribute("href", "https://wa.me/213770987654");
+  const imageFile = { name: "attachment.png", mimeType: "image/png", buffer: image };
+  await dialog.getByText("Attachments (0)", { exact: true }).click();
+  await dialog.getByLabel("Add image", { exact: true }).setInputFiles(imageFile);
+  await dialog.getByRole("button", { name: "Upload image", exact: true }).click();
+  await dialog.getByText("Attachments (1)", { exact: true }).waitFor();
+  const firstAttachment = (await TrackingIssue.findOne({ orderId: saved._id })).attachments[0].public_id;
+  await dialog.getByLabel("Replace image 1", { exact: true }).setInputFiles(imageFile);
+  await dialog.getByRole("button", { name: "Replace image", exact: true }).click();
+  await expect.poll(async () => (await TrackingIssue.findOne({ orderId: saved._id })).attachments[0].public_id).not.toBe(firstAttachment);
+  await expect(dialog.getByRole("button", { name: "Replace image", exact: true })).toHaveCount(0);
+  await dialog.getByRole("button", { name: "Remove image 1", exact: true }).click();
+  await dialog.getByText("Attachments (0)", { exact: true }).waitFor();
+  assert.equal((await Order.findById(saved._id)).tracking.stage, "PREPARING");
   await dialog.getByRole("button", { name: "Resolve", exact: true }).click();
   await dialog.getByText(/Resolved by designer/).waitFor();
   assert.equal(await dialog.getByRole("textbox").count(), 0);
@@ -417,10 +433,27 @@ try {
   assert.equal((await Order.findById(saved._id)).status, "NEW");
   assert.equal(await Shipment.countDocuments(), 0);
   assert.deepEqual(courierCalls, []);
+  await goto(`/orders/${saved._id}`);
+  const firstOrderImage = (await Order.findById(saved._id)).images[0].public_id;
+  await page.getByLabel("Replace image 1", { exact: true }).setInputFiles(imageFile);
+  await page.getByRole("button", { name: "Replace image", exact: true }).click();
+  await expect.poll(async () => (await Order.findById(saved._id)).images[0].public_id).not.toBe(firstOrderImage);
+  await expect(page.getByRole("button", { name: "Replace image", exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "Remove image 1", exact: true }).click();
+  await expect(page.getByLabel("Replace image 1", { exact: true })).toHaveCount(0);
+  await page.getByLabel("Add image", { exact: true }).setInputFiles(imageFile);
+  await page.getByRole("button", { name: "Upload image", exact: true }).click();
+  await page.getByLabel("Replace image 1", { exact: true }).waitFor();
+  await expect.poll(async () => page.getByAltText("Reference image 1", { exact: true }).evaluate(img => img.naturalWidth)).toBeGreaterThan(0);
+  await page.screenshot({ path: path.join(output, "cloudinary-order.png"), fullPage: true });
+  await page.setViewportSize({ width: 390, height: 844 });
+  await expect.poll(async () => (await page.locator(".sidebar").boundingBox()).x + (await page.locator(".sidebar").boundingBox()).width).toBeLessThanOrEqual(0);
+  await page.screenshot({ path: path.join(output, "cloudinary-order-mobile.png"), fullPage: true });
+  assert.ok(await page.evaluate(() => document.documentElement.scrollWidth <= innerWidth + 1), "Order media controls must fit mobile viewport");
   assert.deepEqual(errors, []);
   assert.deepEqual(failedRequests, []);
   console.log(
-    "Tracking browser passed: sales creation with image; Designer toggle; unified report and one-click resolve; Production single and bulk; role visibility; desktop/mobile; settings and profile; no console/API errors or courier requests.",
+    "Tracking browser passed: Cloudinary order/report upload, preview, replacement and removal; sales creation; Designer toggle; reports/resolve; Production single/bulk; role visibility; desktop/mobile; settings/profile; no console/API errors or courier requests.",
   );
   console.log(`Screenshots: ${output}`);
 } finally {
