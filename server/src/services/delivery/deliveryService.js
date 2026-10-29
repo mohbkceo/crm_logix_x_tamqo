@@ -222,10 +222,10 @@ export const deliveryService = {
     );
     return result;
   },
-  async ready(id, actor) {
+  async ready(id, actor, options = {}) {
     const { service } = await context(id, "readyToShip");
     const result = service
-      ? await service.ready(id, actor)
+      ? await service.ready(id, actor, options)
       : await transition(id, "READY_TO_SHIP", actor);
     await event(id, actor, "Marked ready");
     return result;
