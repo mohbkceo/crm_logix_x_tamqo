@@ -1,7 +1,16 @@
 import { useEffect, useRef, useState } from "react";
 import { Link } from "react-router-dom";
-import { MoreHorizontal, RefreshCw, Search, Flag, Star } from "lucide-react";
-import { api, useApi, params, human, date } from "../api";
+import {
+  ArrowLeft,
+  ArrowRight,
+  X,
+  MoreHorizontal,
+  RefreshCw,
+  Search,
+  Flag,
+  Star,
+} from "lucide-react";
+import { api, useApi, params, money, human, date } from "../api";
 import { P, can, useUser } from "../access";
 import { MediaGallery } from "../MediaGallery";
 import {
@@ -23,6 +32,7 @@ import {
   defaultTrackingFilters,
   clearTrackingFilters,
 } from "../../../shared/trackingFilters.js";
+import "./tracking-redesign.css";
 
 function ContactLink({ contact, children }) {
   return contact?.url ? (
@@ -48,6 +58,124 @@ const age = (value) => {
       ? `${hours}h in stage`
       : `${Math.floor(hours / 24)}d ${hours % 24}h in stage`;
 };
+/** Full-size, keyboard-accessible order image preview. */
+function TrackingImageViewer({ order, onClose }) {
+  const [index, setIndex] = useState(0);
+  const closeRef = useRef(null);
+  const onCloseRef = useRef(onClose);
+  onCloseRef.current = onClose;
+  const images = order.images || [];
+  const count = images.length;
+
+  useEffect(() => {
+    const previousOverflow = document.body.style.overflow;
+    const previouslyFocused = document.activeElement;
+    document.body.style.overflow = "hidden";
+    closeRef.current?.focus();
+    const onKeyDown = (event) => {
+      if (event.key === "Escape") onCloseRef.current();
+      if (event.key === "ArrowRight" && count > 1)
+        setIndex((current) => (current + 1) % count);
+      if (event.key === "ArrowLeft" && count > 1)
+        setIndex((current) => (current - 1 + count) % count);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.body.style.overflow = previousOverflow;
+      document.removeEventListener("keydown", onKeyDown);
+      previouslyFocused?.focus?.();
+    };
+  }, [count]);
+
+  if (!count) return null;
+  return (
+    <div
+      className="tracking-image-overlay"
+      role="presentation"
+      onClick={(event) => {
+        // Clicking/tapping the dark backdrop dismisses the preview.
+        if (event.target === event.currentTarget) onClose();
+      }}
+    >
+      <section
+        className="tracking-image-dialog"
+        role="dialog"
+        aria-modal="true"
+        aria-label={`Order images for ${order.customer?.name || "customer"}`}
+      >
+        <header className="tracking-image-toolbar">
+          <div className="tracking-image-heading">
+            <strong>{order.customer?.name || "Order images"}</strong>
+            <span>
+              {index + 1} of {count}
+            </span>
+          </div>
+          <button
+            ref={closeRef}
+            type="button"
+            className="tracking-image-close"
+            onClick={onClose}
+            aria-label="Close image preview"
+          >
+            <X size={20} />
+          </button>
+        </header>
+        <div className="tracking-image-stage">
+          {count > 1 && (
+            <button
+              type="button"
+              className="tracking-image-nav"
+              aria-label="Previous image"
+              onClick={() =>
+                setIndex((current) => (current - 1 + count) % count)
+              }
+            >
+              <ArrowLeft size={20} />
+            </button>
+          )}
+          <img
+            key={images[index]._id || images[index].url}
+            src={images[index].url}
+            alt={`Order reference ${index + 1} of ${count}`}
+            title="Click or tap to close preview"
+            onClick={onClose}
+          />
+          {count > 1 && (
+            <button
+              type="button"
+              className="tracking-image-nav"
+              aria-label="Next image"
+              onClick={() => setIndex((current) => (current + 1) % count)}
+            >
+              <ArrowRight size={20} />
+            </button>
+          )}
+        </div>
+        {count > 1 && (
+          <nav className="tracking-image-thumbnails" aria-label="Choose image">
+            {images.map((image, position) => (
+              <button
+                type="button"
+                key={image._id || position}
+                aria-label={`Show image ${position + 1}`}
+                aria-current={position === index ? "true" : undefined}
+                className={position === index ? "active" : ""}
+                onClick={() => setIndex(position)}
+              >
+                <img
+                  src={image.url + "?thumbnail=true"}
+                  alt=""
+                  loading="lazy"
+                />
+              </button>
+            ))}
+          </nav>
+        )}
+      </section>
+    </div>
+  );
+}
+
 export function Tracking() {
   const user = useUser();
   const [filters, setFilters] = useState(() => defaultTrackingFilters(user));
@@ -190,11 +318,11 @@ export function Tracking() {
     ),
   );
   return (
-    <>
+    <div className="tracking-page">
       <PageHeader
-        eyebrow="WORKSPACE / TRACKING"
+        eyebrow="OPERATIONS / TRACKING"
         title="Tracking"
-        description="Production progress, reports and delivery status in one place."
+        description="Production progress and order status, at a glance."
       >
         <button
           onClick={result.reload}
@@ -442,10 +570,11 @@ export function Tracking() {
               aria-hidden="true"
             >
               <span />
-              <span>Order & customer</span>
-              <span>Products & specifications</span>
-              <span>Production Note / status</span>
-              <span>Responsible & courier</span>
+              <span>Customer</span>
+              <span>Total price</span>
+              <span>Products</span>
+              <span>Production</span>
+              <span>Responsible / courier</span>
               <span>Actions</span>
             </div>
             {rows.map((o) => {
@@ -489,52 +618,65 @@ export function Tracking() {
                         />
                       </button>
                     )}
-                    <div>
-                      <b>{o.orderNumber}</b>
-                      {o.canMarkImportant ? (
-                        <button
-                          className={`tracking-important ${o.tracking.important ? "active" : ""}`}
-                          aria-label={`${o.tracking.important ? "Unmark" : "Mark"} ${o.orderNumber} as Important`}
-                          aria-pressed={Boolean(o.tracking.important)}
-                          title={o.tracking.important ? "Remove Important flag" : "Mark as Important"}
-                          disabled={busy}
-                          onClick={() =>
-                            perform(
-                              () =>
-                                api(`/tracking/${o._id}/important`, {
-                                  method: "PATCH",
-                                  body: {
-                                    important: !o.tracking.important,
-                                    expectedRevision: o.revision,
-                                  },
-                                }),
+                    <div className="tracking-person-main">
+                      <div className="tracking-name-line">
+                        <strong>{o.customer.name}</strong>
+                        {o.canMarkImportant ? (
+                          <button
+                            className={`tracking-important ${o.tracking.important ? "active" : ""}`}
+                            aria-label={`${o.tracking.important ? "Unmark" : "Mark"} ${o.orderNumber} as Important`}
+                            aria-pressed={Boolean(o.tracking.important)}
+                            title={
                               o.tracking.important
-                                ? "Important flag removed"
-                                : "Marked as Important",
-                            )
-                          }
-                        >
-                          <Star
-                            size={14}
-                            fill={
-                              o.tracking.important ? "currentColor" : "none"
+                                ? "Remove Important flag"
+                                : "Mark as Important"
                             }
-                          />
-                        </button>
-                      ) : o.tracking.important ? (
-                        <span
-                          className="tracking-important-indicator"
-                          title="Important"
-                          aria-label="Important"
-                        >
-                          <Star size={14} fill="currentColor" />
-                        </span>
-                      ) : null}
-                      <strong>{o.customer.name}</strong>
+                            disabled={busy}
+                            onClick={() =>
+                              perform(
+                                () =>
+                                  api(`/tracking/${o._id}/important`, {
+                                    method: "PATCH",
+                                    body: {
+                                      important: !o.tracking.important,
+                                      expectedRevision: o.revision,
+                                    },
+                                  }),
+                                o.tracking.important
+                                  ? "Important flag removed"
+                                  : "Marked as Important",
+                              )
+                            }
+                          >
+                            <Star
+                              size={14}
+                              fill={
+                                o.tracking.important ? "currentColor" : "none"
+                              }
+                            />
+                          </button>
+                        ) : o.tracking.important ? (
+                          <span
+                            className="tracking-important-indicator"
+                            title="Important"
+                            aria-label="Important"
+                          >
+                            <Star size={14} fill="currentColor" />
+                          </span>
+                        ) : null}
+                      </div>
                       <small>{o.customer.phoneA}</small>
                     </div>
                   </div>
-                  <div className="tracking-products">
+                  <div className="tracking-price" data-label="Total price">
+                    {o.totalOrderValue != null &&
+                    Number.isFinite(Number(o.totalOrderValue)) ? (
+                      money(o.totalOrderValue)
+                    ) : (
+                      <span className="tracking-not-available">—</span>
+                    )}
+                  </div>
+                  <div className="tracking-products" data-label="Products">
                     {o.items.map((i, n) => (
                       <div key={n}>
                         <b>
@@ -543,9 +685,8 @@ export function Tracking() {
                         {i.specifications && <small>{i.specifications}</small>}
                       </div>
                     ))}
-                    {o.note && <small>Order note: {o.note}</small>}
                   </div>
-                  <div className="tracking-stage">
+                  <div className="tracking-stage" data-label="Production">
                     <button
                       disabled={busy || !target}
                       onClick={() => move(o, target)}
@@ -589,7 +730,10 @@ export function Tracking() {
                       </button>
                     )}
                   </div>
-                  <div className="tracking-responsible">
+                  <div
+                    className="tracking-responsible"
+                    data-label="Responsible / courier"
+                  >
                     <span>
                       {o.responsible.name || "No internal employee assigned"}
                     </span>
@@ -625,6 +769,9 @@ export function Tracking() {
                         <span className="sr-only">More</span>
                       </summary>
                       <div>
+                        <span className="tracking-more-reference">
+                          {o.orderNumber}
+                        </span>
                         <ContactLink contact={o.creatorContact}>
                           Contact Order Creator
                         </ContactLink>
@@ -713,9 +860,15 @@ export function Tracking() {
           />
         )}
       </div>
-      {modal && (
+      {modal?.kind === "image" && (
+        <TrackingImageViewer
+          order={modal.order}
+          onClose={() => setModal(null)}
+        />
+      )}
+      {modal && modal.kind !== "image" && (
         <Modal
-          title={`${modal.kind === "report" ? "Report" : modal.kind === "issues" ? "Reports" : modal.kind === "assign" ? "Assignment" : modal.kind === "image" ? "Order images" : "Tracking audit"} · ${modal.order.orderNumber}`}
+          title={`${modal.kind === "report" ? "Report" : modal.kind === "issues" ? "Reports" : modal.kind === "assign" ? "Assignment" : "Tracking audit"} · ${modal.order.orderNumber}`}
           onClose={() => !busy && setModal(null)}
         >
           <div className="modal-body">
@@ -765,22 +918,13 @@ export function Tracking() {
                 }
               />
             )}
-            {modal.kind === "image" &&
-              modal.order.images.map((i) => (
-                <img
-                  key={i._id}
-                  className="tracking-preview"
-                  src={i.url}
-                  alt="Order reference"
-                />
-              ))}
             {modal.kind === "history" && (
               <TrackingHistory order={modal.order} />
             )}
           </div>
         </Modal>
       )}
-    </>
+    </div>
   );
 }
 function ReportForm({ types, busy, onSend }) {
