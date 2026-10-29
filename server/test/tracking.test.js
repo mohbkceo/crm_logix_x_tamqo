@@ -32,6 +32,7 @@ import {
 } from "../src/models/tracking.js";
 import { createOrder } from "../src/services/orderService.js";
 import { DeliverySyncService } from "../src/services/delivery/deliverySyncService.js";
+import { DeliveryClient } from "../src/services/delivery/deliveryClient.js";
 import {
   moveStage,
   listTracking,
@@ -262,30 +263,79 @@ test("new physical orders initialize independently; TAMQO stays outside Tracking
   assert.equal(result.items[0].note, "Original order note");
   assert.equal(result.items[0].totalOrderValue, undefined);
 });
-test("designer directly toggles Preparing and At Production; production toggles Ready both ways without courier writes", async () => {
-  const o = await order(),
-    s = await parcel(o),
-    beforeShipment = snapshot(s),
-    payment = snapshot(o.payment);
-  for (const [user, to, revision] of [
-    [designer.user, "AT_PRODUCTION", 0],
-    [designer.user, "PREPARING", 1],
-    [designer.user, "AT_PRODUCTION", 2],
-    [production.user, "READY_TO_SHIP", 3],
-    [production.user, "AT_PRODUCTION", 4],
-  ])
-    await moveStage(user, String(o._id), stage(to, revision));
+test("Designer toggles locally; Production Ready confirms ABEX /pret and locks the order", async () => {
+  const o = await order(), s = await parcel(o), payment = snapshot(o.payment);
+  let readyCalls = 0;
+  const stub = mock.method(DeliveryClient.prototype, "readyPackages", async (trackings) => {
+    readyCalls++;
+    assert.deepEqual(trackings, [s.tracking]);
+    return { Colis: [{ Tracking: s.tracking, MessageRetour: "Good" }] };
+  });
+  try {
+    for (const [to, revision] of [
+      ["AT_PRODUCTION", 0],
+      ["PREPARING", 1],
+      ["AT_PRODUCTION", 2],
+    ])
+      await moveStage(designer.user, String(o._id), stage(to, revision));
+    assert.equal((await Order.findById(o._id)).status, "NEW");
+    assert.equal((await Shipment.findById(s._id)).status, "PREPARING");
+    const result = await moveStage(production.user, String(o._id), stage("READY_TO_SHIP", 3));
+    const current = await Order.findById(o._id), parcelState = await Shipment.findById(s._id);
+    assert.equal(readyCalls, 1);
+    assert.equal(current.status, "READY_TO_SHIP");
+    assert.equal(current.tracking.stage, "READY_TO_SHIP");
+    assert.equal(current.tracking.courierOwned, true);
+    assert.equal(parcelState.status, "READY_TO_SHIP");
+    assert.equal(parcelState.syncStatus, "SYNCED");
+    assert.equal(result.revision, current.revision);
+    assert.deepEqual(snapshot(current.payment), payment);
+    assert.equal(await TrackingEvent.countDocuments({ orderId: o._id }), 4);
+    assert.equal((await TrackingEvent.findOne({ kind: "TRACKING_STAGE_CHANGED", newStage: "READY_TO_SHIP" })).data.courierReadinessConfirmed, true);
+    assert.equal((await OrderEvent.findOne({ orderId: o._id, toStatus: "READY_TO_SHIP" })).source, "DELIVERY_PROVIDER");
+    await assert.rejects(moveStage(production.user, String(o._id), stage("AT_PRODUCTION", current.revision)), { status: 409 });
+    const event = await TrackingEvent.findOne({ revision: 1 });
+    assert.equal(event.previousStage, "PREPARING");
+    assert.equal(event.newStage, "AT_PRODUCTION");
+    assert.equal(String(event.actor.userId), String(designer.user._id));
+    assert.equal(event.source, "TRACKING");
+  } finally {
+    stub.mock.restore();
+  }
+});
+
+test("ABEX rejection leaves production at At Production and requires reconciliation", async () => {
+  const o = await order(), s = await parcel(o);
+  await moveStage(designer.user, String(o._id), stage("AT_PRODUCTION"));
+  const stub = mock.method(DeliveryClient.prototype, "readyPackages", async () =>
+    ({ Colis: [{ Tracking: s.tracking, MessageRetour: "Rejected" }] }));
+  try {
+    await assert.rejects(
+      moveStage(production.user, String(o._id), stage("READY_TO_SHIP", 1)),
+      { status: 502 },
+    );
+    const current = await Order.findById(o._id);
+    assert.equal(current.status, "NEW");
+    assert.equal(current.tracking.stage, "AT_PRODUCTION");
+    const failed = await Shipment.findById(s._id);
+    assert.equal(failed.syncStatus, "ERROR");
+    assert.equal(failed.uncertain, true);
+    assert.equal(await TrackingEvent.countDocuments({ orderId: o._id }), 1);
+  } finally {
+    stub.mock.restore();
+  }
+});
+
+test("Ready requires a linked agency tracking number and never advances locally alone", async () => {
+  const o = await order();
+  await moveStage(designer.user, String(o._id), stage("AT_PRODUCTION"));
+  await assert.rejects(
+    moveStage(production.user, String(o._id), stage("READY_TO_SHIP", 1)),
+    { status: 409 },
+  );
   const current = await Order.findById(o._id);
+  assert.equal(current.tracking.stage, "AT_PRODUCTION");
   assert.equal(current.status, "NEW");
-  assert.deepEqual(snapshot(current.payment), payment);
-  assert.deepEqual(snapshot(await Shipment.findById(s._id)), beforeShipment);
-  assert.equal(await TrackingEvent.countDocuments({ orderId: o._id }), 5);
-  const event = await TrackingEvent.findOne({ revision: 1 });
-  assert.equal(event.previousStage, "PREPARING");
-  assert.equal(event.newStage, "AT_PRODUCTION");
-  assert.equal(String(event.actor.userId), String(designer.user._id));
-  assert.ok(event.at);
-  assert.equal(event.source, "TRACKING");
 });
 test("unauthorized role actions and production financial edits are rejected on server", async () => {
   const o = await order();
@@ -431,27 +481,29 @@ test("blocking reports and critical reports lock production until resolution", a
     { status: 409 },
   );
 });
-test("bulk updates give per-order results with no partial individual writes", async () => {
-  const good = await order(),
-    bad = await order();
+test("bulk Ready sends /pret for eligible ABEX orders and isolates failures", async () => {
+  const good = await order(), bad = await order();
+  const parcelState = await parcel(good);
   await moveStage(designer.user, String(good._id), stage("AT_PRODUCTION"));
-  const response = await production.api.post("/api/tracking/bulk-stage").send({
-    orders: [
-      { orderId: String(good._id), ...stage("READY_TO_SHIP", 1) },
-      { orderId: String(bad._id), ...stage("READY_TO_SHIP") },
-    ],
-  });
-  assert.equal(response.status, 200);
-  assert.deepEqual(
-    response.body.results.map((r) => r.success),
-    [true, false],
-  );
-  assert.equal((await Order.findById(bad._id)).revision, 0);
-  assert.equal(
-    (await designer.api.post("/api/tracking/bulk-stage").send({ orders: [] }))
-      .status,
-    403,
-  );
+  const stub = mock.method(DeliveryClient.prototype, "readyPackages", async (trackings) => ({
+    Colis: trackings.map((tracking) => ({ Tracking: tracking, MessageRetour: "Good" })),
+  }));
+  try {
+    const response = await production.api.post("/api/tracking/bulk-stage").send({
+      orders: [
+        { orderId: String(good._id), ...stage("READY_TO_SHIP", 1) },
+        { orderId: String(bad._id), ...stage("READY_TO_SHIP") },
+      ],
+    });
+    assert.equal(response.status, 200);
+    assert.deepEqual(response.body.results.map((r) => r.success), [true, false]);
+    assert.equal((await Order.findById(good._id)).status, "READY_TO_SHIP");
+    assert.equal((await Shipment.findById(parcelState._id)).status, "READY_TO_SHIP");
+    assert.equal((await Order.findById(bad._id)).revision, 0);
+    assert.equal((await designer.api.post("/api/tracking/bulk-stage").send({ orders: [] })).status, 403);
+  } finally {
+    stub.mock.restore();
+  }
 });
 test("migration repeated twice preserves historical courier statuses, finances, notes and tracking IDs", async () => {
   const originals = [];
