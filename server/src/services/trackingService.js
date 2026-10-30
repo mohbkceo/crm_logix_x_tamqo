@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { Order, Shipment } from "../models/index.js";
+import { DeliveryAgency } from "../models/delivery.js";
 import { User, audit } from "../models/security.js";
 import {
   TrackingIssue,
@@ -16,6 +17,7 @@ import {
 } from "../authorization.js";
 import { assert } from "../errors.js";
 import { transaction } from "./orderService.js";
+import { deliveryService } from "./delivery/deliveryService.js";
 import { objectId, pagination, escapeRegex } from "./filters.js";
 import {
   COURIER_STAGES,
@@ -169,8 +171,72 @@ async function mutate(user, id, expectedRevision, operation) {
     };
   });
 }
+async function moveToCourierReady(user, id, data) {
+  // Validate before sending any external request; bulk and single actions use this path.
+  const order = await accessibleOrder(user, id);
+  assert(
+    order.revision === data.expectedRevision,
+    "This order changed. Refresh and try again.",
+    409,
+    "CONFLICT",
+  );
+  const [shipment, agency] = await Promise.all([
+    Shipment.findOne({ orderId: order._id }),
+    DeliveryAgency.findById(order.delivery.agencyId),
+  ]);
+  assert(
+    stageTargets(user, order, shipment).includes("READY_TO_SHIP"),
+    "Production is locked by courier ownership, a pending courier operation, or a blocking report.",
+    409,
+  );
+  assert(
+    agency?.integrationType === "API" &&
+      agency.apiProvider === "PROCOLIS" &&
+      agency.capabilities?.readyToShip,
+    "This delivery agency cannot confirm readiness automatically.",
+    409,
+  );
+  assert(
+    shipment?.tracking && !shipment.uncertain,
+    "Reconcile and link the courier parcel before marking it ready.",
+    409,
+  );
+
+  // The provider's /pret acknowledgement must arrive BEFORE the local stage moves.
+  // A single database transaction then records the commercial and production states.
+  await deliveryService.ready(order._id, actor(user), {
+    expectedRevision: data.expectedRevision,
+    onConfirmed: async (confirmedOrder, session) => {
+      assert(
+        confirmedOrder.tracking?.stage === "AT_PRODUCTION",
+        "Production changed while courier readiness was being confirmed.",
+        409,
+      );
+      const previous = confirmedOrder.tracking.stage;
+      confirmedOrder.tracking.stage = "READY_TO_SHIP";
+      confirmedOrder.tracking.stageEnteredAt = new Date();
+      await writeEvent(
+        confirmedOrder,
+        user,
+        "TRACKING_STAGE_CHANGED",
+        previous,
+        session,
+        { courierReadinessConfirmed: true },
+      );
+    },
+  });
+  const current = await Order.findById(order._id);
+  return {
+    orderId: current._id,
+    revision: current.revision,
+    tracking: current.tracking,
+  };
+}
+
 export async function moveStage(user, id, payload) {
   const data = stageInput.parse(payload);
+  if (data.targetStage === "READY_TO_SHIP")
+    return moveToCourierReady(user, id, data);
   return mutate(user, id, data.expectedRevision, async (order, session) => {
     const shipment = await Shipment.findOne({ orderId: order._id }).session(
       session,

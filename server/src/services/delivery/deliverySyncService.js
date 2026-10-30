@@ -445,67 +445,123 @@ export class DeliverySyncService {
       throw error;
     }
   }
-  async ready(orderId, actor) {
+  async ready(orderId, actor, options = {}) {
     const s = await Shipment.findOne({ orderId }),
       o = await Order.findById(orderId);
     assert(o, "Order not found", 404);
     assert(!o.deletedAt, "Deleted orders cannot synchronize shipments.", 409);
     assert(
-      o.status === "PREPARING" || o.status === "READY_TO_SHIP",
+      (options.onConfirmed
+        ? ["NEW", "CONFIRMED", "PREPARING", "READY_TO_SHIP"]
+        : ["PREPARING", "READY_TO_SHIP"]
+      ).includes(o.status),
       "Prepare this order first.",
       409,
     );
+    if (options.expectedRevision !== undefined)
+      assert(
+        o.revision === options.expectedRevision,
+        "This order changed. Refresh and try again.",
+        409,
+        "CONFLICT",
+      );
     assert(
       !s?.creationAttemptedAt || s.tracking,
       "Reconcile the courier parcel before marking ready.",
       409,
     );
+    if (options.onConfirmed)
+      assert(
+        s?.tracking && !s.uncertain,
+        "A verified tracking number is required to confirm courier readiness.",
+        409,
+      );
     if (!s?.tracking) return transition(orderId, "READY_TO_SHIP", actor);
-    if (o.status === 'READY_TO_SHIP' && s.status === 'READY_TO_SHIP') return s;
-    await transaction(async session => {
+    if (o.status === "READY_TO_SHIP" && s.status === "READY_TO_SHIP") return s;
+
+    await transaction(async (session) => {
       const current = await Order.findById(orderId).session(session);
-      assert(current && !current.deletedAt && ['PREPARING', 'READY_TO_SHIP'].includes(current.status), 'Order changed before courier readiness', 409);
-      const reserved = await Shipment.findOneAndUpdate({ _id: s._id, $or: [{ lockUntil: null }, { lockUntil: { $lte: new Date() } }] }, { $set: { lockUntil: new Date(Date.now() + 60000) } }, { session });
-      assert(reserved, 'A courier operation is already in progress', 409);
-      current.increment(); await current.save({ session });
+      assert(
+        current && !current.deletedAt &&
+          (options.onConfirmed
+            ? ["NEW", "CONFIRMED", "PREPARING", "READY_TO_SHIP"]
+            : ["PREPARING", "READY_TO_SHIP"]
+          ).includes(current.status),
+        "Order changed before courier readiness.",
+        409,
+      );
+      if (options.expectedRevision !== undefined)
+        assert(
+          current.revision === options.expectedRevision,
+          "This order changed. Refresh and try again.",
+          409,
+          "CONFLICT",
+        );
+      const reserved = await Shipment.findOneAndUpdate(
+        {
+          _id: s._id,
+          uncertain: { $ne: true },
+          $or: [{ lockUntil: null }, { lockUntil: { $lte: new Date() } }],
+        },
+        { $set: { lockUntil: new Date(Date.now() + 60000) } },
+        { session },
+      );
+      assert(reserved, "A courier operation is already in progress or requires reconciliation.", 409);
+      current.increment();
+      await current.save({ session });
     });
+
     try {
       const raw = this.sanitize(await this.client.readyPackages([s.tracking]));
-      const messageRetour = Array.isArray(raw?.Colis)
-        ? raw.Colis[0]?.MessageRetour
-        : null;
-      if (messageRetour && messageRetour !== "Good") {
-        const error = new AppError(
-          `Procolis rejected ready request: ${messageRetour}`,
+      const rows = Array.isArray(raw?.Colis) ? raw.Colis : [];
+      const confirmed = rows.find(
+        (p) =>
+          String(p?.Tracking || "").trim().toUpperCase() === s.tracking.trim().toUpperCase() &&
+          p?.MessageRetour === "Good",
+      );
+      if (!confirmed) {
+        const failure = new AppError(
+          "Courier readiness was not confirmed for this tracking number. Refresh tracking before retrying.",
           502,
           "DELIVERY_ERROR",
         );
-        error.providerData = this.client.lastResponse || { body: raw };
-        throw error;
+        failure.providerData = this.client.lastResponse || { body: raw };
+        throw failure;
       }
       return transaction(async (session) => {
-        await transition(orderId, "READY_TO_SHIP", actor, session);
+        // /pret was accepted by the courier: its readiness status is authoritative.
+        const updatedOrder = await transition(
+          orderId,
+          "READY_TO_SHIP",
+          options.onConfirmed ? "courier" : actor,
+          session,
+        );
+        if (options.onConfirmed)
+          await options.onConfirmed(updatedOrder, session);
         const shipment = await Shipment.findOne({ orderId }).session(session);
         shipment.status = "READY_TO_SHIP";
         shipment.lockUntil = null;
+        shipment.uncertain = false;
         shipment.syncStatus = "SYNCED";
         shipment.lastError = "";
         shipment.lastSyncedAt = new Date();
         shipment.sanitizedProviderData = raw;
-        if (messageRetour) shipment.messageRetour = messageRetour;
+        shipment.messageRetour = confirmed.MessageRetour;
         await shipment.save({ session });
         return shipment;
       });
     } catch (error) {
+      // The request may have reached ABEX even on a timeout. Do not retry blindly.
       await Shipment.updateOne(
         { _id: s._id },
         {
           $set: {
             syncStatus: "ERROR",
+            uncertain: true,
             lastError:
               error instanceof AppError
                 ? error.message
-                : "Ready request could not be verified.",
+                : "Ready request could not be verified. Refresh the parcel before retrying.",
             lockUntil: null,
             ...(error.providerData
               ? { sanitizedProviderData: this.sanitize(error.providerData) }
