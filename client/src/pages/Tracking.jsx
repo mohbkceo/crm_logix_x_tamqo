@@ -432,7 +432,7 @@ export function Tracking() {
             <option value="NONE">دون بلاغات مفتوحة</option>
           </select>
           <details className="tracking-filter-details">
-            <summary>فلاتر إضافية</summary>
+            <summary>فلاتر متقدمة</summary>
             <div className="filter-grid">
               <Field label="حالة التوصيل">
                 <select
