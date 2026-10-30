@@ -638,7 +638,7 @@ export function Tracking() {
               aria-hidden="true"
             >
               <span />
-              <span>العميل</span>
+              <span>الزبون</span>
               <span>السعر الإجمالي</span>
               <span>المنتجات</span>
               <span>الإنتاج</span>
