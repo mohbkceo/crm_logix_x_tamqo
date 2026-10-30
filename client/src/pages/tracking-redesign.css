@@ -90,7 +90,7 @@
   position: absolute;
   z-index: 50;
   top: calc(100% + 9px);
-  right: 0;
+  left: 0;
   width: min(570px, calc(100vw - 50px));
   padding: 16px;
   border: 1px solid var(--tracking-border);
