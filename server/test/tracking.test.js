@@ -1,4 +1,4 @@
-import { before, after, beforeEach, test, mock } from "node:test";
+import { before, after, beforeEach, afterEach, test, mock } from "node:test";
 import { fakeCloudinary } from "./fixtures/cloudinary.js";
 import assert from "node:assert/strict";
 import { randomUUID } from "node:crypto";
@@ -41,6 +41,7 @@ import {
   resolveIssue,
   assignTracking,
   markImportant,
+  changeCourierReadiness,
 } from "../src/services/trackingService.js";
 import { migrateTracking } from "../src/services/trackingMigration.js";
 import { normalizeWhatsApp } from "../src/domain/whatsapp.js";
@@ -67,6 +68,8 @@ const basePermissions = [
   P["tracking.issue"].create,
   P["tracking.issue"].resolve,
 ];
+let preparationRead;
+afterEach(() => preparationRead?.mock.restore());
 before(
   async () => {
     fakeCloudinary(mock);
@@ -180,6 +183,21 @@ beforeEach(async () => {
   ])
     await model.deleteMany({});
   await migrateTracking();
+  preparationRead = mock.method(
+    DeliveryClient.prototype,
+    "readPackages",
+    async (trackings) => ({
+      Colis: (await Shipment.find({ tracking: { $in: trackings } }).lean()).map(
+        (s) => ({
+          Tracking: s.tracking,
+          Situation: s.providerStatus,
+          ...(s.providerUpdatedAt
+            ? { DateH_Action: s.providerUpdatedAt.toISOString() }
+            : {}),
+        }),
+      ),
+    }),
+  );
 });
 function input(business = "LOGIX_ONLY") {
   return {
@@ -264,13 +282,19 @@ test("new physical orders initialize independently; TAMQO stays outside Tracking
   assert.equal(result.items[0].totalOrderValue, undefined);
 });
 test("Designer toggles locally; Production Ready confirms ABEX /pret and locks the order", async () => {
-  const o = await order(), s = await parcel(o), payment = snapshot(o.payment);
+  const o = await order(),
+    s = await parcel(o),
+    payment = snapshot(o.payment);
   let readyCalls = 0;
-  const stub = mock.method(DeliveryClient.prototype, "readyPackages", async (trackings) => {
-    readyCalls++;
-    assert.deepEqual(trackings, [s.tracking]);
-    return { Colis: [{ Tracking: s.tracking, MessageRetour: "Good" }] };
-  });
+  const stub = mock.method(
+    DeliveryClient.prototype,
+    "readyPackages",
+    async (trackings) => {
+      readyCalls++;
+      assert.deepEqual(trackings, [s.tracking]);
+      return { Colis: [{ Tracking: s.tracking, MessageRetour: "Good" }] };
+    },
+  );
   try {
     for (const [to, revision] of [
       ["AT_PRODUCTION", 0],
@@ -280,8 +304,13 @@ test("Designer toggles locally; Production Ready confirms ABEX /pret and locks t
       await moveStage(designer.user, String(o._id), stage(to, revision));
     assert.equal((await Order.findById(o._id)).status, "NEW");
     assert.equal((await Shipment.findById(s._id)).status, "PREPARING");
-    const result = await moveStage(production.user, String(o._id), stage("READY_TO_SHIP", 3));
-    const current = await Order.findById(o._id), parcelState = await Shipment.findById(s._id);
+    const result = await moveStage(
+      production.user,
+      String(o._id),
+      stage("READY_TO_SHIP", 3),
+    );
+    const current = await Order.findById(o._id),
+      parcelState = await Shipment.findById(s._id);
     assert.equal(readyCalls, 1);
     assert.equal(current.status, "READY_TO_SHIP");
     assert.equal(current.tracking.stage, "READY_TO_SHIP");
@@ -291,9 +320,28 @@ test("Designer toggles locally; Production Ready confirms ABEX /pret and locks t
     assert.equal(result.revision, current.revision);
     assert.deepEqual(snapshot(current.payment), payment);
     assert.equal(await TrackingEvent.countDocuments({ orderId: o._id }), 4);
-    assert.equal((await TrackingEvent.findOne({ kind: "TRACKING_STAGE_CHANGED", newStage: "READY_TO_SHIP" })).data.courierReadinessConfirmed, true);
-    assert.equal((await OrderEvent.findOne({ orderId: o._id, toStatus: "READY_TO_SHIP" })).source, "DELIVERY_PROVIDER");
-    await assert.rejects(moveStage(production.user, String(o._id), stage("AT_PRODUCTION", current.revision)), { status: 409 });
+    assert.equal(
+      (
+        await TrackingEvent.findOne({
+          kind: "TRACKING_STAGE_CHANGED",
+          newStage: "READY_TO_SHIP",
+        })
+      ).data.courierReadinessConfirmed,
+      true,
+    );
+    assert.equal(
+      (await OrderEvent.findOne({ orderId: o._id, toStatus: "READY_TO_SHIP" }))
+        .source,
+      "DELIVERY_PROVIDER",
+    );
+    await assert.rejects(
+      moveStage(
+        production.user,
+        String(o._id),
+        stage("AT_PRODUCTION", current.revision),
+      ),
+      { status: 409 },
+    );
     const event = await TrackingEvent.findOne({ revision: 1 });
     assert.equal(event.previousStage, "PREPARING");
     assert.equal(event.newStage, "AT_PRODUCTION");
@@ -305,10 +353,16 @@ test("Designer toggles locally; Production Ready confirms ABEX /pret and locks t
 });
 
 test("ABEX rejection leaves production at At Production and requires reconciliation", async () => {
-  const o = await order(), s = await parcel(o);
+  const o = await order(),
+    s = await parcel(o);
   await moveStage(designer.user, String(o._id), stage("AT_PRODUCTION"));
-  const stub = mock.method(DeliveryClient.prototype, "readyPackages", async () =>
-    ({ Colis: [{ Tracking: s.tracking, MessageRetour: "Rejected" }] }));
+  const stub = mock.method(
+    DeliveryClient.prototype,
+    "readyPackages",
+    async () => ({
+      Colis: [{ Tracking: s.tracking, MessageRetour: "Rejected" }],
+    }),
+  );
   try {
     await assert.rejects(
       moveStage(production.user, String(o._id), stage("READY_TO_SHIP", 1)),
@@ -482,25 +536,45 @@ test("blocking reports and critical reports lock production until resolution", a
   );
 });
 test("bulk Ready sends /pret for eligible ABEX orders and isolates failures", async () => {
-  const good = await order(), bad = await order();
+  const good = await order(),
+    bad = await order();
   const parcelState = await parcel(good);
   await moveStage(designer.user, String(good._id), stage("AT_PRODUCTION"));
-  const stub = mock.method(DeliveryClient.prototype, "readyPackages", async (trackings) => ({
-    Colis: trackings.map((tracking) => ({ Tracking: tracking, MessageRetour: "Good" })),
-  }));
+  const stub = mock.method(
+    DeliveryClient.prototype,
+    "readyPackages",
+    async (trackings) => ({
+      Colis: trackings.map((tracking) => ({
+        Tracking: tracking,
+        MessageRetour: "Good",
+      })),
+    }),
+  );
   try {
-    const response = await production.api.post("/api/tracking/bulk-stage").send({
-      orders: [
-        { orderId: String(good._id), ...stage("READY_TO_SHIP", 1) },
-        { orderId: String(bad._id), ...stage("READY_TO_SHIP") },
-      ],
-    });
+    const response = await production.api
+      .post("/api/tracking/bulk-stage")
+      .send({
+        orders: [
+          { orderId: String(good._id), ...stage("READY_TO_SHIP", 1) },
+          { orderId: String(bad._id), ...stage("READY_TO_SHIP") },
+        ],
+      });
     assert.equal(response.status, 200);
-    assert.deepEqual(response.body.results.map((r) => r.success), [true, false]);
+    assert.deepEqual(
+      response.body.results.map((r) => r.success),
+      [true, false],
+    );
     assert.equal((await Order.findById(good._id)).status, "READY_TO_SHIP");
-    assert.equal((await Shipment.findById(parcelState._id)).status, "READY_TO_SHIP");
+    assert.equal(
+      (await Shipment.findById(parcelState._id)).status,
+      "READY_TO_SHIP",
+    );
     assert.equal((await Order.findById(bad._id)).revision, 0);
-    assert.equal((await designer.api.post("/api/tracking/bulk-stage").send({ orders: [] })).status, 403);
+    assert.equal(
+      (await designer.api.post("/api/tracking/bulk-stage").send({ orders: [] }))
+        .status,
+      403,
+    );
   } finally {
     stub.mock.restore();
   }
@@ -1053,10 +1127,14 @@ test("operational defaults apply even with viewAll; security admins retain the c
   });
   await datedOrder("2026-10-23T10:00:00Z", { status: "DELIVERED" });
   await datedOrder("2026-10-24T10:00:00Z", { "tracking.courierOwned": true });
-  assert.deepEqual(filterIds(await listTracking(designer.user, {})), [
-    String(oldest._id),
-    String(newer._id),
-  ]);
+  const preparingOrder =
+    defaultTrackingFilters(designer.user).sort === "newest"
+      ? [newer, oldest]
+      : [oldest, newer];
+  assert.deepEqual(
+    filterIds(await listTracking(designer.user, {})),
+    preparingOrder.map((o) => String(o._id)),
+  );
   assert.deepEqual(filterIds(await listTracking(production.user, {})), [
     String(atProduction._id),
   ]);
@@ -1323,4 +1401,533 @@ test("quick filter payload validation rejects unknown/duplicate tags and malform
   ]) {
     assert.equal((await admin.api.get("/api/tracking?" + query)).status, 400);
   }
+});
+
+async function readyCase() {
+  const o = await order(),
+    s = await parcel(o);
+  await moveStage(designer.user, String(o._id), stage("AT_PRODUCTION"));
+  return { o: await Order.findById(o._id), s };
+}
+function courierStub(
+  o,
+  s,
+  {
+    initial = "En préparation",
+    after = "En Traitement - Prêt à Expédie",
+    ambiguous = false,
+    timeout = false,
+  } = {},
+) {
+  let situation = initial;
+  const read = mock.method(
+    DeliveryClient.prototype,
+    "readPackages",
+    async (numbers) => {
+      assert.deepEqual(numbers, [s.tracking]);
+      return {
+        Colis: [
+          {
+            Tracking: s.tracking,
+            id_Externe: o.orderNumber,
+            Situation: situation,
+          },
+        ],
+      };
+    },
+  );
+  const ready = mock.method(
+    DeliveryClient.prototype,
+    "readyPackages",
+    async (numbers) => {
+      assert.deepEqual(numbers, [s.tracking]);
+      situation = after;
+      if (timeout) throw new Error("timeout");
+      return {
+        Colis: [
+          {
+            ...(ambiguous ? {} : { Tracking: s.tracking }),
+            MessageRetour: "Good",
+          },
+        ],
+      };
+    },
+  );
+  return {
+    read,
+    ready,
+    set: (value) => {
+      situation = value;
+    },
+    restore() {
+      read.mock.restore();
+      ready.mock.restore();
+    },
+  };
+}
+test("ambiguous Ready and timeout acknowledgements verify the same parcel without duplicate requests", async () => {
+  for (const timeout of [false, true]) {
+    const { o, s } = await readyCase(),
+      stub = courierStub(o, s, { ambiguous: true, timeout });
+    try {
+      await moveStage(
+        production.user,
+        String(o._id),
+        stage("READY_TO_SHIP", o.revision),
+      );
+      const current = await Order.findById(o._id),
+        shipment = await Shipment.findById(s._id);
+      assert.equal(current.status, "READY_TO_SHIP");
+      assert.equal(current.tracking.stage, "READY_TO_SHIP");
+      assert.equal(shipment.providerStatus, "En Traitement - Prêt à Expédie");
+      assert.equal(stub.ready.mock.callCount(), 1);
+      assert.equal(stub.read.mock.callCount(), 2);
+    } finally {
+      stub.restore();
+    }
+  }
+});
+test("Ready requires both In Production and exact En préparation, including direct Orders API requests", async () => {
+  const { o, s } = await readyCase(),
+    stub = courierStub(o, s);
+  try {
+    for (const internal of [
+      "PREPARING",
+      "READY_TO_SHIP",
+      "LEGACY_UNINITIALIZED",
+    ]) {
+      await Order.updateOne({ _id: o._id }, { "tracking.stage": internal });
+      assert.equal(
+        (
+          await admin.api.get("/api/orders/" + o._id)
+        ).body.allowedStatuses.includes("READY_TO_SHIP"),
+        false,
+      );
+      const response = await admin.api
+        .post("/api/orders/" + o._id + "/shipment/ready")
+        .send({ expectedRevision: o.revision });
+      assert.equal(response.status, 409);
+    }
+    await Order.updateOne(
+      { _id: o._id },
+      { "tracking.stage": "AT_PRODUCTION" },
+    );
+    for (const agency of [
+      "Dispatcher",
+      "Livrée",
+      "Supprimée",
+      "Unknown",
+      "En Traitement - Prêt à Expédie",
+    ]) {
+      stub.set(agency);
+      const response = await production.api
+        .patch("/api/tracking/" + o._id + "/stage")
+        .send(stage("READY_TO_SHIP", o.revision));
+      assert.equal(response.status, 409);
+      assert.equal((await Order.findById(o._id)).status, "NEW");
+      assert.equal((await Order.findById(o._id)).deletedAt, undefined);
+    }
+    assert.equal(stub.ready.mock.callCount(), 0);
+    stub.set("En préparation");
+    assert.equal(
+      (
+        await admin.api.get("/api/orders/" + o._id)
+      ).body.allowedStatuses.includes("READY_TO_SHIP"),
+      true,
+    );
+    assert.equal(
+      (
+        await sales.api.get("/api/orders/" + o._id)
+      ).body.allowedStatuses.includes("READY_TO_SHIP"),
+      false,
+    );
+    assert.equal(
+      (
+        await admin.api
+          .post("/api/orders/" + o._id + "/shipment/ready")
+          .send({ expectedRevision: o.revision })
+      ).status,
+      200,
+    );
+    assert.equal(stub.ready.mock.callCount(), 1);
+  } finally {
+    stub.restore();
+  }
+});
+test("stale, mismatched and unknown read-backs cannot advance Ready even alongside a Good acknowledgement", async () => {
+  for (const failure of [
+    "wrongTracking",
+    "unknown",
+    "stale",
+    "preparing",
+    "wrongOrder",
+    "delivered",
+  ]) {
+    const { o, s } = await readyCase();
+    await Shipment.updateOne(
+      { _id: s._id },
+      { providerUpdatedAt: new Date("2026-10-30T12:00:00Z") },
+    );
+    let reads = 0;
+    const parcelResponse = {
+      Colis: [
+        {
+          Tracking: failure === "wrongTracking" ? "OTHER" : s.tracking,
+          MessageRetour: "Good",
+          Situation:
+            failure === "unknown"
+              ? "Undocumented"
+              : failure === "preparing"
+                ? "En préparation"
+                : failure === "delivered"
+                  ? "Livrée"
+                  : "En Traitement - Prêt à Expédie",
+          ...(failure === "stale"
+            ? { DateH_Action: "2026-10-29T12:00:00Z" }
+            : {}),
+          ...(failure === "wrongOrder" ? { id_Externe: "OTHER-ORDER" } : {}),
+        },
+      ],
+    };
+    const read = mock.method(
+      DeliveryClient.prototype,
+      "readPackages",
+      async () =>
+        ++reads === 1
+          ? { Colis: [{ Tracking: s.tracking, Situation: "En préparation" }] }
+          : parcelResponse,
+    );
+    const ready = mock.method(
+      DeliveryClient.prototype,
+      "readyPackages",
+      async () => parcelResponse,
+    );
+    try {
+      await assert.rejects(
+        moveStage(
+          production.user,
+          String(o._id),
+          stage("READY_TO_SHIP", o.revision),
+        ),
+        { status: 502 },
+      );
+      assert.equal(
+        (await Order.findById(o._id)).tracking.stage,
+        "AT_PRODUCTION",
+      );
+      assert.equal((await Order.findById(o._id)).status, "NEW");
+      assert.equal((await Shipment.findById(s._id)).uncertain, true);
+    } finally {
+      read.mock.restore();
+      ready.mock.restore();
+    }
+  }
+});
+test("Ready is irreversible through single, bulk and legacy toggle APIs and cannot be retried twice", async () => {
+  const { o, s } = await readyCase(),
+    stub = courierStub(o, s);
+  try {
+    await moveStage(
+      production.user,
+      String(o._id),
+      stage("READY_TO_SHIP", o.revision),
+    );
+    const current = await Order.findById(o._id),
+      before = snapshot(current),
+      calls = stub.ready.mock.callCount();
+    for (const enabled of [false, true])
+      assert.equal(
+        (
+          await production.api
+            .patch("/api/tracking/" + o._id + "/readiness")
+            .send({ enabled, expectedRevision: current.revision })
+        ).status,
+        409,
+      );
+    await assert.rejects(
+      moveStage(
+        production.user,
+        String(o._id),
+        stage("AT_PRODUCTION", current.revision),
+      ),
+      { status: 409 },
+    );
+    await assert.rejects(
+      moveStage(
+        production.user,
+        String(o._id),
+        stage("READY_TO_SHIP", o.revision),
+      ),
+      { status: 409 },
+    );
+    const bulk = await admin.api.post("/api/tracking/bulk-stage").send({
+      orders: [
+        {
+          orderId: String(o._id),
+          expectedRevision: current.revision,
+          targetStage: "AT_PRODUCTION",
+        },
+      ],
+    });
+    assert.equal(bulk.status, 200);
+    assert.equal(bulk.body.results[0].success, false);
+    assert.deepEqual(snapshot(await Order.findById(o._id)), before);
+    assert.equal(stub.ready.mock.callCount(), calls);
+    assert.equal(
+      (await presentOrders(production.user, [current.toObject()]))[0].readiness
+        .canEnable,
+      false,
+    );
+  } finally {
+    stub.restore();
+  }
+});
+test("stale or mismatched preflight agency responses do not send pret", async () => {
+  for (const failure of ["tracking", "reference", "timestamp"]) {
+    const { o, s } = await readyCase();
+    await Shipment.updateOne(
+      { _id: s._id },
+      { providerUpdatedAt: new Date("2026-10-30T12:00:00Z") },
+    );
+    const read = mock.method(
+      DeliveryClient.prototype,
+      "readPackages",
+      async () => ({
+        Colis: [
+          {
+            Tracking: failure === "tracking" ? "WRONG" : s.tracking,
+            id_Externe: failure === "reference" ? "WRONG" : o.orderNumber,
+            Situation: "En préparation",
+            ...(failure === "timestamp"
+              ? { DateH_Action: "2026-10-29T12:00:00Z" }
+              : {}),
+          },
+        ],
+      }),
+    );
+    const ready = mock.method(
+      DeliveryClient.prototype,
+      "readyPackages",
+      async () => {
+        throw new Error("Must not send");
+      },
+    );
+    try {
+      await assert.rejects(
+        moveStage(
+          production.user,
+          String(o._id),
+          stage("READY_TO_SHIP", o.revision),
+        ),
+        { status: 409 },
+      );
+      assert.equal(ready.mock.callCount(), 0);
+      assert.equal((await Shipment.findById(s._id)).uncertain, false);
+    } finally {
+      read.mock.restore();
+      ready.mock.restore();
+    }
+  }
+});
+test("benign preparation polling preserves an in-flight Ready reservation", async () => {
+  const { o, s } = await readyCase();
+  await Order.updateOne({ _id: o._id }, { status: "PREPARING" });
+  const read = mock.method(
+    DeliveryClient.prototype,
+    "readPackages",
+    async () => {
+      await updateCourier(o, "En préparation");
+      return { Colis: [{ Tracking: s.tracking, Situation: "En préparation" }] };
+    },
+  );
+  const ready = mock.method(
+    DeliveryClient.prototype,
+    "readyPackages",
+    async () => ({ Colis: [{ Tracking: s.tracking, MessageRetour: "Good" }] }),
+  );
+  try {
+    await moveStage(
+      production.user,
+      String(o._id),
+      stage("READY_TO_SHIP", o.revision),
+    );
+    assert.equal(ready.mock.callCount(), 1);
+    assert.equal((await Order.findById(o._id)).tracking.stage, "READY_TO_SHIP");
+  } finally {
+    read.mock.restore();
+    ready.mock.restore();
+  }
+});
+
+test("new courier ownership during readiness preflight cannot be overwritten or trigger pret", async () => {
+  const { o, s } = await readyCase();
+  const read = mock.method(
+    DeliveryClient.prototype,
+    "readPackages",
+    async () => {
+      await updateCourier(o, "En Livraison");
+      return { Colis: [{ Tracking: s.tracking, Situation: "En préparation" }] };
+    },
+  );
+  const ready = mock.method(
+    DeliveryClient.prototype,
+    "readyPackages",
+    async () => {
+      throw new Error("Must not send");
+    },
+  );
+  try {
+    await assert.rejects(
+      moveStage(
+        production.user,
+        String(o._id),
+        stage("READY_TO_SHIP", o.revision),
+      ),
+      { status: 409 },
+    );
+    assert.equal(ready.mock.callCount(), 0);
+    assert.equal((await Order.findById(o._id)).status, "OUT_FOR_DELIVERY");
+  } finally {
+    read.mock.restore();
+    ready.mock.restore();
+  }
+});
+test("only explicit Supprimée soft-deletes the same order automatically and duplicates have no repeated effects", async () => {
+  const { o, s } = await readyCase(),
+    stub = courierStub(o, s),
+    payment = snapshot(o.payment);
+  try {
+    await moveStage(
+      production.user,
+      String(o._id),
+      stage("READY_TO_SHIP", o.revision),
+    );
+    const result = await updateCourier(o, "Supprimée", "2026-11-01T13:00:00Z");
+    assert.equal(result.outcome.result, "SUCCESS");
+    const current = await Order.findById(o._id);
+    assert.ok(current.deletedAt);
+    assert.equal(current.tracking.readinessDeleted, true);
+    assert.equal(current.status, "READY_TO_SHIP");
+    assert.deepEqual(snapshot(current.payment), payment);
+    assert.equal(current.note, o.note);
+    assert.equal((await Shipment.findById(s._id)).status, "DELETED");
+    assert.equal((await sales.api.get("/api/orders")).body.total, 0);
+    const rows = await listTracking(production.user, {
+      view: "custom",
+      lifecycle: "READINESS_DELETED",
+    });
+    assert.equal(rows.total, 1);
+    assert.equal(rows.items[0].displayStatus, "DELETED");
+    assert.equal(rows.items[0].readiness.canEnable, false);
+    const again = await updateCourier(o, "Supprimée", "2026-11-01T13:00:00Z");
+    assert.equal(again.outcome.result, "UNCHANGED");
+    assert.equal((await Order.findById(o._id)).revision, current.revision);
+    assert.equal(
+      await OrderEvent.countDocuments({
+        orderId: o._id,
+        type: "ORDER_PROVIDER_DELETED",
+      }),
+      1,
+    );
+    assert.equal(
+      await TrackingEvent.countDocuments({
+        orderId: o._id,
+        kind: "TRACKING_PROVIDER_DELETED",
+      }),
+      1,
+    );
+    assert.equal(await Order.countDocuments(), 1);
+    assert.equal(await Shipment.countDocuments(), 1);
+    assert.equal((await Shipment.findById(s._id)).tracking, s.tracking);
+    await assert.rejects(
+      changeCourierReadiness(production.user, String(o._id), {
+        enabled: true,
+        expectedRevision: current.revision,
+      }),
+      { status: 404 },
+    );
+  } finally {
+    stub.restore();
+  }
+});
+test("other agency statuses never imply deletion and normal delivery mapping remains authoritative", async () => {
+  for (const status of [
+    "En préparation",
+    "En Traitement - Prêt à Expédie",
+    "En Livraison",
+    "Livrée",
+    "Retour stock",
+    "Annuler par le client",
+    "Deleted",
+    "Supprimée unexpected",
+    "Unknown",
+  ]) {
+    const o = await order();
+    await parcel(o);
+    await updateCourier(o, status);
+    const current = await Order.findById(o._id);
+    assert.equal(current.deletedAt, undefined);
+    if (status === "Livrée") assert.equal(current.status, "DELIVERED");
+    if (status === "Annuler par le client")
+      assert.equal(current.status, "CANCELLED");
+    if (status === "Retour stock") assert.equal(current.status, "RETURNED");
+  }
+});
+test("Supprimée rejects stale observations, wrong tracking/reference and terminal-state contradictions", async () => {
+  for (const failure of [
+    "stale",
+    "sameTime",
+    "tracking",
+    "reference",
+    "terminal",
+  ]) {
+    const o = await order(),
+      s = await parcel(o);
+    await Shipment.updateOne(
+      { _id: s._id },
+      { providerUpdatedAt: new Date("2026-10-30T12:00:00Z") },
+    );
+    if (failure === "terminal")
+      await Order.updateOne({ _id: o._id }, { status: "DELIVERED" });
+    const result = await sync.applyWithResult(o._id, {
+      tracking: failure === "tracking" ? "WRONG" : s.tracking,
+      externalId: failure === "reference" ? "WRONG" : o.orderNumber,
+      providerStatus: "Supprimée",
+      providerUpdatedAt: new Date(
+        failure === "stale"
+          ? "2026-10-29T12:00:00Z"
+          : failure === "sameTime"
+            ? "2026-10-30T12:00:00Z"
+            : "2026-11-01T12:00:00Z",
+      ),
+      raw: {},
+    });
+    assert.equal(result.outcome.result, "ERROR");
+    assert.equal((await Order.findById(o._id)).deletedAt, undefined);
+  }
+});
+test("agency deletion preserves reports and resolving an issue never restores or contacts the courier", async () => {
+  const o = await order(),
+    s = await parcel(o);
+  await report(o, { severity: "CRITICAL" });
+  const issue = await TrackingIssue.findOne({ orderId: o._id });
+  await updateCourier(o, "Supprimée");
+  const current = await Order.findById(o._id),
+    beforeShipment = snapshot(await Shipment.findById(s._id)),
+    calls = preparationRead.mock.callCount();
+  assert.equal(
+    (await production.api.get("/api/tracking/" + o._id + "/issues")).status,
+    200,
+  );
+  assert.equal(
+    (
+      await production.api
+        .post("/api/tracking/" + o._id + "/issues/" + issue._id + "/resolve")
+        .send({ expectedRevision: current.revision })
+    ).status,
+    200,
+  );
+  assert.ok((await Order.findById(o._id)).deletedAt);
+  assert.deepEqual(snapshot(await Shipment.findById(s._id)), beforeShipment);
+  assert.equal(preparationRead.mock.callCount(), calls);
 });

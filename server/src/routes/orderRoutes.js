@@ -29,6 +29,7 @@ import {
 } from "../authorization.js";
 import { deliveryService } from "../services/delivery/deliveryService.js";
 import { DeliveryAgency } from "../models/delivery.js";
+import { eligible, moveStage, stageTargets, trackingScope } from "../services/trackingService.js";
 const router = Router();
 router.use(async (req, _res, next) => {
   const parts = req.path.split("/").filter(Boolean),
@@ -157,14 +158,21 @@ router.get("/:id", async (req, res) => {
   ]);
   assert(order, "Order not found", 404);
   const deliveryAgency = await DeliveryAgency.findById(order.delivery.agencyId)
-    .select("integrationType capabilities")
+    .select("integrationType apiProvider capabilities")
     .lean();
+  const productionOrder = eligible(order);
+  let productionReady = productionOrder && can(req.user, P.tracking.view) &&
+    deliveryAgency?.integrationType === 'API' && deliveryAgency.apiProvider === 'PROCOLIS' &&
+    deliveryAgency.capabilities?.tracking && deliveryAgency.capabilities?.readyToShip &&
+    shipment?.tracking && String(shipment.agencyId) === String(order.delivery.agencyId) &&
+    stageTargets(req.user, order, shipment).includes('READY_TO_SHIP');
+  if (productionReady) productionReady = Boolean(await Order.exists({ ...trackingScope(req.user), _id: order._id }));
   res.json({
     ...order,
     shipment,
     deliveryAgency,
     allowedStatuses: STATUSES.filter((s) =>
-      canTransition(order.status, s, order.businessType),
+      s === 'READY_TO_SHIP' && productionOrder ? Boolean(productionReady) : canTransition(order.status, s, order.businessType),
     ),
   });
 });
@@ -327,9 +335,14 @@ router.post("/:id/payment", async (req, res) =>
 router.post("/:id/shipment", async (req, res) =>
   res.json(await deliveryService.create(req.params.id, req.actor, req.body)),
 );
-router.post("/:id/shipment/ready", async (req, res) =>
-  res.json(await deliveryService.ready(req.params.id, req.actor)),
-);
+router.post("/:id/shipment/ready", async (req, res) => {
+  const order = await Order.findById(req.params.id);
+  if (eligible(order)) {
+    await moveStage(req.user, req.params.id, { targetStage: "READY_TO_SHIP", expectedRevision: req.body.expectedRevision ?? order.revision });
+    return res.json(await Shipment.findOne({ orderId: order._id }));
+  }
+  res.json(await deliveryService.ready(req.params.id, req.actor));
+});
 router.post("/:id/shipment/refresh", async (req, res) =>
   res.json(await deliveryService.refresh(req.params.id, req.actor)),
 );

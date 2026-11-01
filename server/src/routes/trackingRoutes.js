@@ -22,6 +22,7 @@ import {
   employeeOptions,
   revisionInput,
   markImportant,
+  changeCourierReadiness,
 } from "../services/trackingService.js";
 const router = Router();
 const admin = (req, _res, next) => {
@@ -250,13 +251,20 @@ router.get("/:orderId", async (req, res) =>
   res.json(
     (
       await presentOrders(req.user, [
-        (await accessibleOrder(req.user, req.params.orderId)).toObject(),
+        (
+          await accessibleOrder(req.user, req.params.orderId, null, true)
+        ).toObject(),
       ])
     )[0],
   ),
 );
 router.patch("/:orderId/stage", async (req, res) =>
   res.json(await moveStage(req.user, req.params.orderId, req.body)),
+);
+router.patch("/:orderId/readiness", async (req, res) =>
+  res.json(
+    await changeCourierReadiness(req.user, req.params.orderId, req.body),
+  ),
 );
 router.patch(
   "/:orderId/important",

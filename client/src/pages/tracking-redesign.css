@@ -90,8 +90,12 @@
   position: absolute;
   z-index: 50;
   top: calc(100% + 9px);
-  left: 0;
-  width: min(570px, calc(100vw - 50px));
+  /* Anchor to the inline end: left in RTL, right in LTR. */
+  inset-inline-end: 0;
+  inset-inline-start: auto;
+  width: min(570px, calc(100vw - 32px));
+  max-width: calc(100vw - 32px);
+  box-sizing: border-box;
   padding: 16px;
   border: 1px solid var(--tracking-border);
   border-radius: 12px;
@@ -312,7 +316,7 @@
   color: #404856;
   font-size: 11px;
   font-weight: 650;
-  text-align: left;
+  text-align: start;
   white-space: normal;
   line-height: 1.25;
 }
@@ -344,6 +348,8 @@
 .tracking-page .tracking-issue-count.blocking { color: #965600; background: #fff7e6; border-color: #f5e2b6; }
 .tracking-page .tracking-responsible span,
 .tracking-page .tracking-responsible small { line-height: 1.5; overflow-wrap: anywhere; }
+.tracking-page .tracking-responsible > span,
+.tracking-page .tracking-responsible > small { display: block; }
 .tracking-page .tracking-responsible > span { font-size: 12px; font-weight: 600; }
 .tracking-page .tracking-responsible > small { margin-top: 4px; }
 .tracking-page .tracking-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
@@ -364,7 +370,8 @@
 .tracking-page .tracking-more > summary { padding: 8px; }
 .tracking-page .tracking-more[open] > div {
   top: calc(100% + 5px);
-  right: 0;
+  inset-inline-end: 0;
+  inset-inline-start: auto;
   z-index: 80;
   width: 245px;
   border: 1px solid var(--tracking-border);
@@ -432,37 +439,6 @@
   .tracking-page .tracking-order-row .tracking-stage { display: block; }
   .tracking-page .tracking-order-row .tracking-responsible { display: block; }
 }
-@media (max-width: 700px) {
-  .tracking-page .tracking-filters { gap: 8px; padding: 12px; }
-  .tracking-page .tracking-search { flex: 1 1 100%; min-width: 0; }
-  .tracking-page .tracking-filters > select { flex: 1 1 130px; max-width: none; min-width: 0; }
-  .tracking-page .tracking-filter-details { flex: 1 1 100%; }
-  .tracking-page .tracking-filter-details summary { justify-content: center; }
-  .tracking-page .tracking-filter-details .filter-grid {
-    position: static;
-    width: 100%;
-    grid-template-columns: 1fr;
-    margin-top: 8px;
-    box-shadow: none;
-  }
-  .tracking-page .tracking-quick-filters { padding: 10px 12px 6px; }
-  .tracking-page .tracking-filter-tools { padding: 7px 12px 11px; }
-  .tracking-page .tracking-bulk { padding: 10px 12px; }
-  .tracking-page .tracking-list { padding: 10px; }
-  .tracking-page .tracking-order-row { grid-template-columns: 18px minmax(0, 1fr) auto; gap: 8px 9px; padding: 12px; }
-  .tracking-page .tracking-person { gap: 10px; }
-  .tracking-page .tracking-person strong { font-size: 13px; }
-  .tracking-page .tracking-thumb { width: 70px; height: 76px; flex-basis: 70px; }
-  .tracking-page .tracking-actions { gap: 4px; flex-wrap: wrap; justify-content: flex-end; max-width: 83px; }
-  .tracking-page .tracking-actions > button { padding: 7px 8px; }
-  .tracking-page .tracking-more[open] > div { right: 0; width: min(244px, calc(100vw - 55px)); }
-}
-@media (max-width: 390px) {
-  .tracking-page .tracking-thumb { width: 60px; height: 65px; flex-basis: 60px; }
-  .tracking-page .tracking-order-row { grid-template-columns: 16px minmax(0, 1fr) 35px; }
-  .tracking-page .tracking-actions > button { order: 2; }
-}
-
 /* Image lightbox: click background or X to close, Esc to close, arrow keys to navigate. */
 .tracking-image-overlay {
   position: fixed;
@@ -570,4 +546,285 @@
 @media (prefers-reduced-motion: reduce) {
   .tracking-page .tracking-thumb img,
   .tracking-page .tracking-order-row { transition: none; }
+}
+
+
+/* UX refinement: quiet, mobile-first, with explicit production actions. */
+@media (max-width: 760px) {
+  .tracking-page .tracking-stage[data-label="الإنتاج"]::before { display: none; }
+}
+.tracking-page { --tracking-border:#e9eaed; --tracking-muted:#6b7280; }
+.tracking-page .tracking-mobile-topbar { display:none; }
+.tracking-page .tracking-filters { gap:8px; }
+.tracking-page .tracking-stage { display:flex; flex-direction:column; align-items:flex-start; gap:7px; }
+.tracking-page .tracking-stage-current {
+  display:inline-flex; align-items:center; width:fit-content; padding:6px 10px;
+  border-radius:6px; border:1px solid #e6e9ee; background:#f2f4f7;
+  color:#404856; font-size:12px; font-weight:650; line-height:1.3;
+  margin-top: 12px;
+}
+.tracking-page .tracking-order-row.stage-at_production .tracking-stage-current { background:#fff3e7; border-color:#ffe2c1; color:#985210; }
+.tracking-page .tracking-order-row.stage-ready_to_ship .tracking-stage-current { background:#eaf7ee; border-color:#cdebd4; color:#246d3e; }
+.tracking-page .tracking-stage > .tracking-stage-next {
+  display:inline-flex; gap:6px; align-items:center; justify-content:center; min-height:34px;
+  width:fit-content; padding:7px 11px; background:#202127; color:white;
+  border:1px solid #202127; border-radius:7px; font-size:11px; font-weight:650;
+  cursor:pointer;
+}
+.tracking-page .tracking-stage > .tracking-stage-next:hover {background:#383a42;}
+.tracking-page .tracking-stage > .tracking-stage-next:disabled {opacity:.55;cursor:wait;}
+.tracking-page .tracking-stage > small {margin-top:0;}
+.tracking-page .tracking-actions .tracking-report-action {display:inline-flex;align-items:center;gap:6px;}
+.tracking-page .tracking-more {position:relative;}
+.tracking-page .tracking-more[open] > div {inset-inline-end:0;inset-inline-start:auto;max-width:min(270px,calc(100vw - 32px));}
+.tracking-page .tracking-filter-details .filter-grid {inset-inline-end:0;inset-inline-start:auto;}
+.tracking-page .tracking-quick-filters {display:flex;flex-wrap:nowrap;overflow-x:auto;scrollbar-width:none;}
+.tracking-page .tracking-quick-filters::-webkit-scrollbar {display:none;}
+.tracking-page .tracking-filter-tools {display:flex;align-items:center;flex-wrap:wrap;gap:8px;}
+.tracking-page .tracking-filter-tools > span {margin-inline-end:auto;}
+.tracking-page .tracking-stage-current, .tracking-page .tracking-stage-next {white-space:normal;}
+@media(max-width:1250px) {
+  .tracking-page .tracking-order-row .tracking-stage {flex-direction:row;align-items:center;flex-wrap:wrap;gap:8px;}
+  .tracking-page .tracking-order-row .tracking-stage::before {flex-basis:100%;margin-bottom:0;}
+  .tracking-page .tracking-order-row .tracking-stage > small {flex-basis:100%;}
+  .tracking-page .tracking-order-row .tracking-price {border-top:0;padding-top:2px;}
+  .tracking-page .tracking-order-row .tracking-products {gap:4px;}
+}
+
+/* Keep desktop actions icon-sized; show an explicit label on phones. */
+.tracking-page .tracking-more-label { display: none; }
+
+/* Single-column phone card: customer identity, details, then a dedicated action footer. */
+@media (max-width: 760px) {
+  .tracking-page .tracking-list {
+    display: grid;
+    gap: 10px;
+    padding: 10px;
+    background: #f8f9fa;
+  }
+  .tracking-page .tracking-order-row {
+    display: grid;
+    grid-template-columns: 20px minmax(0, 1fr);
+    align-items: start;
+    column-gap: 10px;
+    row-gap: 0;
+    min-width: 0;
+    width: 100%;
+    padding: 13px;
+    border: 1px solid #e5e7eb;
+    border-radius: 11px;
+    background: #fff;
+  }
+  .tracking-page .tracking-order-row .tracking-selection {
+    grid-column: 1;
+    grid-row: 1;
+    padding-top: 24px;
+    align-self: start;
+  }
+  .tracking-page .tracking-order-row .tracking-person {
+    grid-column: 2;
+    grid-row: 1;
+    display: flex;
+    align-items: center;
+    min-width: 0;
+    gap: 11px;
+    padding-bottom: 13px;
+  }
+  .tracking-page .tracking-person-main {
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .tracking-page .tracking-name-line { flex-wrap: wrap; }
+  .tracking-page .tracking-person strong {
+    font-size: 14px;
+    line-height: 1.45;
+    overflow-wrap: anywhere;
+  }
+  .tracking-page .tracking-person small { overflow-wrap: anywhere; }
+  .tracking-page .tracking-thumb {
+    flex: 0 0 66px;
+    width: 66px;
+    height: 72px;
+  }
+  .tracking-page .tracking-order-row .tracking-price,
+  .tracking-page .tracking-order-row .tracking-products,
+  .tracking-page .tracking-order-row .tracking-stage,
+  .tracking-page .tracking-order-row .tracking-responsible {
+    grid-column: 1 / -1;
+    min-width: 0;
+    margin: 0;
+    padding: 12px 0;
+    border-top: 1px solid #edf0f2;
+  }
+  .tracking-page .tracking-order-row .tracking-price {
+    grid-row: 2;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    font-size: 15px;
+  }
+  .tracking-page .tracking-order-row .tracking-price::before { margin: 0; }
+  .tracking-page .tracking-order-row .tracking-products {
+    grid-row: 3;
+    display: grid;
+    gap: 4px;
+  }
+  .tracking-page .tracking-order-row .tracking-products::before { margin-bottom: 3px; }
+  .tracking-page .tracking-order-row .tracking-stage {
+    grid-row: 4;
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 7px;
+  }
+  .tracking-page .tracking-order-row .tracking-stage::before {
+    flex-basis: 100%;
+    margin: 0;
+  }
+  .tracking-page .tracking-stage-current { margin-top: 0; }
+  .tracking-page .tracking-order-row .tracking-stage > small { flex-basis: 100%; }
+  .tracking-page .tracking-order-row .tracking-responsible {
+    grid-row: 5;
+    display: block;
+  }
+  .tracking-page .tracking-order-row .tracking-actions {
+    grid-column: 1 / -1;
+    grid-row: 6;
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    align-items: stretch;
+    gap: 8px;
+    width: 100%;
+    max-width: none;
+    padding-top: 12px;
+    border-top: 1px solid #edf0f2;
+  }
+  .tracking-page .tracking-order-row .tracking-actions > button,
+  .tracking-page .tracking-order-row .tracking-more > summary {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 7px;
+    width: 100%;
+    height: auto;
+    min-height: 44px;
+    padding: 9px 8px;
+    border-radius: 8px;
+    font-size: 12px;
+    font-weight: 600;
+    white-space: normal;
+  }
+  .tracking-page .tracking-actions .tracking-report-action {
+    background: #fff2eb;
+    border-color: #f8cdbb;
+    color: #a73810;
+  }
+  .tracking-page .tracking-actions .tracking-report-action:hover { background: #ffe9df; }
+  .tracking-page .tracking-actions .tracking-report-action span,
+  .tracking-page .tracking-more-label { display: inline; }
+  .tracking-page .tracking-more {
+    position: relative;
+    width: 100%;
+    min-width: 0;
+  }
+  .tracking-page .tracking-more[open] > div {
+    position: absolute;
+    top: calc(100% + 7px);
+    inset-inline-end: 0;
+    inset-inline-start: auto;
+    z-index: 80;
+    width: min(260px, calc(100vw - 42px));
+    max-width: none;
+    max-height: min(410px, 62dvh);
+    overflow-y: auto;
+  }
+}
+
+/* Toolbar remains compact while keeping form controls large enough to tap. */
+@media (max-width: 700px) {
+  .tracking-page .tracking-page-heading { display: none !important; }
+  .tracking-page .tracking-mobile-topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px 4px;
+    background: #fff;
+  }
+  .tracking-page .tracking-mobile-topbar span { font-size: 16px; font-weight: 750; }
+  .tracking-page .tracking-mobile-topbar button {
+    display: grid;
+    place-items: center;
+    width: 42px;
+    height: 42px;
+    border: 1px solid var(--tracking-border);
+    border-radius: 9px;
+    background: #fff;
+    color: var(--tracking-ink);
+  }
+  .tracking-page .tracking-panel { border: 0; border-radius: 0; }
+  .tracking-page .tracking-filters { gap: 8px; padding: 8px 12px 10px; }
+  .tracking-page .tracking-search { flex: 1 1 100%; min-height: 44px; min-width: 0; }
+  .tracking-page .tracking-search input { font-size: 14px; }
+  .tracking-page .tracking-filters > select {
+    flex: 1 1 130px;
+    max-width: none;
+    min-width: 0;
+    min-height: 42px;
+    font-size: 12px;
+  }
+  .tracking-page .tracking-filter-details { flex: 1 1 100%; width: 100%; }
+  .tracking-page .tracking-filter-details summary { min-height: 40px; justify-content: center; }
+  .tracking-page .tracking-filter-details .filter-grid {
+    position: static;
+    inset: auto;
+    display: grid;
+    grid-template-columns: 1fr;
+    width: 100%;
+    margin-top: 8px;
+    box-shadow: none;
+  }
+  .tracking-page .tracking-quick-filters { padding: 8px 12px; gap: 6px; }
+  .tracking-page .tracking-filter-chip { min-height: 36px; font-size: 12px; }
+  .tracking-page .tracking-filter-tools { padding: 7px 12px 12px; }
+  .tracking-page .tracking-filter-tools > span { font-size: 12px; }
+  .tracking-page .tracking-bulk { padding: 10px 12px; }
+  .tracking-page .tracking-stage > .tracking-stage-next { min-height: 40px; font-size: 12px; }
+}
+
+@media (max-width: 340px) {
+  /* Two full-width actions avoid crowding on very narrow screens. */
+  .tracking-page .tracking-order-row .tracking-actions { grid-template-columns: 1fr; }
+  .tracking-page .tracking-more[open] > div { width: min(260px, calc(100vw - 42px)); }
+  .tracking-page .tracking-thumb { flex-basis: 58px; width: 58px; height: 64px; }
+}
+
+/* RTL / LTR safety: prevent controls from expanding their grid/flex parents. */
+.tracking-page .tracking-filters > *,
+.tracking-page .tracking-filter-details .filter-grid > *,
+.tracking-page .tracking-more,
+.tracking-page .tracking-order-row > * {
+  min-width: 0;
+}
+
+.tracking-page .tracking-filter-details .filter-grid select,
+.tracking-page .tracking-filter-details .filter-grid input {
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+/* Before the mobile layout, keep dropdowns inside the panel rather than offscreen. */
+@media (min-width: 701px) and (max-width: 900px) {
+  .tracking-page .tracking-filter-details {
+    flex: 1 1 100%;
+    width: 100%;
+  }
+  .tracking-page .tracking-filter-details .filter-grid {
+    position: static;
+    inset: auto;
+    width: 100%;
+    max-width: 100%;
+    margin-top: 8px;
+    box-shadow: none;
+  }
 }

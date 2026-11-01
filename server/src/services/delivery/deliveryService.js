@@ -223,7 +223,8 @@ export const deliveryService = {
     return result;
   },
   async ready(id, actor, options = {}) {
-    const { service } = await context(id, "readyToShip");
+    const { service, order, agency } = await context(id, "readyToShip");
+    assert((service && agency.capabilities?.tracking) || !order.items.some(i => i.business === "LOGIX" && i.type === "PRODUCT"), "This agency cannot verify En préparation for production readiness.", 409);
     const result = service
       ? await service.ready(id, actor, options)
       : await transition(id, "READY_TO_SHIP", actor);

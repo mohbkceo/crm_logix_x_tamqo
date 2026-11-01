@@ -25,7 +25,10 @@ import {
   STAGE_ACTIONS,
   SEVERITIES,
 } from "../../../shared/tracking.js";
-import { mapProviderStatus } from "./delivery/deliveryStatusMapper.js";
+import {
+  mapProviderStatus,
+  normalizeProviderStatus,
+} from "./delivery/deliveryStatusMapper.js";
 import { whatsAppUrl } from "../domain/whatsapp.js";
 import { QUICK_TAGS } from "../../../shared/trackingFilters.js";
 import { canManageIssueMedia } from "./mediaAccess.js";
@@ -65,7 +68,13 @@ export const trackingState = (order) =>
 export function trackingScope(user) {
   assert(can(user, P.tracking.view), "Tracking access denied", 403);
   const clauses = [
-    orderScope(user),
+    orderScope(user, false, true),
+    {
+      $or: [
+        { deletedAt: { $exists: false } },
+        { "tracking.readinessDeleted": true },
+      ],
+    },
     { items: { $elemMatch: { business: "LOGIX", type: "PRODUCT" } } },
   ];
   if (!can(user, P.tracking.viewAll)) {
@@ -92,17 +101,29 @@ export function trackingScope(user) {
   }
   return { $and: clauses };
 }
-export async function accessibleOrder(user, id, session = null) {
+export async function accessibleOrder(
+  user,
+  id,
+  session = null,
+  includeReadinessDeleted = false,
+) {
   const order = await Order.findOne({
     ...trackingScope(user),
     _id: objectId(id),
   }).session(session);
   assert(order, "Order unavailable in your Tracking scope", 404);
+  assert(
+    !order.deletedAt ||
+      (includeReadinessDeleted && order.tracking?.readinessDeleted),
+    "Deleted order is unavailable for this action",
+    404,
+  );
   return order;
 }
 export function stageTargets(user, order, shipment) {
   if (
     courierOwns(order, shipment) ||
+    order.tracking?.stage === "READY_TO_SHIP" ||
     order.deletedAt ||
     order.tracking?.blockingIssues > 0 ||
     shipment?.uncertain ||
@@ -110,6 +131,11 @@ export function stageTargets(user, order, shipment) {
   )
     return [];
   return PRODUCTION_STAGES.filter((target) => {
+    if (
+      target === "READY_TO_SHIP" &&
+      normalizeProviderStatus(shipment?.providerStatus) !== "en preparation"
+    )
+      return false;
     const action = STAGE_ACTIONS[`${order.tracking?.stage}:${target}`];
     return (
       action &&
@@ -153,9 +179,20 @@ async function writeEvent(
     session,
   );
 }
-async function mutate(user, id, expectedRevision, operation) {
+async function mutate(
+  user,
+  id,
+  expectedRevision,
+  operation,
+  includeReadinessDeleted = false,
+) {
   return transaction(async (session) => {
-    const order = await accessibleOrder(user, id, session);
+    const order = await accessibleOrder(
+      user,
+      id,
+      session,
+      includeReadinessDeleted,
+    );
     assert(
       order.revision === expectedRevision,
       "This order changed. Refresh and try again.",
@@ -172,6 +209,15 @@ async function mutate(user, id, expectedRevision, operation) {
   });
 }
 async function moveToCourierReady(user, id, data) {
+  assert(
+    can(user, P.tracking.markReady) &&
+      (elevated(user) ||
+        user.operationalRoles?.some((r) =>
+          ["PRODUCTION", "PRODUCTION_MANAGER"].includes(r),
+        )),
+    "Courier readiness action denied",
+    403,
+  );
   // Validate before sending any external request; bulk and single actions use this path.
   const order = await accessibleOrder(user, id);
   assert(
@@ -192,6 +238,7 @@ async function moveToCourierReady(user, id, data) {
   assert(
     agency?.integrationType === "API" &&
       agency.apiProvider === "PROCOLIS" &&
+      agency.capabilities?.tracking &&
       agency.capabilities?.readyToShip,
     "This delivery agency cannot confirm readiness automatically.",
     409,
@@ -259,6 +306,30 @@ export async function moveStage(user, id, payload) {
     order.tracking.stage = data.targetStage;
     order.tracking.stageEnteredAt = new Date();
     await writeEvent(order, user, "TRACKING_STAGE_CHANGED", previous, session);
+  });
+}
+export async function changeCourierReadiness(user, id, payload) {
+  const data = z
+    .object({ enabled: z.boolean(), expectedRevision: revisionInput })
+    .strict()
+    .parse(payload);
+  assert(
+    can(user, P.tracking.markReady) &&
+      (elevated(user) ||
+        user.operationalRoles?.some((r) =>
+          ["PRODUCTION", "PRODUCTION_MANAGER"].includes(r),
+        )),
+    "Courier readiness action denied",
+    403,
+  );
+  assert(
+    data.enabled,
+    "Ready to Ship is irreversible. Manual reversal, deletion and restoration are not allowed.",
+    409,
+  );
+  return moveToCourierReady(user, id, {
+    targetStage: "READY_TO_SHIP",
+    expectedRevision: data.expectedRevision,
   });
 }
 export async function markImportant(user, id, payload) {
@@ -433,43 +504,49 @@ export async function resolveIssue(user, id, issueId, payload) {
     .object({ expectedRevision: revisionInput })
     .strict()
     .parse(payload);
-  return mutate(user, id, data.expectedRevision, async (order, session) => {
-    const issue = await TrackingIssue.findOne({
-      _id: objectId(issueId),
-      orderId: order._id,
-    }).session(session);
-    assert(issue, "Report not found", 404);
-    assert(issue.status === "OPEN", "This report is already resolved", 409);
-    issue.status = "RESOLVED";
-    issue.resolvedBy = actor(user);
-    issue.resolvedAt = new Date();
-    await issue.save({ session });
-    order.tracking.openIssues = Math.max(
-      0,
-      (order.tracking.openIssues || 0) - 1,
-    );
-    order.tracking.blockingIssues = Math.max(
-      0,
-      (order.tracking.blockingIssues || 0) - Number(issue.blocking),
-    );
-    order.tracking.criticalIssues = Math.max(
-      0,
-      (order.tracking.criticalIssues || 0) -
-        Number(issue.severity === "CRITICAL"),
-    );
-    await writeEvent(
-      order,
-      user,
-      "TRACKING_ISSUE_RESOLVED",
-      order.tracking.stage,
-      session,
-      { issueId },
-    );
-  });
+  return mutate(
+    user,
+    id,
+    data.expectedRevision,
+    async (order, session) => {
+      const issue = await TrackingIssue.findOne({
+        _id: objectId(issueId),
+        orderId: order._id,
+      }).session(session);
+      assert(issue, "Report not found", 404);
+      assert(issue.status === "OPEN", "This report is already resolved", 409);
+      issue.status = "RESOLVED";
+      issue.resolvedBy = actor(user);
+      issue.resolvedAt = new Date();
+      await issue.save({ session });
+      order.tracking.openIssues = Math.max(
+        0,
+        (order.tracking.openIssues || 0) - 1,
+      );
+      order.tracking.blockingIssues = Math.max(
+        0,
+        (order.tracking.blockingIssues || 0) - Number(issue.blocking),
+      );
+      order.tracking.criticalIssues = Math.max(
+        0,
+        (order.tracking.criticalIssues || 0) -
+          Number(issue.severity === "CRITICAL"),
+      );
+      await writeEvent(
+        order,
+        user,
+        "TRACKING_ISSUE_RESOLVED",
+        order.tracking.stage,
+        session,
+        { issueId },
+      );
+    },
+    true,
+  );
 }
 export async function listIssues(user, id, query) {
   assert(can(user, P["tracking.issue"].view), "Report access denied", 403);
-  const order = await accessibleOrder(user, id),
+  const order = await accessibleOrder(user, id, null, true),
     p = pagination(query);
   const filter = { orderId: order._id };
   const [items, total] = await Promise.all([
@@ -491,11 +568,13 @@ export async function listIssues(user, id, query) {
   return {
     items: items.map((i) => ({
       ...i,
-      canManageAttachments: canManageIssueMedia(user, i),
-      attachments: (i.attachments || []).map((image) => ({
-        _id: image._id,
-        url: `/api/issue-media/${order._id}/${i._id}/${image._id}`,
-      })),
+      canManageAttachments: !order.deletedAt && canManageIssueMedia(user, i),
+      attachments: (order.deletedAt ? [] : i.attachments || []).map(
+        (image) => ({
+          _id: image._id,
+          url: `/api/issue-media/${order._id}/${i._id}/${image._id}`,
+        }),
+      ),
       reporterContact: contact(
         contacts.find((u) => String(u._id) === String(i.reporter.userId)),
         can(user, P["tracking.contacts"].view),
@@ -544,7 +623,10 @@ export async function presentOrders(user, orders) {
       .select(
         "orderId agencyId tracking status providerStatus syncStatus lastError lockUntil uncertain",
       )
-      .populate("agencyId", "code name")
+      .populate(
+        "agencyId",
+        "code name integrationType apiProvider capabilities",
+      )
       .lean(),
   ]);
   const peopleById = new Map(people.map((p) => [String(p._id), p])),
@@ -553,6 +635,13 @@ export async function presentOrders(user, orders) {
     const shipment = shipmentByOrder.get(String(o._id)),
       state = trackingState(o),
       owned = courierOwns(o, shipment);
+    const readinessProvider = Boolean(
+      shipment?.tracking &&
+      shipment.agencyId?.integrationType === "API" &&
+      shipment.agencyId.apiProvider === "PROCOLIS" &&
+      shipment.agencyId.capabilities?.tracking &&
+      shipment.agencyId.capabilities?.readyToShip,
+    );
     let responsible = peopleById.get(
       String(
         !owned
@@ -592,19 +681,31 @@ export async function presentOrders(user, orders) {
       note: o.note,
       createdAt: o.createdAt,
       status: o.status,
+      deleted: Boolean(o.deletedAt),
+      displayStatus: o.deletedAt ? "DELETED" : owned ? o.status : state.stage,
+      readiness: {
+        enabled: !o.deletedAt && o.status === "READY_TO_SHIP",
+        deleted: Boolean(o.deletedAt && state.readinessDeleted),
+        canEnable:
+          readinessProvider &&
+          stageTargets(user, o, shipment).includes("READY_TO_SHIP"),
+      },
       revision: o.revision,
       canViewOrder:
-        can(user, P.orders.viewAll) ||
-        (can(user, P.orders.viewOwn) &&
-          String(o.createdBy?.userId) === String(user._id)),
+        (!o.deletedAt || can(user, P.orders.deleteAll)) &&
+        (can(user, P.orders.viewAll) ||
+          (can(user, P.orders.viewOwn) &&
+            String(o.createdBy?.userId) === String(user._id))),
       tracking: state,
-      canMarkImportant: can(user, P.tracking.assign),
+      canMarkImportant: !o.deletedAt && can(user, P.tracking.assign),
       courierOwned: owned,
-      images: (o.images || []).map((i) => ({
+      images: (o.deletedAt ? [] : o.images || []).map((i) => ({
         _id: i._id,
         url: `/api/order-media/${o._id}/${i._id}`,
       })),
-      allowedTargets: stageTargets(user, o, shipment),
+      allowedTargets: stageTargets(user, o, shipment).filter(
+        (target) => target !== "READY_TO_SHIP" || readinessProvider,
+      ),
       canInitialize:
         state.stage === "LEGACY_UNINITIALIZED" &&
         !owned &&
@@ -807,7 +908,7 @@ export async function employeeOptions(user, query = {}) {
     .lean();
 }
 export async function trackingHistory(user, id, query) {
-  const order = await accessibleOrder(user, id);
+  const order = await accessibleOrder(user, id, null, true);
   assert(can(user, P.audit.view), "Audit access denied", 403);
   const p = pagination(query),
     filter = { orderId: order._id };

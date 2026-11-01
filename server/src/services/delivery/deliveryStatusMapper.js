@@ -3,6 +3,7 @@ import { STATUSES } from "../../constants.js";
 const KNOWN_PROVIDER_STATUSES = {
   "en preparation": "PREPARING",
   "En Traitement - Eret a Expedie": "READY_TO_SHIP",
+  "en traitement - pret a expedie": "READY_TO_SHIP",
   dispatcher: "SHIPPED",
   "en livraison": "OUT_FOR_DELIVERY",
   "en livraison ( 1528 )": "OUT_FOR_DELIVERY",

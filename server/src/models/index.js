@@ -274,6 +274,7 @@ export const Shipment = create("Shipment", {
   providerAccepted: { type: Boolean, default: false },
   uncertain: { type: Boolean, default: false },
   lockUntil: Date,
+  readinessLockToken: String,
   importBatchId: { type: Schema.Types.ObjectId, ref: "ImportBatch" },
   importRowNumber: Number,
 });

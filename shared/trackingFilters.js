@@ -14,7 +14,7 @@ export const clearTrackingFilters = () => ({
   view: "custom",
   page: 1,
   limit: 20,
-  sort: "oldest",
+  sort: "newest",
   lifecycle: "ALL",
   attention: "all",
   tags: "",

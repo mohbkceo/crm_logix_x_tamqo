@@ -3660,3 +3660,9 @@ main,
   .tracking-role-setting { display: block; }
   .tracking-order-row.tracking-head { display: none; }
 }
+
+.tracking-page .tracking-order-row.readiness-deleted .tracking-stage-current {
+  background: #f4f4f5;
+  border-color: #d4d4d8;
+  color: #52525b;
+}

@@ -10,7 +10,7 @@ import {
   Flag,
   Star,
 } from "lucide-react";
-import { api, useApi, params, money, human, date } from "../api";
+import { api, useApi, params, money, date } from "../api";
 import { P, can, useUser } from "../access";
 import { MediaGallery } from "../MediaGallery";
 import {
@@ -41,6 +41,7 @@ const STAGES_AR = {
   PREPARING: "قيد التحضير",
   COMPLETED: "مكتمل",
   CANCELLED: "ملغى",
+  DELETED: "محذوف",
 };
 const SEVERITIES_AR = {
   INFO: "معلومات",
@@ -51,6 +52,7 @@ const SEVERITIES_AR = {
   WARNING: "تحذير",
 };
 const STATUS_AR = {
+  DELETED: "محذوف",
   OPEN: "مفتوح",
   RESOLVED: "محلول",
   PREPARING: "قيد التحضير",
@@ -164,6 +166,7 @@ function TrackingImageViewer({ order, onClose }) {
       }}
     >
       <section
+        dir="auto"
         className="tracking-image-dialog"
         role="dialog"
         aria-modal="true"
@@ -268,6 +271,9 @@ export function Tracking() {
     setFilters((f) => ({
       ...f,
       [key]: value,
+      ...(key === "lifecycle" && value === "READINESS_DELETED"
+        ? { stage: "", attention: "all", tags: "", issue: "" }
+        : {}),
       page: 1,
       ...(key === "issue"
         ? {
@@ -347,6 +353,7 @@ export function Tracking() {
         }),
       `تم النقل إلى ${stageLabel(targetStage)}`,
     );
+
   async function bulk(targetStage) {
     await perform(async () => {
       const rows = result.data.items.filter((o) => selected.includes(o._id));
@@ -385,20 +392,32 @@ export function Tracking() {
   );
   return (
     <div className="tracking-page" dir="rtl" lang="ar">
-      <PageHeader
-        eyebrow="العمليات / تتبع الطلبات"
-        title="تتبع الطلبات"
-        description="تابع مراحل الإنتاج وحالة الطلبات بسهولة."
-      >
-        <button
-          onClick={result.reload}
-          disabled={busy}
-          aria-label="تحديث التتبع"
+      <div className="tracking-page-heading">
+        <PageHeader
+          eyebrow="العمليات / تتبع الطلبات"
+          title="تتبع الطلبات"
+          description="تابع مراحل الإنتاج وحالة الطلبات بسهولة."
         >
-          <RefreshCw size={16} /> Refresh
-        </button>
-      </PageHeader>
+          <button
+            onClick={result.reload}
+            disabled={busy}
+            aria-label="تحديث التتبع"
+          >
+            <RefreshCw size={16} /> تحديث
+          </button>
+        </PageHeader>
+      </div>
       <div className="panel tracking-panel" aria-busy={busy}>
+        <div className="tracking-mobile-topbar">
+          <button
+            type="button"
+            onClick={result.reload}
+            disabled={busy || result.loading}
+            aria-label="تحديث الطلبات"
+          >
+            <RefreshCw size={18} />
+          </button>
+        </div>
         <div className="tracking-filters">
           <label className="tracking-search">
             <Search size={16} />
@@ -415,7 +434,7 @@ export function Tracking() {
             onChange={(e) => change("stage", e.target.value)}
           >
             <option value="">جميع مراحل الإنتاج</option>
-            {Object.entries(STAGE_LABELS).map(([k, v]) => (
+            {Object.entries(STAGE_LABELS).map(([k]) => (
               <option key={k} value={k}>
                 {stageLabel(k)}
               </option>
@@ -502,9 +521,7 @@ export function Tracking() {
                 >
                   <option value="oldest">الأقدم أولاً</option>
                   <option value="newest">الأحدث أولاً</option>
-                  <option value="issuesFirst">
-                    Issues first · oldest within priority
-                  </option>
+                  <option value="issuesFirst">المشكلات أولاً ثم الأقدم</option>
                 </select>
               </Field>
               <Field label="دورة حياة الطلب">
@@ -514,8 +531,9 @@ export function Tracking() {
                 >
                   <option value="ALL">جميع الطلبات</option>
                   <option value="ACTIVE">الطلبات النشطة</option>
-                  <option value="COMPLETED">
-                    Completed / cancelled orders
+                  <option value="COMPLETED">الطلبات المكتملة أو الملغاة</option>
+                  <option value="READINESS_DELETED">
+                    الطلبات المحذوفة لدى شركة التوصيل
                   </option>
                 </select>
               </Field>
@@ -566,10 +584,10 @@ export function Tracking() {
                 : ""}
           </span>
           <button disabled={busy} onClick={() => resetFilters(false)}>
-            Clear Filters
+            مسح الفلاتر
           </button>
           <button disabled={busy} onClick={() => resetFilters(true)}>
-            Reset to My Default View
+            عرضي الافتراضي
           </button>
         </div>
         <ErrorBox
@@ -609,19 +627,6 @@ export function Tracking() {
                   تحديد كجاهز للشحن
                 </button>
               )}
-            {can(user, P.tracking.revertReady) &&
-              rows.some(
-                (o) =>
-                  o.tracking.stage === "READY_TO_SHIP" &&
-                  o.allowedTargets.includes("AT_PRODUCTION"),
-              ) && (
-                <button
-                  disabled={busy || result.loading || !selected.length}
-                  onClick={() => bulk("AT_PRODUCTION")}
-                >
-                  إرجاع إلى الإنتاج
-                </button>
-              )}
           </div>
         )}
         {result.loading && !result.data ? (
@@ -652,7 +657,7 @@ export function Tracking() {
               return (
                 <article
                   key={o._id}
-                  className={`tracking-order-row stage-${o.tracking.stage.toLowerCase()}`}
+                  className={`tracking-order-row stage-${o.tracking.stage.toLowerCase()} ${o.deleted ? "readiness-deleted" : ""}`}
                   aria-label={o.orderNumber}
                 >
                   <div className="tracking-selection">
@@ -692,7 +697,7 @@ export function Tracking() {
                         {o.canMarkImportant ? (
                           <button
                             className={`tracking-important ${o.tracking.important ? "active" : ""}`}
-                            aria-label={`${o.tracking.important ? "إلغاء تمييز" : "تمييز"} ${o.orderNumber} as Important`}
+                            aria-label={`${o.tracking.important ? "إلغاء تمييز" : "تمييز"} ${o.orderNumber} كمهم`}
                             aria-pressed={Boolean(o.tracking.important)}
                             title={
                               o.tracking.important
@@ -755,28 +760,38 @@ export function Tracking() {
                     ))}
                   </div>
                   <div className="tracking-stage" data-label="الإنتاج">
-                    <button
-                      disabled={busy || !target}
-                      onClick={() => move(o, target)}
-                      title={
-                        target
-                          ? `نقل إلى ${stageLabel(target)}`
-                          : o.courierOwned
-                            ? "تتحكم شركة التوصيل في هذا الطلب"
-                            : o.tracking.blockingIssues
-                              ? "يجب حل البلاغات المعيقة أولاً"
-                              : "لا يوجد انتقال مسموح"
-                      }
-                      aria-label={
-                        target
-                          ? `${o.orderNumber}: ${stageLabel(o.tracking.stage)} ← ${stageLabel(target)}`
-                          : `${o.orderNumber}: ${stageLabel(o.tracking.stage)}`
-                      }
+                    <span
+                      className="tracking-stage-current"
+                      aria-label={`الحالة الحالية: ${o.courierOwned || o.deleted ? localizedStatus(o.displayStatus || o.status) : stageLabel(o.tracking.stage)}`}
                     >
-                      {stageLabel(o.tracking.stage)}
-                      {target && <span aria-hidden="true"> →</span>}
-                    </button>
-                    <small>
+                      {o.courierOwned || o.deleted
+                        ? localizedStatus(o.displayStatus || o.status)
+                        : stageLabel(o.tracking.stage)}
+                    </span>
+                    {o.readiness?.canEnable && (
+                      <button
+                        type="button"
+                        className="tracking-stage-next"
+                        disabled={busy || result.loading}
+                        onClick={() => move(o, "READY_TO_SHIP")}
+                        aria-label={`جاهز للشحن للطلب ${o.orderNumber}`}
+                      >
+                        جاهز للشحن
+                      </button>
+                    )}
+                    {target && target !== "READY_TO_SHIP" && (
+                      <button
+                        type="button"
+                        className="tracking-stage-next"
+                        disabled={busy}
+                        onClick={() => move(o, target)}
+                        aria-label={`نقل طلب ${o.customer.name} إلى ${stageLabel(target)}`}
+                      >
+                        نقل إلى {stageLabel(target)}
+                        <ArrowLeft size={15} aria-hidden="true" />
+                      </button>
+                    )}
+                    <small className="courier-owned">
                       {o.courierOwned
                         ? "هذا الطلب تحت إدارة شركة التوصيل"
                         : age(o.tracking.stageEnteredAt)}
@@ -801,31 +816,25 @@ export function Tracking() {
                     className="tracking-responsible"
                     data-label="المسؤول / شركة التوصيل"
                   >
-                    <span>{o.responsible.name || "لم يُعيّن موظف داخلي"}</span>
-                    <small>
-                      {o.shipment?.agencyName || localizedStatus(o.status)}
-                      {o.shipment?.providerStatus
-                        ? ` · ${localizedStatus(o.shipment.providerStatus)}`
-                        : o.shipment?.status
-                          ? ` · ${localizedStatus(o.shipment.status)}`
-                          : ""}
+                    {o.responsible.name && <span>{o.responsible.name}</span>}
+                    <small title={o.shipment?.providerStatus || undefined}>
+                      {o.shipment?.status
+                        ? localizedStatus(o.shipment.status)
+                        : o.shipment?.providerStatus || ""}
                     </small>
                     {o.shipment?.tracking && (
                       <small>{o.shipment.tracking}</small>
                     )}
-                    {o.shipment?.syncStatus === "ERROR" && (
-                      <small
-                        className="tracking-sync-error"
-                        title={o.shipment.lastError}
-                      >
-                        مزامنة شركة التوصيل تحتاج إلى متابعة
-                      </small>
-                    )}
                   </div>
                   <div className="tracking-actions">
-                    {can(user, P["tracking.issue"].create) && (
-                      <button disabled={busy} onClick={() => open("report", o)}>
-                        إبلاغ عن مشكلة
+                    {!o.deleted && can(user, P["tracking.issue"].create) && (
+                      <button
+                        className="tracking-report-action"
+                        disabled={busy}
+                        onClick={() => open("report", o)}
+                      >
+                        <Flag size={15} aria-hidden="true" />
+                        <span>إبلاغ عن مشكلة</span>
                       </button>
                     )}
                     <details className="tracking-more">
@@ -833,7 +842,7 @@ export function Tracking() {
                         aria-label={`إجراءات إضافية للطلب ${o.orderNumber}`}
                       >
                         <MoreHorizontal size={18} />
-                        <span className="sr-only">المزيد</span>
+                        <span className="tracking-more-label">المزيد</span>
                       </summary>
                       <div>
                         <span className="tracking-more-reference">
@@ -868,7 +877,7 @@ export function Tracking() {
                             البلاغات والسجل
                           </button>
                         )}
-                        {can(user, P.tracking.assign) && (
+                        {!o.deleted && can(user, P.tracking.assign) && (
                           <button onClick={() => open("assign", o)}>
                             تعيين موظف
                           </button>
@@ -1107,7 +1116,7 @@ function IssueList({ order, busy, perform }) {
                 التواصل مع مُقدّم البلاغ
               </ContactLink>
               <details>
-                <summary>Attachments ({i.attachments?.length || 0})</summary>
+                <summary>المرفقات ({i.attachments?.length || 0})</summary>
                 <MediaGallery
                   endpoint={`/issue-media/${order._id}/${i._id}`}
                   images={i.attachments}
@@ -1141,12 +1150,12 @@ function IssueList({ order, busy, perform }) {
                       else result.reload();
                     }}
                   >
-                    Resolve
+                    تحديد كمحلول
                   </button>
                 )}
               {i.status === "RESOLVED" && (
                 <small>
-                  Resolved by {i.resolvedBy?.name} · {date(i.resolvedAt)}
+                  تم الحل بواسطة {i.resolvedBy?.name} · {date(i.resolvedAt)}
                 </small>
               )}
             </article>
@@ -1193,7 +1202,7 @@ function Assignment({ order, employees, busy, save }) {
         </Field>
       ))}
       <button className="primary" disabled={busy}>
-        Save assignment
+        حفظ التعيين
       </button>
     </form>
   );

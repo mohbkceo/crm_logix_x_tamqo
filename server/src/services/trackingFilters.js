@@ -27,7 +27,9 @@ const queryInput = z
     page: z.coerce.number().optional(),
     limit: z.coerce.number().optional(),
     sort: z.enum(["oldest", "newest", "issuesFirst"]).optional(),
-    lifecycle: z.enum(["ALL", "ACTIVE", "COMPLETED"]).optional(),
+    lifecycle: z
+      .enum(["ALL", "ACTIVE", "COMPLETED", "READINESS_DELETED"])
+      .optional(),
     attention: z.enum(["all", "internal"]).optional(),
     tags: z.string().max(150).optional().default(""),
   })
@@ -50,6 +52,8 @@ export function parseTrackingFilters(user, query) {
   };
 }
 export function lifecycleFilter(q) {
+  if (q.lifecycle === "READINESS_DELETED")
+    return { "tracking.readinessDeleted": true, deletedAt: { $exists: true } };
   return q.lifecycle === "ACTIVE"
     ? { status: { $nin: COMPLETED_TRACKING_STATUSES } }
     : q.lifecycle === "COMPLETED"

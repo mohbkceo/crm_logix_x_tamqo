@@ -1,4 +1,7 @@
-import { Order, Shipment, OrderEvent } from "../../models/index.js";
+import { randomUUID } from "node:crypto";
+import { Order, Shipment, OrderEvent, Expense } from "../../models/index.js";
+import { TrackingEvent } from "../../models/tracking.js";
+import { audit } from "../../models/security.js";
 import { transaction, transition } from "../orderService.js";
 import { canProviderTransition } from "../../domain/order.js";
 import { assert, AppError } from "../../errors.js";
@@ -9,9 +12,15 @@ import {
   parseCreationResult,
   sanitizeProviderData,
 } from "./deliveryMapper.js";
-import { mapProviderStatus } from "./deliveryStatusMapper.js";
-import { ensureReturnExpense, reverseReturnExpense } from "./deliveryFinancialService.js";
-import { COURIER_STAGES } from '../../../../shared/tracking.js';
+import {
+  mapProviderStatus,
+  normalizeProviderStatus,
+} from "./deliveryStatusMapper.js";
+import {
+  ensureReturnExpense,
+  reverseReturnExpense,
+} from "./deliveryFinancialService.js";
+import { COURIER_STAGES } from "../../../../shared/tracking.js";
 export class DeliverySyncService {
   constructor(client = deliveryClient) {
     this.client = client;
@@ -57,7 +66,11 @@ export class DeliverySyncService {
       async (session) => {
         const order = await Order.findById(orderId).session(session);
         assert(order, "Order not found", 404);
-        assert(!order.deletedAt, "Deleted orders cannot create shipments.", 409);
+        assert(
+          !order.deletedAt,
+          "Deleted orders cannot create shipments.",
+          409,
+        );
         let s = await Shipment.findOne({ orderId }).session(session);
         if (s?.tracking) return { order, shipment: s };
         assert(
@@ -325,38 +338,164 @@ export class DeliverySyncService {
       const s = await Shipment.findOne({ orderId }).session(session),
         order = await Order.findById(orderId).session(session);
       assert(s && order, "Shipment not found", 404);
-      assert(!order.deletedAt, "Deleted orders cannot synchronize shipments.", 409);
-      const status = mapProviderStatus(parcel.providerStatus);
+      const deleted =
+        normalizeProviderStatus(parcel.providerStatus) === "supprimee";
+      const wasDeleted = Boolean(order.deletedAt);
+      assert(
+        !order.deletedAt ||
+          (deleted &&
+            s.status === "DELETED" &&
+            normalizeProviderStatus(s.providerStatus) === "supprimee"),
+        "Deleted orders cannot synchronize shipments.",
+        409,
+      );
+      const status = deleted ? null : mapProviderStatus(parcel.providerStatus);
       const beforeProviderStatus = s.providerStatus || null,
         beforeOrderStatus = order.status;
-      s.lastObservation = { providerStatus: parcel.providerStatus, providerUpdatedAt: parcel.providerUpdatedAt, receivedAt: new Date(), raw: this.sanitize(parcel.raw) };
-      const incomingDate = parcel.providerUpdatedAt ? new Date(parcel.providerUpdatedAt) : null;
-      const stale = incomingDate && (!Number.isFinite(+incomingDate) || (s.providerUpdatedAt && (+incomingDate < +s.providerUpdatedAt || (+incomingDate === +s.providerUpdatedAt && status && status !== order.status))));
-      const conflicting = status && status !== order.status && !canProviderTransition(order.status, status);
-      const wrongTracking = s.tracking && String(s.tracking).toUpperCase() !== String(parcel.tracking).toUpperCase();
-      if (stale || conflicting || wrongTracking) {
+      s.lastObservation = {
+        providerStatus: parcel.providerStatus,
+        providerUpdatedAt: parcel.providerUpdatedAt,
+        receivedAt: new Date(),
+        raw: this.sanitize(parcel.raw),
+      };
+      const incomingDate = parcel.providerUpdatedAt
+        ? new Date(parcel.providerUpdatedAt)
+        : null;
+      const stale =
+        incomingDate &&
+        (!Number.isFinite(+incomingDate) ||
+          (s.providerUpdatedAt &&
+            (+incomingDate < +s.providerUpdatedAt ||
+              (+incomingDate === +s.providerUpdatedAt &&
+                status &&
+                status !== order.status))) ||
+          (+incomingDate === +s.providerUpdatedAt &&
+            deleted &&
+            !order.deletedAt));
+      const conflicting =
+        (deleted &&
+          ["DELIVERED", "RETURNED", "CANCELLED"].includes(order.status)) ||
+        (status &&
+          status !== order.status &&
+          !canProviderTransition(order.status, status));
+      const wrongTracking =
+        s.tracking &&
+        String(s.tracking).toUpperCase() !==
+          String(parcel.tracking).toUpperCase();
+      const wrongReference =
+        parcel.externalId &&
+        ![order.orderNumber, s.externalId].includes(parcel.externalId);
+      if (
+        stale ||
+        conflicting ||
+        wrongTracking ||
+        wrongReference ||
+        (deleted && !s.tracking)
+      ) {
         s.lastSyncedAt = new Date();
-        s.lastError = stale ? 'Stale or invalid provider timestamp; last accepted state preserved.' : wrongTracking ? 'Provider tracking mismatch; linked parcel preserved.' : `Provider reports ${status}; internal state is ${order.status}. Review the conflicting transition.`;
-        s.syncStatus = 'ERROR';
+        s.lastError = stale
+          ? "Stale or invalid provider timestamp; last accepted state preserved."
+          : wrongTracking || wrongReference || !s.tracking
+            ? "Provider tracking mismatch; linked parcel preserved."
+            : `Provider reports ${status}; internal state is ${order.status}. Review the conflicting transition.`;
+        s.syncStatus = "ERROR";
         await s.save({ session });
-        return { shipment: s, outcome: { beforeProviderStatus, afterProviderStatus: s.providerStatus || null, beforeOrderStatus, afterOrderStatus: order.status, changed: false, terminalReached: false, result: 'ERROR', error: s.lastError } };
+        return {
+          shipment: s,
+          outcome: {
+            beforeProviderStatus,
+            afterProviderStatus: s.providerStatus || null,
+            beforeOrderStatus,
+            afterOrderStatus: order.status,
+            changed: false,
+            terminalReached: false,
+            result: "ERROR",
+            error: s.lastError,
+          },
+        };
       }
       s.tracking = parcel.tracking;
       s.trackingKey = parcel.tracking.toUpperCase();
       s.uncertain = false;
-      s.lockUntil = null;
+      // A benign preparation poll must not cancel an in-flight Ready command.
+      // Real courier ownership/deletion still invalidates its reservation.
+      if (!s.readinessLockToken || deleted || COURIER_STAGES.includes(status)) {
+        s.lockUntil = null;
+        s.readinessLockToken = undefined;
+      }
       s.providerAccepted = true;
       if (parcel.messageRetour) s.messageRetour = parcel.messageRetour;
       s.providerStatus = parcel.providerStatus;
       s.providerSituationId = parcel.providerSituationId;
-      if (incomingDate && status) s.providerUpdatedAt = incomingDate;
+      if (incomingDate && (status || deleted))
+        s.providerUpdatedAt = incomingDate;
       s.sanitizedProviderData = parcel.raw;
       s.lastSyncedAt = new Date();
       s.lastError = "";
       s.syncStatus = "SYNCED";
       let afterOrderStatus = order.status,
         result;
-      if (status && status !== order.status) {
+      if (deleted) {
+        if (!order.deletedAt) {
+          order.deletedAt = new Date();
+          order.deletedBy = { name: "Delivery agency" };
+          order.deleteReason = "Delivery agency explicitly reported Supprimée";
+          if (order.tracking) order.tracking.readinessDeleted = true;
+          order.revision++;
+          await order.save({ session });
+          await Expense.updateMany(
+            { sourceOrderId: order._id, systemGenerated: true },
+            { $set: { sourceOrderDeletedAt: order.deletedAt } },
+            { session },
+          );
+          await OrderEvent.create(
+            [
+              {
+                orderId: order._id,
+                kind: "DELETED",
+                type: "ORDER_PROVIDER_DELETED",
+                actor: { name: "Delivery agency" },
+                source: "DELIVERY_PROVIDER",
+                message:
+                  "Order soft-deleted after the agency reported Supprimée",
+                data: {
+                  tracking: s.tracking,
+                  providerStatus: parcel.providerStatus,
+                },
+              },
+            ],
+            { session },
+          );
+          if (order.tracking)
+            await TrackingEvent.create(
+              [
+                {
+                  orderId: order._id,
+                  kind: "TRACKING_PROVIDER_DELETED",
+                  previousStage: order.tracking.stage,
+                  newStage: order.tracking.stage,
+                  actor: { name: "Delivery agency" },
+                  source: "DELIVERY_PROVIDER",
+                  revision: order.revision,
+                  data: {
+                    tracking: s.tracking,
+                    providerStatus: parcel.providerStatus,
+                  },
+                },
+              ],
+              { session },
+            );
+          await audit(
+            { name: "Delivery agency" },
+            "ORDER_PROVIDER_DELETED",
+            "Order",
+            order._id,
+            order.businessType,
+            { tracking: s.tracking },
+            session,
+          );
+        }
+      } else if (status && status !== order.status) {
         if (canProviderTransition(order.status, status)) {
           const changedOrder = await transition(
             orderId,
@@ -366,9 +505,16 @@ export class DeliverySyncService {
           );
           afterOrderStatus = changedOrder.status;
           if (["RETURNING", "RETURNED"].includes(afterOrderStatus)) {
-            await ensureReturnExpense(changedOrder, { session, actor: "courier", tracking: s.tracking });
+            await ensureReturnExpense(changedOrder, {
+              session,
+              actor: "courier",
+              tracking: s.tracking,
+            });
           } else if (afterOrderStatus === "DELIVERED") {
-            await reverseReturnExpense(changedOrder, { session, actor: "courier" });
+            await reverseReturnExpense(changedOrder, {
+              session,
+              actor: "courier",
+            });
           }
         } else {
           s.lastError = `Provider reports ${status}; internal state is ${order.status}. Review the skipped or conflicting transition.`;
@@ -378,17 +524,23 @@ export class DeliverySyncService {
       } else if (!status && (options.requireStatus || parcel.providerStatus)) {
         result = "UNKNOWN_STATUS";
       }
-      if (status === order.status && COURIER_STAGES.includes(status) && order.tracking && !order.tracking.courierOwned) {
+      if (
+        status === order.status &&
+        COURIER_STAGES.includes(status) &&
+        order.tracking &&
+        !order.tracking.courierOwned
+      ) {
         order.tracking.courierOwned = true;
         order.revision++;
         await order.save({ session });
       }
       // Unknown provider values are retained without guessing a normalized order status.
-      s.status = status || null;
+      s.status = deleted ? "DELETED" : status || null;
       await s.save({ session });
       const changed =
           beforeProviderStatus !== (s.providerStatus || null) ||
-          beforeOrderStatus !== afterOrderStatus,
+          beforeOrderStatus !== afterOrderStatus ||
+          (deleted && !wasDeleted),
         terminalReached =
           !["DELIVERED", "RETURNED", "CANCELLED"].includes(beforeOrderStatus) &&
           ["DELIVERED", "RETURNED", "CANCELLED"].includes(afterOrderStatus);
@@ -450,6 +602,24 @@ export class DeliverySyncService {
       o = await Order.findById(orderId);
     assert(o, "Order not found", 404);
     assert(!o.deletedAt, "Deleted orders cannot synchronize shipments.", 409);
+    const productionOrder = o.items.some(
+      (i) => i.business === "LOGIX" && i.type === "PRODUCT",
+    );
+    if (productionOrder)
+      assert(
+        o.tracking?.stage === "AT_PRODUCTION" &&
+          !o.tracking.blockingIssues &&
+          !o.tracking.courierOwned &&
+          !COURIER_STAGES.includes(o.status),
+        "Ready to Ship requires In Production and is irreversible.",
+        409,
+      );
+    if (productionOrder)
+      assert(
+        s?.tracking && String(s.agencyId) === String(o.delivery.agencyId),
+        "A linked shipment from the order delivery agency is required.",
+        409,
+      );
     assert(
       (options.onConfirmed
         ? ["NEW", "CONFIRMED", "PREPARING", "READY_TO_SHIP"]
@@ -476,13 +646,22 @@ export class DeliverySyncService {
         "A verified tracking number is required to confirm courier readiness.",
         409,
       );
-    if (!s?.tracking) return transition(orderId, "READY_TO_SHIP", actor);
+    if (!s?.tracking) {
+      assert(
+        !productionOrder,
+        "A verified agency tracking number is required.",
+        409,
+      );
+      return transition(orderId, "READY_TO_SHIP", actor);
+    }
     if (o.status === "READY_TO_SHIP" && s.status === "READY_TO_SHIP") return s;
 
+    const readinessToken = randomUUID();
     await transaction(async (session) => {
       const current = await Order.findById(orderId).session(session);
       assert(
-        current && !current.deletedAt &&
+        current &&
+          !current.deletedAt &&
           (options.onConfirmed
             ? ["NEW", "CONFIRMED", "PREPARING", "READY_TO_SHIP"]
             : ["PREPARING", "READY_TO_SHIP"]
@@ -497,28 +676,145 @@ export class DeliverySyncService {
           409,
           "CONFLICT",
         );
+      if (productionOrder)
+        assert(
+          current.tracking?.stage === "AT_PRODUCTION" &&
+            !current.tracking.blockingIssues &&
+            !current.tracking.courierOwned,
+          "Production changed before readiness.",
+          409,
+        );
       const reserved = await Shipment.findOneAndUpdate(
         {
           _id: s._id,
           uncertain: { $ne: true },
           $or: [{ lockUntil: null }, { lockUntil: { $lte: new Date() } }],
         },
-        { $set: { lockUntil: new Date(Date.now() + 60000) } },
+        {
+          $set: {
+            lockUntil: new Date(Date.now() + 120000),
+            readinessLockToken: readinessToken,
+          },
+        },
         { session },
       );
-      assert(reserved, "A courier operation is already in progress or requires reconciliation.", 409);
+      assert(
+        reserved,
+        "A courier operation is already in progress or requires reconciliation.",
+        409,
+      );
       current.increment();
       await current.save({ session });
     });
 
+    let readinessSent = false;
     try {
-      const raw = this.sanitize(await this.client.readyPackages([s.tracking]));
+      if (productionOrder) {
+        const beforeRaw = this.sanitize(
+          await this.client.readPackages([s.tracking]),
+        );
+        const before = parsePackages(beforeRaw).find(
+          (p) =>
+            p.tracking.toUpperCase() === s.tracking.toUpperCase() &&
+            (!p.externalId || p.externalId === o.orderNumber),
+        );
+        assert(
+          before &&
+            normalizeProviderStatus(before.providerStatus) ===
+              "en preparation" &&
+            (!before.providerUpdatedAt ||
+              (Number.isFinite(+before.providerUpdatedAt) &&
+                (!s.providerUpdatedAt ||
+                  +before.providerUpdatedAt >= +s.providerUpdatedAt))),
+          "Ready to Ship requires the delivery agency status En préparation. Refresh tracking.",
+          409,
+        );
+        const [liveOrder, reservedShipment] = await Promise.all([
+          Order.findById(orderId),
+          Shipment.findOne({
+            _id: s._id,
+            readinessLockToken: readinessToken,
+            lockUntil: { $gt: new Date() },
+          }),
+        ]);
+        assert(
+          reservedShipment &&
+            liveOrder &&
+            !liveOrder.deletedAt &&
+            liveOrder.revision === (options.expectedRevision ?? o.revision) &&
+            liveOrder.tracking?.stage === "AT_PRODUCTION" &&
+            !liveOrder.tracking.courierOwned &&
+            !liveOrder.tracking.blockingIssues,
+          "Order changed during agency verification. Refresh tracking.",
+          409,
+        );
+      }
+      let raw;
+      try {
+        readinessSent = true;
+        raw = this.sanitize(await this.client.readyPackages([s.tracking]));
+      } catch (error) {
+        if (error.code === "DELIVERY_NOT_CONFIGURED") throw error;
+        raw = {
+          readinessRequestError: this.sanitize(
+            error.providerData || error.message,
+          ),
+        };
+      }
       const rows = Array.isArray(raw?.Colis) ? raw.Colis : [];
-      const confirmed = rows.find(
+      let confirmed = rows.find(
         (p) =>
-          String(p?.Tracking || "").trim().toUpperCase() === s.tracking.trim().toUpperCase() &&
+          String(p?.Tracking || "")
+            .trim()
+            .toUpperCase() === s.tracking.trim().toUpperCase() &&
           p?.MessageRetour === "Good",
       );
+      const matchesTracking = (p) =>
+        p.tracking.toUpperCase() === s.tracking.toUpperCase();
+      const verifiesReady = (p) =>
+        matchesTracking(p) &&
+        (!p.externalId || p.externalId === o.orderNumber) &&
+        mapProviderStatus(p.providerStatus) === "READY_TO_SHIP" &&
+        (!p.providerUpdatedAt ||
+          (Number.isFinite(+p.providerUpdatedAt) &&
+            (!s.providerUpdatedAt ||
+              +p.providerUpdatedAt >= +s.providerUpdatedAt)));
+      const responseParcel = parsePackages(raw).find(matchesTracking);
+      let observed =
+        responseParcel && verifiesReady(responseParcel)
+          ? responseParcel
+          : undefined;
+      // An acknowledgement cannot override a contradictory situation supplied
+      // alongside it. Verify the current parcel instead of assuming Ready.
+      if (responseParcel?.providerStatus && !observed) confirmed = undefined;
+      if (!confirmed) {
+        // Some /pret responses omit Tracking/MessageRetour even though the
+        // transition succeeded. /lire verifies the same persisted parcel; never
+        // resend /pret or create a replacement parcel to resolve ambiguity.
+        let readback;
+        try {
+          readback = this.sanitize(
+            await this.client.readPackages([s.tracking]),
+          );
+        } catch (error) {
+          const failure = new AppError(
+            "Courier readiness could not be verified. Refresh tracking before retrying.",
+            502,
+            "DELIVERY_ERROR",
+          );
+          failure.providerData = {
+            readiness: raw,
+            verificationError: this.sanitize(
+              error.providerData || error.message,
+            ),
+          };
+          throw failure;
+        }
+        observed = parsePackages(readback).find(verifiesReady);
+        raw = { readiness: raw, verification: readback };
+        if (observed)
+          confirmed = { MessageRetour: observed.messageRetour || "Good" };
+      }
       if (!confirmed) {
         const failure = new AppError(
           "Courier readiness was not confirmed for this tracking number. Refresh tracking before retrying.",
@@ -528,7 +824,30 @@ export class DeliverySyncService {
         failure.providerData = this.client.lastResponse || { body: raw };
         throw failure;
       }
-      return transaction(async (session) => {
+      return await transaction(async (session) => {
+        const current = await Order.findById(orderId).session(session);
+        const shipment = await Shipment.findOne({
+          orderId,
+          readinessLockToken: readinessToken,
+        }).session(session);
+        assert(
+          current &&
+            shipment &&
+            shipment.lockUntil > new Date() &&
+            !current.deletedAt &&
+            (options.expectedRevision === undefined ||
+              current.revision === options.expectedRevision),
+          "Order changed while courier readiness was being verified. Refresh tracking.",
+          409,
+        );
+        if (productionOrder)
+          assert(
+            current.tracking?.stage === "AT_PRODUCTION" &&
+              !current.tracking.blockingIssues &&
+              !current.tracking.courierOwned,
+            "Production changed during readiness verification.",
+            409,
+          );
         // /pret was accepted by the courier: its readiness status is authoritative.
         const updatedOrder = await transition(
           orderId,
@@ -538,26 +857,58 @@ export class DeliverySyncService {
         );
         if (options.onConfirmed)
           await options.onConfirmed(updatedOrder, session);
-        const shipment = await Shipment.findOne({ orderId }).session(session);
+        else if (productionOrder) {
+          updatedOrder.tracking.stage = "READY_TO_SHIP";
+          updatedOrder.tracking.stageEnteredAt = new Date();
+          updatedOrder.revision++;
+          await updatedOrder.save({ session });
+          await TrackingEvent.create(
+            [
+              {
+                orderId,
+                kind: "TRACKING_STAGE_CHANGED",
+                previousStage: "AT_PRODUCTION",
+                newStage: "READY_TO_SHIP",
+                actor,
+                revision: updatedOrder.revision,
+                data: { courierReadinessConfirmed: true },
+              },
+            ],
+            { session },
+          );
+        }
         shipment.status = "READY_TO_SHIP";
         shipment.lockUntil = null;
+        shipment.readinessLockToken = undefined;
         shipment.uncertain = false;
         shipment.syncStatus = "SYNCED";
         shipment.lastError = "";
         shipment.lastSyncedAt = new Date();
         shipment.sanitizedProviderData = raw;
         shipment.messageRetour = confirmed.MessageRetour;
+        if (observed) {
+          shipment.providerStatus = observed.providerStatus;
+          shipment.providerSituationId = observed.providerSituationId;
+          if (observed.providerUpdatedAt)
+            shipment.providerUpdatedAt = observed.providerUpdatedAt;
+          shipment.lastObservation = { ...observed, receivedAt: new Date() };
+        } else {
+          // A confirmed /pret without a situation must not keep presenting the
+          // previous En Préparation value as the current courier situation.
+          shipment.providerStatus = undefined;
+          shipment.providerSituationId = undefined;
+        }
         await shipment.save({ session });
         return shipment;
       });
     } catch (error) {
       // The request may have reached ABEX even on a timeout. Do not retry blindly.
       await Shipment.updateOne(
-        { _id: s._id },
+        { _id: s._id, readinessLockToken: readinessToken },
         {
           $set: {
             syncStatus: "ERROR",
-            uncertain: true,
+            ...(readinessSent ? { uncertain: true } : {}),
             lastError:
               error instanceof AppError
                 ? error.message
@@ -567,6 +918,7 @@ export class DeliverySyncService {
               ? { sanitizedProviderData: this.sanitize(error.providerData) }
               : {}),
           },
+          $unset: { readinessLockToken: 1 },
         },
       );
       throw error;

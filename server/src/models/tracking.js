@@ -16,6 +16,7 @@ export const trackingSchema = new Schema(
     stageEnteredAt: Date,
     initializedAt: Date,
     courierOwned: { type: Boolean, default: false },
+    readinessDeleted: { type: Boolean, default: false },
     designerId: { type: Schema.Types.ObjectId, ref: "User" },
     productionId: { type: Schema.Types.ObjectId, ref: "User" },
     openIssues: { type: Number, default: 0 },

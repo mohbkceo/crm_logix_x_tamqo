@@ -1712,12 +1712,13 @@ test("provider forward jumps record only observed statuses and cannot reopen a t
     delete process.env.DELIVERY_STATUS_MAP;
   }
 });
-test("ready calls only pret and transitions the prepared order", async () => {
+test("ready verifies En préparation before pret and transitions an In Production order", async () => {
   const order = await createOrder(input());
   await transition(order._id, "CONFIRMED");
   await transition(order._id, "PREPARING");
+  await Order.updateOne({ _id: order._id }, { "tracking.stage": "AT_PRODUCTION" });
   let readyCalls = 0,
-    providerStatus = "preparing",
+    providerStatus = "En préparation",
     readCalls = 0;
   process.env.DELIVERY_STATUS_MAP = JSON.stringify({
     preparing: "PREPARING",
@@ -1758,7 +1759,7 @@ test("ready calls only pret and transitions the prepared order", async () => {
     await service.create(order._id);
     await service.ready(order._id);
     assert.equal(readyCalls, 1);
-    assert.equal(readCalls, 0);
+    assert.equal(readCalls, 1);
     assert.equal((await Order.findById(order._id)).status, "READY_TO_SHIP");
   } finally {
     delete process.env.DELIVERY_STATUS_MAP;
