@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { Fragment, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { Link } from "react-router-dom";
 import {
   ArrowLeft,
@@ -9,12 +10,16 @@ import {
   Search,
   Flag,
   Star,
+  SlidersHorizontal,
+  ArrowDownUp,
+  MessageSquareText,
+  ShoppingBag,
+  CalendarDays,
 } from "lucide-react";
 import { api, useApi, params, money, date } from "../api";
 import { P, can, useUser } from "../access";
 import { MediaGallery } from "../MediaGallery";
 import {
-  PageHeader,
   ErrorBox,
   Loading,
   Empty,
@@ -75,6 +80,8 @@ const STATUS_AR = {
 const TAGS_AR = {
   IMPORTANT: "مهم",
   NEW: "جديد",
+  LT4D: "أقل من 4 أيام",
+  GTE4D: "4 أيام فأكثر",
   ISSUES: "به مشكلات",
   BLOCKED: "معيق",
   NO_ISSUES: "دون مشكلات",
@@ -114,18 +121,167 @@ function ContactLink({ contact, children }) {
     </span>
   );
 }
-const age = (value) => {
-  if (!value) return "مدة المرحلة غير معروفة";
-  const hours = Math.max(
-    0,
-    Math.floor((Date.now() - new Date(value)) / 3600000),
-  );
+// Creation age is independent of the time spent in the current production stage.
+const creationPeriod = (value) => {
+  const timestamp = value ? new Date(value).getTime() : NaN;
+  if (!Number.isFinite(timestamp)) return "تاريخ غير معروف";
+  const hours = Math.max(0, Math.floor((Date.now() - timestamp) / 3600000));
   return hours < 1
-    ? "أقل من ساعة"
+    ? "منذ أقل من ساعة"
     : hours < 24
-      ? `${hours} ساعة في هذه المرحلة`
-      : `${Math.floor(hours / 24)} يوم و${hours % 24} ساعة في هذه المرحلة`;
+      ? `منذ ${hours} ساعة`
+      : `منذ ${Math.floor(hours / 24)} يوم`;
 };
+const creationDay = (value) => {
+  const timestamp = value ? new Date(value).getTime() : NaN;
+  return Number.isFinite(timestamp)
+    ? new Intl.DateTimeFormat("ar-DZ", {
+        day: "numeric",
+        month: "long",
+        year: "numeric",
+        timeZone: "Africa/Algiers",
+      }).format(timestamp)
+    : "تاريخ غير معروف";
+};
+const itemCount = (order) =>
+  (order.items || []).reduce(
+    (total, item) => total + (Number(item.quantity) || 0),
+    0,
+  );
+const orderTotal = (order) =>
+  order.totalOrderValue != null &&
+  Number.isFinite(Number(order.totalOrderValue))
+    ? Number(order.totalOrderValue)
+    : null;
+const nextStage = (order) => {
+  // Forward progress belongs on the badge; reversals stay in the action menu.
+  const next = { PREPARING: "AT_PRODUCTION", AT_PRODUCTION: "READY_TO_SHIP" }[
+    order.tracking.stage
+  ];
+  return !order.deleted &&
+    !order.courierOwned &&
+    order.allowedTargets.includes(next)
+    ? next
+    : null;
+};
+
+/** Fixed positioning keeps the action menu outside the scrolling desktop table. */
+function OrderMenu({ orderNumber, children }) {
+  const ref = useRef(null);
+  const menuRef = useRef(null);
+  const [position, setPosition] = useState(null);
+  useEffect(() => {
+    const dismiss = () => {
+      ref.current?.removeAttribute("open");
+      setPosition(null);
+    };
+    const close = (event) => {
+      if (
+        !ref.current?.contains(event.target) &&
+        !menuRef.current?.contains(event.target)
+      )
+        dismiss();
+    };
+    const escape = (event) => {
+      if (event.key === "Escape" && ref.current?.open) {
+        dismiss();
+        ref.current.querySelector("summary")?.focus();
+      }
+    };
+    document.addEventListener("pointerdown", close);
+    document.addEventListener("keydown", escape);
+    window.addEventListener("resize", dismiss);
+    return () => {
+      document.removeEventListener("pointerdown", close);
+      document.removeEventListener("keydown", escape);
+      window.removeEventListener("resize", dismiss);
+    };
+  }, []);
+  useEffect(() => {
+    if (position)
+      menuRef.current
+        ?.querySelector("a[href], button:not(:disabled)")
+        ?.focus({ preventScroll: true });
+  }, [position]);
+  return (
+    <>
+      <details
+        ref={ref}
+        className="tracking-more"
+        onToggle={(event) => {
+          if (!event.currentTarget.open) {
+            setPosition(null);
+            return;
+          }
+          const rect = event.currentTarget.getBoundingClientRect();
+          const width = Math.min(280, window.innerWidth - 24);
+          setPosition({
+            width,
+            left: Math.max(
+              12,
+              Math.min(rect.left, window.innerWidth - width - 12),
+            ),
+            top: Math.max(
+              12,
+              Math.min(rect.bottom + 6, window.innerHeight - 412),
+            ),
+          });
+        }}
+      >
+        <summary
+          aria-label={`إجراءات إضافية للطلب ${orderNumber}`}
+          aria-expanded={Boolean(position)}
+        >
+          <MoreHorizontal size={18} />
+        </summary>
+      </details>
+      {position &&
+        createPortal(
+          <div
+            className="tracking-page tracking-menu-portal"
+            dir="rtl"
+            lang="ar"
+          >
+            <div className="tracking-more">
+              <div
+                ref={menuRef}
+                className="tracking-order-menu"
+                style={position}
+                role="region"
+                aria-label={`إجراءات الطلب ${orderNumber}`}
+                onKeyDown={(event) => {
+                  if (event.key === "Tab") {
+                    const items = menuRef.current.querySelectorAll(
+                      "a[href], button:not(:disabled)",
+                    );
+                    if (
+                      (!event.shiftKey &&
+                        event.target === items[items.length - 1]) ||
+                      (event.shiftKey && event.target === items[0])
+                    ) {
+                      event.preventDefault();
+                      ref.current.removeAttribute("open");
+                      setPosition(null);
+                      ref.current.querySelector("summary").focus();
+                    }
+                  }
+                }}
+                onClick={(event) => {
+                  if (event.target.closest("button, a")) {
+                    ref.current.removeAttribute("open");
+                    setPosition(null);
+                  }
+                }}
+              >
+                {children}
+              </div>
+            </div>
+          </div>,
+          document.body,
+        )}
+    </>
+  );
+}
 /** Full-size, keyboard-accessible order image preview. */
 function TrackingImageViewer({ order, onClose }) {
   const [index, setIndex] = useState(0);
@@ -392,67 +548,117 @@ export function Tracking() {
   );
   return (
     <div className="tracking-page" dir="rtl" lang="ar">
-      <div className="tracking-page-heading">
-        <PageHeader
-          eyebrow="العمليات / تتبع الطلبات"
-          title="تتبع الطلبات"
-          description="تابع مراحل الإنتاج وحالة الطلبات بسهولة."
+      <header className="tracking-page-heading">
+        <h1>
+          <ShoppingBag size={22} aria-hidden="true" /> الطلبات
+        </h1>
+        <button
+          onClick={result.reload}
+          disabled={busy || result.loading}
+          aria-label="تحديث التتبع"
         >
-          <button
-            onClick={result.reload}
-            disabled={busy}
-            aria-label="تحديث التتبع"
-          >
-            <RefreshCw size={16} /> تحديث
-          </button>
-        </PageHeader>
-      </div>
-      <div className="panel tracking-panel" aria-busy={busy}>
-        <div className="tracking-mobile-topbar">
-          <button
-            type="button"
-            onClick={result.reload}
-            disabled={busy || result.loading}
-            aria-label="تحديث الطلبات"
-          >
-            <RefreshCw size={18} />
-          </button>
-        </div>
+          <RefreshCw size={16} />
+          <span>تحديث</span>
+        </button>
+      </header>
+      <section
+        className="tracking-summary"
+        aria-label="ملخص الطلبات في الصفحة الحالية"
+      >
+        <span className="tracking-summary-period">
+          <CalendarDays size={16} /> هذه الصفحة
+        </span>
+        {[
+          ["الطلبات", rows.length],
+          ["إجمالي القطع", rows.reduce((sum, o) => sum + itemCount(o), 0)],
+          [
+            "القيمة الإجمالية",
+            rows.every((o) => orderTotal(o) !== null)
+              ? money(rows.reduce((sum, o) => sum + orderTotal(o), 0))
+              : "—",
+          ],
+          [
+            "جاهز للشحن",
+            rows.filter(
+              (o) => !o.deleted && o.tracking.stage === "READY_TO_SHIP",
+            ).length,
+          ],
+          [
+            "البلاغات المفتوحة",
+            rows.reduce((sum, o) => sum + (o.tracking.openIssues || 0), 0),
+          ],
+        ].map(([label, value]) => (
+          <div key={label}>
+            <span>{label}</span>
+            <strong>
+              <bdi>{result.loading ? "…" : value}</bdi>
+            </strong>
+          </div>
+        ))}
+      </section>
+      <div className="panel tracking-panel" aria-busy={busy || result.loading}>
         <div className="tracking-filters">
           <label className="tracking-search">
             <Search size={16} />
             <input
               aria-label="البحث في الطلبات"
-              placeholder="ابحث بالطلب أو العميل أو الهاتف أو المنتج أو رقم التتبع…"
+              placeholder="بحث في الطلبات"
               value={filters.search || ""}
               onChange={(e) => change("search", e.target.value)}
             />
           </label>
-          <select
-            aria-label="مرحلة الإنتاج"
-            value={filters.stage || ""}
-            onChange={(e) => change("stage", e.target.value)}
+          <button
+            className="tracking-sort"
+            aria-label={
+              filters.sort === "newest"
+                ? "ترتيب الأقدم أولاً"
+                : "ترتيب الأحدث أولاً"
+            }
+            title={
+              filters.sort === "newest"
+                ? "الأحدث أولاً"
+                : filters.sort === "oldest"
+                  ? "الأقدم أولاً"
+                  : "المشكلات أولاً"
+            }
+            onClick={() =>
+              change("sort", filters.sort === "newest" ? "oldest" : "newest")
+            }
           >
-            <option value="">جميع مراحل الإنتاج</option>
-            {Object.entries(STAGE_LABELS).map(([k]) => (
-              <option key={k} value={k}>
-                {stageLabel(k)}
-              </option>
-            ))}
-          </select>
-          <select
-            aria-label="حالة البلاغات"
-            value={filters.issue || ""}
-            onChange={(e) => change("issue", e.target.value)}
-          >
-            <option value="">جميع البلاغات</option>
-            <option value="OPEN">البلاغات غير المحلولة</option>
-            <option value="BLOCKING">البلاغات المعيقة</option>
-            <option value="NONE">دون بلاغات مفتوحة</option>
-          </select>
+            <ArrowDownUp size={18} />
+          </button>
           <details className="tracking-filter-details">
-            <summary>فلاتر متقدمة</summary>
+            <summary aria-label="تصفية الطلبات">
+              <SlidersHorizontal size={18} />
+              <span>الفلاتر</span>
+            </summary>
             <div className="filter-grid">
+              <Field label="مرحلة الإنتاج">
+                <select
+                  aria-label="مرحلة الإنتاج"
+                  value={filters.stage || ""}
+                  onChange={(e) => change("stage", e.target.value)}
+                >
+                  <option value="">جميع مراحل الإنتاج</option>
+                  {Object.entries(STAGE_LABELS).map(([k]) => (
+                    <option key={k} value={k}>
+                      {stageLabel(k)}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+              <Field label="حالة البلاغات">
+                <select
+                  aria-label="حالة البلاغات"
+                  value={filters.issue || ""}
+                  onChange={(e) => change("issue", e.target.value)}
+                >
+                  <option value="">جميع البلاغات</option>
+                  <option value="OPEN">البلاغات غير المحلولة</option>
+                  <option value="BLOCKING">البلاغات المعيقة</option>
+                  <option value="NONE">دون بلاغات مفتوحة</option>
+                </select>
+              </Field>
               <Field label="حالة التوصيل">
                 <select
                   value={filters.courierStatus || ""}
@@ -470,7 +676,9 @@ export function Tracking() {
                     "RETURNED",
                     "CANCELLED",
                   ].map((s) => (
-                    <option key={s}>{s}</option>
+                    <option key={s} value={s}>
+                      {localizedStatus(s)}
+                    </option>
                   ))}
                 </select>
               </Field>
@@ -548,48 +756,67 @@ export function Tracking() {
                   </option>
                 </select>
               </Field>
+              <div className="tracking-extra-filters">
+                <div
+                  className="tracking-quick-filters"
+                  role="group"
+                  aria-label="فلاتر سريعة"
+                >
+                  {QUICK_TAGS.map((tag) => (
+                    <button
+                      key={tag.value}
+                      className={`tracking-filter-chip ${activeTags.has(tag.value) ? "active" : ""}`}
+                      aria-pressed={activeTags.has(tag.value)}
+                      disabled={busy}
+                      onClick={() => toggleTag(tag)}
+                      title="تراعي الأعداد الفلاتر الأخرى؛ تُجمع الوسوم في الفئة نفسها بشرط «أو»."
+                    >
+                      {quickTagLabel(tag)}
+                      {!result.loading &&
+                        result.data?.tagCounts?.[tag.value] !== undefined && (
+                          <span className="tracking-chip-count">
+                            {result.data.tagCounts[tag.value]}
+                          </span>
+                        )}
+                    </button>
+                  ))}
+                </div>
+                <div className="tracking-filter-tools">
+                  <span role="status" aria-live="polite">
+                    {result.loading
+                      ? "جارٍ تحديث النتائج…"
+                      : result.data
+                        ? `${result.data.total} طلب مطابق`
+                        : ""}
+                  </span>
+                  <button disabled={busy} onClick={() => resetFilters(false)}>
+                    مسح الفلاتر
+                  </button>
+                  <button disabled={busy} onClick={() => resetFilters(true)}>
+                    عرضي الافتراضي
+                  </button>
+                </div>
+              </div>
             </div>
           </details>
         </div>
-        <div
-          className="tracking-quick-filters"
-          role="group"
-          aria-label="فلاتر سريعة"
-        >
-          {QUICK_TAGS.map((tag) => (
+        <nav className="tracking-view-tabs" aria-label="مراحل الطلبات">
+          {[
+            ["", "الكل"],
+            ["PREPARING", "قيد التحضير"],
+            ["AT_PRODUCTION", "قيد الإنتاج"],
+            ["READY_TO_SHIP", "جاهز للشحن"],
+          ].map(([stage, label]) => (
             <button
-              key={tag.value}
-              className={`tracking-filter-chip ${activeTags.has(tag.value) ? "active" : ""}`}
-              aria-pressed={activeTags.has(tag.value)}
-              disabled={busy}
-              onClick={() => toggleTag(tag)}
-              title="تراعي الأعداد الفلاتر الأخرى؛ تُجمع الوسوم في الفئة نفسها بشرط «أو»."
+              key={stage}
+              className={(filters.stage || "") === stage ? "active" : ""}
+              aria-pressed={(filters.stage || "") === stage}
+              onClick={() => change("stage", stage)}
             >
-              {quickTagLabel(tag)}
-              {!result.loading &&
-                result.data?.tagCounts?.[tag.value] !== undefined && (
-                  <span className="tracking-chip-count">
-                    {result.data.tagCounts[tag.value]}
-                  </span>
-                )}
+              {label}
             </button>
           ))}
-        </div>
-        <div className="tracking-filter-tools">
-          <span role="status" aria-live="polite">
-            {result.loading
-              ? "جارٍ تحديث النتائج…"
-              : result.data
-                ? `${result.data.total} طلب مطابق`
-                : ""}
-          </span>
-          <button disabled={busy} onClick={() => resetFilters(false)}>
-            مسح الفلاتر
-          </button>
-          <button disabled={busy} onClick={() => resetFilters(true)}>
-            عرضي الافتراضي
-          </button>
-        </div>
+        </nav>
         <ErrorBox
           error={error || result.error || types.error || employees.error}
         />
@@ -598,7 +825,7 @@ export function Tracking() {
             {message}
           </p>
         )}
-        {can(user, P.tracking.bulkUpdate) && (
+        {can(user, P.tracking.bulkUpdate) && selected.length > 0 && (
           <div className="tracking-bulk">
             <label>
               <input
@@ -637,295 +864,363 @@ export function Tracking() {
             text="جرّب مرحلة أخرى أو غيّر البحث."
           />
         ) : (
-          <div className="tracking-list">
-            <div
-              className="tracking-order-row tracking-head"
-              aria-hidden="true"
-            >
-              <span />
-              <span>الزبون</span>
-              <span>السعر الإجمالي</span>
-              <span>المنتجات</span>
-              <span>الإنتاج</span>
-              <span>المسؤول / شركة التوصيل</span>
+          <div
+            className="tracking-list"
+            role="region"
+            aria-label="قائمة الطلبات"
+            tabIndex={0}
+          >
+            <div className="tracking-order-row tracking-head">
+              <span className="tracking-selection">
+                {can(user, P.tracking.bulkUpdate) && (
+                  <input
+                    type="checkbox"
+                    aria-label="تحديد كل الطلبات المؤهلة"
+                    checked={
+                      selectable.length > 0 &&
+                      selectable.every((o) => selected.includes(o._id))
+                    }
+                    disabled={busy || result.loading || !selectable.length}
+                    onChange={(e) =>
+                      setSelected(
+                        e.target.checked ? selectable.map((o) => o._id) : [],
+                      )
+                    }
+                  />
+                )}
+              </span>{" "}
+              <span>الطلب</span>
+              <span>منذ الإنشاء</span>
+              <span>العميل</span>
+              <span>الإجمالي</span>
+              <span>الملاحظات والبلاغات</span>
+              <span>حالة الطلب</span>
+              <span>القطع</span>
+              <span>المسؤول / التوصيل</span>
               <span>الإجراءات</span>
             </div>
-            {rows.map((o) => {
-              const target = o.allowedTargets.includes("READY_TO_SHIP")
-                ? "READY_TO_SHIP"
-                : o.allowedTargets[0];
+            {rows.map((o, index) => {
+              const target = nextStage(o);
+              const status =
+                o.courierOwned || o.deleted
+                  ? o.displayStatus || o.status
+                  : o.tracking.stage;
+              const label =
+                o.courierOwned || o.deleted
+                  ? localizedStatus(status)
+                  : stageLabel(status);
+              const day = creationDay(o.createdAt);
               return (
-                <article
-                  key={o._id}
-                  className={`tracking-order-row stage-${o.tracking.stage.toLowerCase()} ${o.deleted ? "readiness-deleted" : ""}`}
-                  aria-label={o.orderNumber}
-                >
-                  <div className="tracking-selection">
-                    {can(user, P.tracking.bulkUpdate) && (
-                      <input
-                        type="checkbox"
-                        aria-label={`تحديد ${o.orderNumber}`}
-                        checked={selected.includes(o._id)}
-                        disabled={busy || !o.allowedTargets.length}
-                        onChange={(e) =>
-                          setSelected((s) =>
-                            e.target.checked
-                              ? [...s, o._id]
-                              : s.filter((id) => id !== o._id),
-                          )
-                        }
-                      />
-                    )}
-                  </div>
-                  <div className="tracking-person">
-                    {o.images[0] && (
-                      <button
-                        className="tracking-thumb"
-                        aria-label={`معاينة صورة الطلب ${o.orderNumber}`}
-                        onClick={() => open("image", o)}
-                      >
-                        <img
-                          src={o.images[0].url + "?thumbnail=true"}
-                          alt="صورة الطلب"
-                          loading="lazy"
-                        />
-                      </button>
-                    )}
-                    <div className="tracking-person-main">
-                      <div className="tracking-name-line">
-                        <strong>{o.customer.name}</strong>
-                        {o.canMarkImportant ? (
-                          <button
-                            className={`tracking-important ${o.tracking.important ? "active" : ""}`}
-                            aria-label={`${o.tracking.important ? "إلغاء تمييز" : "تمييز"} ${o.orderNumber} كمهم`}
-                            aria-pressed={Boolean(o.tracking.important)}
-                            title={
-                              o.tracking.important
-                                ? "إزالة علامة الأهمية"
-                                : "تمييز كمهم"
-                            }
-                            disabled={busy}
-                            onClick={() =>
-                              perform(
-                                () =>
-                                  api(`/tracking/${o._id}/important`, {
-                                    method: "PATCH",
-                                    body: {
-                                      important: !o.tracking.important,
-                                      expectedRevision: o.revision,
-                                    },
-                                  }),
-                                o.tracking.important
-                                  ? "أُزيلت علامة الأهمية"
-                                  : "تم تمييز الطلب كمهم",
-                              )
-                            }
-                          >
-                            <Star
-                              size={14}
-                              fill={
-                                o.tracking.important ? "currentColor" : "none"
-                              }
-                            />
-                          </button>
-                        ) : o.tracking.important ? (
-                          <span
-                            className="tracking-important-indicator"
-                            title="مهم"
-                            aria-label="مهم"
-                          >
-                            <Star size={14} fill="currentColor" />
-                          </span>
-                        ) : null}
-                      </div>
-                      <small>{o.customer.phoneA}</small>
-                    </div>
-                  </div>
-                  <div className="tracking-price" data-label="السعر الإجمالي">
-                    {o.totalOrderValue != null &&
-                    Number.isFinite(Number(o.totalOrderValue)) ? (
-                      money(o.totalOrderValue)
-                    ) : (
-                      <span className="tracking-not-available">—</span>
-                    )}
-                  </div>
-                  <div className="tracking-products" data-label="المنتجات">
-                    {o.items.map((i, n) => (
-                      <div key={n}>
-                        <b>
-                          {i.quantity} × {i.name}
-                        </b>
-                        {i.specifications && <small>{i.specifications}</small>}
-                      </div>
-                    ))}
-                  </div>
-                  <div className="tracking-stage" data-label="الإنتاج">
-                    <span
-                      className="tracking-stage-current"
-                      aria-label={`الحالة الحالية: ${o.courierOwned || o.deleted ? localizedStatus(o.displayStatus || o.status) : stageLabel(o.tracking.stage)}`}
-                    >
-                      {o.courierOwned || o.deleted
-                        ? localizedStatus(o.displayStatus || o.status)
-                        : stageLabel(o.tracking.stage)}
-                    </span>
-                    {o.readiness?.canEnable && (
-                      <button
-                        type="button"
-                        className="tracking-stage-next"
-                        disabled={busy || result.loading}
-                        onClick={() => move(o, "READY_TO_SHIP")}
-                        aria-label={`جاهز للشحن للطلب ${o.orderNumber}`}
-                      >
-                        جاهز للشحن
-                      </button>
-                    )}
-                    {target && target !== "READY_TO_SHIP" && (
-                      <button
-                        type="button"
-                        className="tracking-stage-next"
-                        disabled={busy}
-                        onClick={() => move(o, target)}
-                        aria-label={`نقل طلب ${o.customer.name} إلى ${stageLabel(target)}`}
-                      >
-                        نقل إلى {stageLabel(target)}
-                        <ArrowLeft size={15} aria-hidden="true" />
-                      </button>
-                    )}
-                    <small className="courier-owned">
-                      {o.courierOwned
-                        ? "هذا الطلب تحت إدارة شركة التوصيل"
-                        : age(o.tracking.stageEnteredAt)}
-                    </small>
-                    {o.tracking.openIssues > 0 && (
-                      <button
-                        className={`tracking-issue-count ${o.tracking.criticalIssues ? "critical" : o.tracking.blockingIssues ? "blocking" : ""}`}
-                        disabled={!can(user, P["tracking.issue"].view)}
-                        onClick={() => open("issues", o)}
-                      >
-                        <Flag size={13} />
-                        {o.tracking.openIssues} بلاغ مفتوح
-                        {o.tracking.criticalIssues
-                          ? " · حرج"
-                          : o.tracking.blockingIssues > 0
-                            ? " · معيق"
-                            : ""}
-                      </button>
-                    )}
-                  </div>
-                  <div
-                    className="tracking-responsible"
-                    data-label="المسؤول / شركة التوصيل"
+                <Fragment key={o._id}>
+                  {(index === 0 ||
+                    day !== creationDay(rows[index - 1].createdAt)) && (
+                    <h2 className="tracking-date-group">{day}</h2>
+                  )}
+                  <article
+                    className={`tracking-order-row stage-${status.toLowerCase()} ${o.deleted ? "readiness-deleted" : ""}`}
+                    aria-label={o.orderNumber}
                   >
-                    {o.responsible.name && <span>{o.responsible.name}</span>}
-                    <small title={o.shipment?.providerStatus || undefined}>
-                      {o.shipment?.status
-                        ? localizedStatus(o.shipment.status)
-                        : o.shipment?.providerStatus || ""}
-                    </small>
-                    {o.shipment?.tracking && (
-                      <small>{o.shipment.tracking}</small>
-                    )}
-                  </div>
-                  <div className="tracking-actions">
-                    {!o.deleted && can(user, P["tracking.issue"].create) && (
-                      <button
-                        className="tracking-report-action"
-                        disabled={busy}
-                        onClick={() => open("report", o)}
-                      >
-                        <Flag size={15} aria-hidden="true" />
-                        <span>إبلاغ عن مشكلة</span>
-                      </button>
-                    )}
-                    <details className="tracking-more">
-                      <summary
-                        aria-label={`إجراءات إضافية للطلب ${o.orderNumber}`}
-                      >
-                        <MoreHorizontal size={18} />
-                        <span className="tracking-more-label">المزيد</span>
-                      </summary>
-                      <div>
-                        <span className="tracking-more-reference">
-                          {o.orderNumber}
-                        </span>
-                        <ContactLink contact={o.creatorContact}>
-                          التواصل مع مُنشئ الطلب
-                        </ContactLink>
-                        <ContactLink contact={o.responsible}>
-                          التواصل مع المسؤول الحالي
-                        </ContactLink>
-                        {o.shipment?.url ? (
-                          <a
-                            href={o.shipment.url}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                          >
-                            عرض لدى شركة التوصيل
-                          </a>
-                        ) : (
-                          <span className="unavailable-contact">
-                            عرض لدى شركة التوصيل
-                            <small>
-                              {o.shipment?.tracking
-                                ? "رابط التتبع الخارجي غير متاح لهذه الشركة"
-                                : "لا يوجد رقم تتبع بعد"}
-                            </small>
-                          </span>
-                        )}
-                        {can(user, P["tracking.issue"].view) && (
-                          <button onClick={() => open("issues", o)}>
-                            البلاغات والسجل
-                          </button>
-                        )}
-                        {!o.deleted && can(user, P.tracking.assign) && (
-                          <button onClick={() => open("assign", o)}>
-                            تعيين موظف
-                          </button>
-                        )}
-                        {o.canInitialize && (
-                          <button
-                            disabled={busy}
-                            onClick={() =>
-                              perform(
-                                () =>
-                                  api(`/tracking/${o._id}/initialize`, {
-                                    method: "POST",
-                                    body: { expectedRevision: o.revision },
-                                  }),
-                                "بدأت عملية الإنتاج",
-                              )
+                    <div className="tracking-selection">
+                      {can(user, P.tracking.bulkUpdate) && (
+                        <input
+                          type="checkbox"
+                          aria-label={`تحديد ${o.orderNumber}`}
+                          checked={selected.includes(o._id)}
+                          disabled={
+                            busy ||
+                            result.loading ||
+                            !selectable.some((row) => row._id === o._id)
+                          }
+                          onChange={(e) =>
+                            setSelected((ids) =>
+                              e.target.checked
+                                ? [...ids, o._id]
+                                : ids.filter((id) => id !== o._id),
+                            )
+                          }
+                        />
+                      )}
+                    </div>
+                    <div className="tracking-identity">
+                      {o.canViewOrder ? (
+                        <Link to={`/orders/${o._id}`}>
+                          <bdi>{o.orderNumber}</bdi>
+                        </Link>
+                      ) : (
+                        <strong>
+                          <bdi>{o.orderNumber}</bdi>
+                        </strong>
+                      )}
+                      {o.canMarkImportant ? (
+                        <button
+                          className={`tracking-important ${o.tracking.important ? "active" : ""}`}
+                          aria-label={`${o.tracking.important ? "إلغاء تمييز" : "تمييز"} ${o.orderNumber} كمهم`}
+                          aria-pressed={Boolean(o.tracking.important)}
+                          title={
+                            o.tracking.important
+                              ? "إزالة علامة الأهمية"
+                              : "تمييز كمهم"
+                          }
+                          disabled={busy}
+                          onClick={() =>
+                            perform(
+                              () =>
+                                api(`/tracking/${o._id}/important`, {
+                                  method: "PATCH",
+                                  body: {
+                                    important: !o.tracking.important,
+                                    expectedRevision: o.revision,
+                                  },
+                                }),
+                              o.tracking.important
+                                ? "أُزيلت علامة الأهمية"
+                                : "تم تمييز الطلب كمهم",
+                            )
+                          }
+                        >
+                          <Star
+                            size={14}
+                            fill={
+                              o.tracking.important ? "currentColor" : "none"
                             }
+                          />
+                        </button>
+                      ) : o.tracking.important ? (
+                        <span
+                          className="tracking-important-indicator"
+                          title="مهم"
+                          aria-label="مهم"
+                        >
+                          <Star size={14} fill="currentColor" />
+                        </span>
+                      ) : null}
+                    </div>
+                    <div className="tracking-metadata">
+                      <span className="tracking-created" title={day}>
+                        {creationPeriod(o.createdAt)}
+                      </span>
+                      <span
+                        className="tracking-customer"
+                        title={o.customer.phoneA}
+                      >
+                        <bdi>{o.customer.name}</bdi>
+                      </span>
+                      <span
+                        className="tracking-item-count"
+                        title={o.items
+                          .map((i) => `${i.quantity} × ${i.name}`)
+                          .join("، ")}
+                      >
+                        <bdi>{itemCount(o)} قطعة</bdi>
+                      </span>
+                    </div>
+                    <div className="tracking-price" aria-label="السعر الإجمالي">
+                      <bdi>
+                        {orderTotal(o) === null ? "—" : money(orderTotal(o))}
+                      </bdi>
+                    </div>
+                    <div className="tracking-badges">
+                      <div className="tracking-reports">
+                        {o.tracking.openIssues > 0 ? (
+                          <button
+                            className={`tracking-badge tracking-issue-count ${o.tracking.criticalIssues ? "critical" : o.tracking.blockingIssues ? "blocking" : ""}`}
+                            disabled={!can(user, P["tracking.issue"].view)}
+                            onClick={() => open("issues", o)}
                           >
-                            بدء سير عمل الإنتاج
+                            <MessageSquareText size={13} />
+                            {o.tracking.openIssues} بلاغ
+                            {o.tracking.criticalIssues
+                              ? " · حرج"
+                              : o.tracking.blockingIssues
+                                ? " · معيق"
+                                : " مفتوح"}
                           </button>
-                        )}
-                        {o.allowedTargets
-                          .filter((t) => t !== target)
-                          .map((t) => (
-                            <button
-                              key={t}
-                              disabled={busy}
-                              onClick={() => move(o, t)}
-                            >
-                              نقل إلى {stageLabel(t)}
-                            </button>
-                          ))}
-                        {o.canViewOrder && (
-                          <Link to={`/orders/${o._id}`}>عرض الطلب</Link>
-                        )}
-                        {can(user, P.audit.view) && (
-                          <button onClick={() => open("history", o)}>
-                            سجل تدقيق التتبع
-                          </button>
+                        ) : o.note ? (
+                          <span
+                            className="tracking-badge tracking-note"
+                            title={o.note}
+                          >
+                            <MessageSquareText size={13} />
+                            ملاحظة
+                          </span>
+                        ) : (
+                          <span className="tracking-no-reports">—</span>
                         )}
                       </div>
-                    </details>
-                  </div>
-                </article>
+                      <div className="tracking-stage">
+                        {target ? (
+                          <button
+                            className="tracking-badge tracking-stage-current"
+                            disabled={busy || result.loading}
+                            onClick={() => move(o, target)}
+                            title={`نقل إلى ${stageLabel(target)}`}
+                            aria-label={`نقل طلب ${o.customer.name} إلى ${stageLabel(target)}`}
+                          >
+                            <span className="tracking-status-dot" />
+                            {label}
+                            <ArrowLeft size={12} />
+                          </button>
+                        ) : (
+                          <span
+                            className="tracking-badge tracking-stage-current"
+                            aria-label={`الحالة الحالية: ${label}`}
+                          >
+                            <span className="tracking-status-dot" />
+                            {label}
+                          </span>
+                        )}
+                      </div>
+                      <div className="tracking-actions">
+                        {!o.deleted &&
+                          can(user, P["tracking.issue"].create) && (
+                            <button
+                              className="tracking-report-action"
+                              aria-label="إبلاغ عن مشكلة"
+                              title="إبلاغ عن مشكلة"
+                              disabled={busy}
+                              onClick={() => open("report", o)}
+                            >
+                              <Flag size={15} aria-hidden="true" />
+                              <span>إبلاغ عن مشكلة</span>
+                            </button>
+                          )}
+                        <OrderMenu orderNumber={o.orderNumber}>
+                          <div className="tracking-order-details">
+                            <strong>
+                              <bdi>{o.customer.name}</bdi>
+                            </strong>
+                            <bdi>{o.customer.phoneA}</bdi>
+                            <span>أُنشئ في {creationDay(o.createdAt)}</span>
+                            <span>
+                              المسؤول: <bdi>{o.responsible.name || "—"}</bdi>
+                            </span>
+                            {o.shipment?.tracking && (
+                              <bdi>{o.shipment.tracking}</bdi>
+                            )}
+                            {o.shipment?.status && (
+                              <span>{localizedStatus(o.shipment.status)}</span>
+                            )}
+                            {o.items.map((item, index) => (
+                              <p key={index}>
+                                <bdi>
+                                  {item.quantity} × {item.name}
+                                </bdi>
+                                {item.specifications && (
+                                  <small dir="auto">
+                                    {item.specifications}
+                                  </small>
+                                )}
+                              </p>
+                            ))}
+                            {o.note && <p dir="auto">{o.note}</p>}
+                            {o.images.length > 0 && (
+                              <button onClick={() => open("image", o)}>
+                                عرض صور الطلب ({o.images.length})
+                              </button>
+                            )}
+                          </div>
+                          <span className="tracking-more-reference">
+                            {o.orderNumber}
+                          </span>
+                          <ContactLink contact={o.creatorContact}>
+                            التواصل مع مُنشئ الطلب
+                          </ContactLink>
+                          <ContactLink contact={o.responsible}>
+                            التواصل مع المسؤول الحالي
+                          </ContactLink>
+                          {o.shipment?.url ? (
+                            <a
+                              href={o.shipment.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                            >
+                              عرض لدى شركة التوصيل
+                            </a>
+                          ) : (
+                            <span className="unavailable-contact">
+                              عرض لدى شركة التوصيل
+                              <small>
+                                {o.shipment?.tracking
+                                  ? "رابط التتبع الخارجي غير متاح لهذه الشركة"
+                                  : "لا يوجد رقم تتبع بعد"}
+                              </small>
+                            </span>
+                          )}
+                          {can(user, P["tracking.issue"].view) && (
+                            <button onClick={() => open("issues", o)}>
+                              البلاغات والسجل
+                            </button>
+                          )}
+                          {!o.deleted && can(user, P.tracking.assign) && (
+                            <button onClick={() => open("assign", o)}>
+                              تعيين موظف
+                            </button>
+                          )}
+                          {o.canInitialize && (
+                            <button
+                              disabled={busy}
+                              onClick={() =>
+                                perform(
+                                  () =>
+                                    api(`/tracking/${o._id}/initialize`, {
+                                      method: "POST",
+                                      body: { expectedRevision: o.revision },
+                                    }),
+                                  "بدأت عملية الإنتاج",
+                                )
+                              }
+                            >
+                              بدء سير عمل الإنتاج
+                            </button>
+                          )}
+                          {o.allowedTargets
+                            .filter((t) => t !== target)
+                            .map((t) => (
+                              <button
+                                key={t}
+                                disabled={busy}
+                                onClick={() => move(o, t)}
+                              >
+                                نقل إلى {stageLabel(t)}
+                              </button>
+                            ))}
+                          {o.canViewOrder && (
+                            <Link to={`/orders/${o._id}`}>عرض الطلب</Link>
+                          )}
+                          {can(user, P.audit.view) && (
+                            <button onClick={() => open("history", o)}>
+                              سجل تدقيق التتبع
+                            </button>
+                          )}
+                        </OrderMenu>
+                      </div>
+                    </div>
+                    <div className="tracking-responsible">
+                      <span>
+                        <bdi>
+                          {o.courierOwned
+                            ? o.shipment?.agencyName || "شركة التوصيل"
+                            : o.responsible.name || "—"}
+                        </bdi>
+                      </span>
+                      {o.shipment?.status && (
+                        <small title={o.shipment.providerStatus}>
+                          {localizedStatus(o.shipment.status)}
+                        </small>
+                      )}
+                      {o.shipment?.tracking && (
+                        <small>
+                          <bdi>{o.shipment.tracking}</bdi>
+                        </small>
+                      )}
+                    </div>
+                  </article>
+                </Fragment>
               );
             })}
           </div>
         )}
+
         {result.data && (
           <Pagination
             {...result.data}
@@ -947,7 +1242,7 @@ export function Tracking() {
           title={`${modal.kind === "report" ? "إبلاغ عن مشكلة" : modal.kind === "issues" ? "البلاغات" : modal.kind === "assign" ? "التعيين" : "سجل تدقيق التتبع"} · ${modal.order.orderNumber}`}
           onClose={() => !busy && setModal(null)}
         >
-          <div className="modal-body">
+          <div className="modal-body" dir="rtl">
             <ErrorBox error={error} />
             {modal.kind === "report" && (
               <ReportForm

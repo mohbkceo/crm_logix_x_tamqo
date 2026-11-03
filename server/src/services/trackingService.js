@@ -673,6 +673,7 @@ export async function presentOrders(user, orders) {
       orderNumber: o.orderNumber,
       customer: o.customer,
       businessType: o.businessType,
+      totalOrderValue: o.totalOrderValue ?? null,
       items: o.items.map(({ name, quantity, specifications }) => ({
         name,
         quantity,

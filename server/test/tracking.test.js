@@ -279,7 +279,18 @@ test("new physical orders initialize independently; TAMQO stays outside Tracking
   const result = await listTracking(admin.user, {});
   assert.equal(result.total, 1);
   assert.equal(result.items[0].note, "Original order note");
-  assert.equal(result.items[0].totalOrderValue, undefined);
+  assert.equal(result.items[0].totalOrderValue, o.totalOrderValue);
+  const designerView = await designer.api.get("/api/tracking?stage=PREPARING");
+  assert.equal(designerView.status, 200);
+  assert.equal(designerView.body.items[0].totalOrderValue, o.totalOrderValue);
+  assert.equal(
+    designerView.body.items[0].items.reduce(
+      (sum, item) => sum + item.quantity,
+      0,
+    ),
+    2,
+  );
+  assert.equal(designerView.body.items[0].payment, undefined);
 });
 test("Designer toggles locally; Production Ready confirms ABEX /pret and locks the order", async () => {
   const o = await order(),

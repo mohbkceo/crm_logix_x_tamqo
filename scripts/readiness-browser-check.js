@@ -140,15 +140,15 @@ try {
     .getByLabel("Password", { exact: true })
     .fill("readiness-browser-password");
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
-  await page
-    .getByRole("heading", { name: "تتبع الطلبات", exact: true })
-    .waitFor();
+  await page.getByRole("heading", { name: "الطلبات", exact: true }).waitFor();
+  await page.getByLabel("تصفية الطلبات", { exact: true }).click();
   await page.getByRole("button", { name: "مسح الفلاتر", exact: true }).click();
+  await page.getByLabel("تصفية الطلبات", { exact: true }).click();
   const row = page.getByRole("article", { name: o.orderNumber, exact: true });
   await row.waitFor();
 
   const readyButton = row.getByRole("button", {
-    name: "جاهز للشحن للطلب " + o.orderNumber,
+    name: "نقل طلب " + o.customer.name + " إلى جاهز للشحن",
     exact: true,
   });
   await expect(readyButton).toBeVisible();
@@ -172,13 +172,11 @@ try {
       return box.x + box.width;
     })
     .toBeLessThanOrEqual(0);
-  await expect(
-    row.getByLabel("الحالة الحالية: قيد الإنتاج", { exact: true }),
-  ).toBeVisible();
+  await expect(row.locator(".tracking-stage-current")).toBeVisible();
   assert.equal(
     await row
       .locator(".tracking-stage")
-      .evaluate((el) => getComputedStyle(el, "::before").display),
+      .evaluate((el) => getComputedStyle(el, "::before").content),
     "none",
   );
   await page.screenshot({
@@ -213,9 +211,7 @@ try {
     providerStatus: "En Livraison",
     raw: {},
   });
-  await page
-    .getByRole("button", { name: "تحديث الطلبات", exact: true })
-    .click();
+  await page.getByRole("button", { name: "تحديث التتبع", exact: true }).click();
   await row
     .getByLabel("الحالة الحالية: قيد التوصيل", { exact: true })
     .waitFor();
@@ -227,9 +223,7 @@ try {
   await expect
     .poll(async () => Boolean((await Order.findById(o._id)).deletedAt))
     .toBe(true);
-  await page
-    .getByRole("button", { name: "تحديث الطلبات", exact: true })
-    .click();
+  await page.getByRole("button", { name: "تحديث التتبع", exact: true }).click();
   await row.getByLabel("الحالة الحالية: محذوف", { exact: true }).waitFor();
   await expect(readyButton).toHaveCount(0);
   await expect(row.getByRole("checkbox")).toHaveCount(0);
