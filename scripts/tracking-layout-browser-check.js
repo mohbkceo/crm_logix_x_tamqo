@@ -48,7 +48,8 @@ try {
     totalOrderValue: total,
     createdAt: new Date(now - (i < 3 ? 2 : 5) * 86400000).toISOString(),
     note: i === 1 ? "يرجى الاتصال قبل التوصيل" : "",
-    images: [],
+    images:
+      i < 2 ? [{ _id: "preview", url: `/api/order-media/${id}/preview` }] : [],
     revision: 4,
     tracking: {
       stage,
@@ -84,6 +85,13 @@ try {
   await page.route("**/api/**", async (route) => {
     const req = route.request(),
       url = new URL(req.url());
+    if (url.pathname.startsWith("/api/order-media/")) {
+      const portrait = url.pathname.includes("1292");
+      return route.fulfill({
+        contentType: "image/svg+xml",
+        body: `<svg xmlns="http://www.w3.org/2000/svg" width="${portrait ? 300 : 800}" height="${portrait ? 800 : 300}"><rect width="100%" height="100%" fill="#e1c9ab"/><circle cx="150" cy="150" r="90" fill="#527d75"/></svg>`,
+      });
+    }
     let data = {};
     if (url.pathname === "/api/auth/session")
       data = {
@@ -163,6 +171,40 @@ try {
       .getByRole("article", { name: "#1287", exact: true })
       .locator(".tracking-price"),
   ).toHaveText("—");
+  const thumbnail = first.getByRole("button", {
+    name: "تكبير صورة الطلب #1293",
+    exact: true,
+  });
+  const portraitThumbnail = page.getByRole("button", {
+    name: "تكبير صورة الطلب #1292",
+    exact: true,
+  });
+  for (const thumb of [thumbnail, portraitThumbnail]) {
+    await expect(thumb.locator("img")).toBeVisible();
+    const box = await thumb.boundingBox();
+    assert.equal(box.width, 40);
+    assert.equal(box.height, 40);
+  }
+  await expect(
+    page
+      .getByRole("article", { name: "#1287", exact: true })
+      .locator(".tracking-thumbnail-placeholder"),
+  ).toBeVisible();
+  await thumbnail.click();
+  const enlarged = page.locator(".tracking-image-stage > img");
+  await expect(enlarged).toBeVisible();
+  await expect(enlarged).toHaveAttribute(
+    "src",
+    "/api/order-media/1293/preview",
+  );
+  await enlarged.click();
+  await expect(page.locator(".tracking-image-overlay")).toHaveCount(0);
+  await expect(thumbnail).toBeFocused();
+  await thumbnail.focus();
+  await page.keyboard.press("Enter");
+  await expect(enlarged).toBeVisible();
+  await page.keyboard.press("Escape");
+  await expect(page.locator(".tracking-image-overlay")).toHaveCount(0);
   const selectAll = page.getByRole("checkbox", {
     name: "تحديد كل الطلبات المؤهلة",
   });
@@ -185,6 +227,13 @@ try {
       ),
       `No page overflow at ${width}`,
     );
+    const thumbBox = await thumbnail.boundingBox();
+    assert.equal(thumbBox.width, 40);
+    assert.equal(thumbBox.height, 40);
+    await thumbnail.click();
+    await expect(enlarged).toBeVisible();
+    await enlarged.click();
+    await expect(page.locator(".tracking-image-overlay")).toHaveCount(0);
     const menu = first.locator("summary");
     await menu.click();
     const panel = page.locator(".tracking-order-menu");

@@ -261,7 +261,7 @@
 .tracking-page .tracking-order-row {
   display: grid;
   grid-template-columns:
-    18px minmax(110px, 1fr) 105px minmax(130px, 1.4fr)
+    18px minmax(165px, 1fr) 105px minmax(130px, 1.4fr)
     115px minmax(130px, 1fr) minmax(125px, 1fr) 65px minmax(115px, 1fr) 64px;
   align-items: center;
   gap: 12px;
@@ -994,4 +994,37 @@
   .tracking-page .tracking-list .tracking-order-row {
     padding-bottom: 22px;
   }
+}
+
+/* Equal square thumbnails keep every order aligned regardless of image dimensions. */
+.tracking-page .tracking-order-thumbnail {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 40px;
+  width: 40px;
+  height: 40px;
+  min-width: 40px;
+  min-height: 40px;
+  padding: 0;
+  margin-inline-end: 5px;
+  overflow: hidden;
+  border: 1px solid #e3e3e3;
+  border-radius: 7px;
+  background: #f6f6f6;
+  cursor: zoom-in;
+}
+.tracking-page .tracking-order-thumbnail img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+}
+.tracking-page .tracking-thumbnail-placeholder {
+  color: #a1a1a1;
+  cursor: default;
+}
+.tracking-image-stage > img:focus-visible {
+  outline: 2px solid #4583d6;
+  outline-offset: 4px;
 }

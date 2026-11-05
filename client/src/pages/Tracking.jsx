@@ -15,6 +15,7 @@ import {
   MessageSquareText,
   ShoppingBag,
   CalendarDays,
+  Image as ImageIcon,
 } from "lucide-react";
 import { api, useApi, params, money, date } from "../api";
 import { P, can, useUser } from "../access";
@@ -282,6 +283,41 @@ function OrderMenu({ orderNumber, children }) {
     </>
   );
 }
+function OrderThumbnail({ order, onOpen }) {
+  const [failed, setFailed] = useState(false);
+  const image = order.images?.[0];
+  if (!image?.url || failed) {
+    return (
+      <span
+        className="tracking-order-thumbnail tracking-thumbnail-placeholder"
+        role="img"
+        aria-label="لا توجد صورة متاحة للطلب"
+        title="لا توجد صورة متاحة"
+      >
+        <ImageIcon size={19} aria-hidden="true" />
+      </span>
+    );
+  }
+  return (
+    <button
+      type="button"
+      className="tracking-order-thumbnail"
+      aria-label={`تكبير صورة الطلب ${order.orderNumber}`}
+      title="تكبير الصورة"
+      onClick={onOpen}
+    >
+      <img
+        src={`${image.url}${image.url.includes("?") ? "&" : "?"}thumbnail=true`}
+        alt=""
+        width={40}
+        height={40}
+        loading="lazy"
+        onError={() => setFailed(true)}
+      />
+    </button>
+  );
+}
+
 /** Full-size, keyboard-accessible order image preview. */
 function TrackingImageViewer({ order, onClose }) {
   const [index, setIndex] = useState(0);
@@ -362,8 +398,17 @@ function TrackingImageViewer({ order, onClose }) {
             key={images[index]._id || images[index].url}
             src={images[index].url}
             alt={`صورة الطلب ${index + 1} من ${count}`}
-            title="انقر لإغلاق المعاينة"
+            title="انقر لتصغير الصورة"
+            role="button"
+            tabIndex={0}
+            aria-label="تصغير الصورة والعودة إلى الطلبات"
             onClick={onClose}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                onClose();
+              }
+            }}
           />
           {count > 1 && (
             <button
@@ -942,6 +987,11 @@ export function Tracking() {
                       )}
                     </div>
                     <div className="tracking-identity">
+                      <OrderThumbnail
+                        key={o.images?.[0]?.url || "no-image"}
+                        order={o}
+                        onOpen={() => open("image", o)}
+                      />
                       {o.canViewOrder ? (
                         <Link to={`/orders/${o._id}`}>
                           <bdi>{o.orderNumber}</bdi>
