@@ -28,7 +28,7 @@ const statusTone = (status) =>
     ? "delivered"
     : status === "RUNNING"
       ? "shipped"
-      : status === "UNCHANGED" || status === "UNKNOWN_STATUS"
+      : status === "UNCHANGED" || status === "UNKNOWN_STATUS" || status === "SKIPPED"
         ? "confirmed"
         : "failed_delivery";
 const skipReasonCounters = [
@@ -78,6 +78,7 @@ function RunDetails({ id, onClose }) {
                   { key: "orderNumber", label: "Order Number" },
                   { key: "tracking", label: "Tracking" },
                   { key: "agencyName", label: "Agency" },
+                  { key: "provider", label: "Provider" },
                   {
                     key: "providerStatus",
                     label: "Provider Status Before → After",

@@ -24,6 +24,7 @@ import { assert } from "../errors.js";
 import { resolveCatalogItem } from "./catalogService.js";
 import { ensureReturnExpense, reverseReturnExpense } from "./delivery/deliveryFinancialService.js";
 import { providerFor } from "./delivery/deliveryProviderFactory.js";
+import { abexOrderSnapshot } from "./delivery/abexMapper.js";
 import { mapOrderToPackage, sanitizeProviderData } from "./delivery/deliveryMapper.js";
 export const transaction = (fn) => mongoose.connection.transaction(fn);
 export async function allocateOrderNumber() {
@@ -205,8 +206,11 @@ const editable = (order) => {
     "This order can no longer be edited.", 409);
 };
 const parcelOptions = (order) => ({ confirmed: ["READY_TO_SHIP", "SHIPPED", "OUT_FOR_DELIVERY", "FAILED_DELIVERY"].includes(order.status) });
-const sameParcel = (before, after) => JSON.stringify(mapOrderToPackage(before, parcelOptions(before))) ===
-  JSON.stringify(mapOrderToPackage(after, parcelOptions(after)));
+const sameParcel = (before, after, provider) => {
+  const snapshot = provider === "ABEX" ? abexOrderSnapshot : (order) =>
+    mapOrderToPackage(order, parcelOptions(order));
+  return JSON.stringify(snapshot(before)) === JSON.stringify(snapshot(after));
+};
 const safeFailure = (error) => sanitizeProviderData(error instanceof Error ? error.message : "Courier synchronization failed");
 async function syncFailure(id, shipment, actor, action, error) {
   const message = safeFailure(error);
@@ -250,8 +254,11 @@ export async function editOrder(id, input, actor = "admin") {
         "An item business with allocated refunds cannot be removed.", 409);
   const oldAgency = shipment && await DeliveryAgency.findById(shipment.agencyId);
   const agencyChanged = Boolean(shipment && String(shipment.agencyId) !== String(preview.delivery.agencyId));
-  const parcelChanged = Boolean(shipment && !sameParcel(order, { ...order.toObject(), ...preview }));
+  const parcelChanged = Boolean(shipment && !sameParcel(order, { ...order.toObject(), ...preview }, shipment.provider));
   const remote = Boolean(shipment && oldAgency?.integrationType === "API" && (shipment.creationAttemptedAt || shipment.tracking || shipment.providerAccepted));
+  assert(shipment?.provider !== "ABEX" || !(agencyChanged || parcelChanged) ||
+    (!shipment.uncertain && !shipment.pendingReadinessStateId),
+    "Reconcile the pending ABEX operation before editing the parcel details.", 409);
   let providerAction = "LOCAL";
   if (agencyChanged) {
     if (remote && oldAgency?.capabilities?.deleteShipment) providerAction = "DELETE";
@@ -279,7 +286,7 @@ export async function editOrder(id, input, actor = "admin") {
   if (providerAction === "UPDATE" || providerAction === "DELETE") {
     await reserveProviderAction(id, input.revision, shipment);
     try {
-      const provider = await providerFor(oldAgency._id, providerAction === "UPDATE" ? "updateShipment" : "deleteShipment");
+      const provider = await providerFor(oldAgency._id, providerAction === "UPDATE" ? "updateShipment" : "deleteShipment", shipment);
       const method = providerAction === "UPDATE" ? "updateShipment" : "deleteShipment";
       assert(typeof provider[method] === "function",
         `${oldAgency.name} has no documented ${method} integration. Confirm the change manually.`, 409);
@@ -329,6 +336,12 @@ export async function editOrder(id, input, actor = "admin") {
           currentShipment.trackingKey = undefined;
           currentShipment.providerStatus = undefined;
           currentShipment.providerSituationId = undefined;
+          currentShipment.providerParcelId = undefined;
+          currentShipment.providerWorkflowId = undefined;
+          currentShipment.providerStateId = undefined;
+          currentShipment.providerStatusMapped = undefined;
+          currentShipment.pendingReadinessStateId = undefined;
+          currentShipment.pendingReadinessAt = undefined;
           currentShipment.messageRetour = undefined;
           currentShipment.providerCreatedAt = undefined;
           currentShipment.providerUpdatedAt = undefined;
@@ -352,7 +365,12 @@ export async function editOrder(id, input, actor = "admin") {
         message: "Order details updated", data: { before, after: data, providerAction } }], { session });
       if (shipment && providerAction !== "LOCAL")
         await OrderEvent.create([{ orderId: id, kind: "SHIPMENT", type: `SHIPMENT_${providerAction}`, actor,
-          message: `Courier parcel synchronization: ${providerAction}`, data: { oldAgencyId: String(shipment.agencyId), newAgencyId: String(data.delivery.agencyId) } }], { session });
+          message: `Courier parcel synchronization: ${providerAction}`, data: {
+            oldAgencyId: String(shipment.agencyId), newAgencyId: String(data.delivery.agencyId),
+            ...(agencyChanged ? { previousParcel: {
+              provider: shipment.provider, parcelId: shipment.providerParcelId, tracking: shipment.tracking,
+            } } : {}),
+          } }], { session });
       await audit(actor, "ORDER_UPDATED", "Order", id, current.businessType, { providerAction }, session);
       if (shipment && providerAction !== "LOCAL")
         await audit(actor, `SHIPMENT_${providerAction}`, "Order", id, current.businessType, {}, session);
@@ -386,7 +404,7 @@ export async function deleteOrder(id, input, actor = "admin") {
       providerAction = "DELETE";
       await reserveProviderAction(id, input.revision, shipment);
       try {
-        const provider = await providerFor(agency._id, "deleteShipment");
+        const provider = await providerFor(agency._id, "deleteShipment", shipment);
         assert(typeof provider.deleteShipment === "function",
           `${agency.name} has no documented deleteShipment integration. Confirm deletion manually.`, 409);
         const result = await provider.deleteShipment(shipment);
@@ -397,7 +415,9 @@ export async function deleteOrder(id, input, actor = "admin") {
       }
     } else {
       assert(input.providerDeletionConfirmed === true,
-        "Mark the parcel Supprimée at the delivery agency, then confirm provider deletion.", 409);
+        shipment.provider === "ABEX"
+          ? "Resolve the parcel in the ABEX portal and confirm before deleting the CRM order."
+          : "Mark the parcel Supprimée at the delivery agency, then confirm provider deletion.", 409);
       providerAction = "MANUAL_DELETE_CONFIRMED";
     }
   }

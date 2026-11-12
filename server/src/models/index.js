@@ -255,6 +255,10 @@ export const Shipment = create("Shipment", {
     select: false,
   },
   externalId: String,
+  providerParcelId: String,
+  providerWorkflowId: String,
+  providerStateId: String,
+  providerStatusMapped: Boolean,
   status: String,
   providerStatus: String,
   providerSituationId: String,
@@ -275,9 +279,16 @@ export const Shipment = create("Shipment", {
   uncertain: { type: Boolean, default: false },
   lockUntil: Date,
   readinessLockToken: String,
+  pendingReadinessStateId: String,
+  pendingReadinessAt: Date,
   importBatchId: { type: Schema.Types.ObjectId, ref: "ImportBatch" },
   importRowNumber: Number,
-});
+}, [
+  [{ agencyId: 1, providerParcelId: 1 }, {
+    unique: true,
+    partialFilterExpression: { provider: "ABEX", providerParcelId: { $type: "string" } },
+  }],
+]);
 export const Expense = create(
   "Expense",
   {

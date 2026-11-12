@@ -3,6 +3,7 @@ import { AppError, assert } from "../../errors.js";
 import { sanitizeProviderData } from "./deliveryMapper.js";
 export class DeliveryClient {
   constructor(options = {}) {
+    this.readOnly = options.readOnly === true;
     this.credentials = options.credentials || {
       token: process.env.DELIVERY_API_TOKEN,
       key: process.env.DELIVERY_API_KEY,
@@ -85,6 +86,7 @@ export class DeliveryClient {
     return response?.Statut === "Acc\u00e8s activ\u00e9";
   }
   createPackages(payload) {
+    assert(!this.readOnly, "Historical Procolis parcels support tracking only.", 409, "LEGACY_SHIPMENT");
     return this.request("POST", "/add_colis", payload);
   }
   readPackages(trackings) {
@@ -93,6 +95,7 @@ export class DeliveryClient {
     });
   }
   readyPackages(trackings) {
+    assert(!this.readOnly, "Historical Procolis parcels support tracking only.", 409, "LEGACY_SHIPMENT");
     return this.request("POST", "/pret", {
       Colis: trackings.map((Tracking) => ({ Tracking })),
     });

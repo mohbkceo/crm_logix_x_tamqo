@@ -70,10 +70,11 @@ All environment configuration is server-side. There are no `VITE_DELIVERY_*` sec
 | `ADMIN_EMAIL`, `ADMIN_PASSWORD_HASH`     | Legacy bootstrap alternative for existing installations                        |
 | `SESSION_SECRET`                         | Reserved server secret for compatible deployments                              |
 | `DELIVERY_CREDENTIALS_ENCRYPTION_KEY`    | Stable 32-byte hexadecimal key used for AES-256-GCM credential encryption      |
-| `DELIVERY_API_BASE_URL`                  | Defaults to `https://procolis.com/api_v1`                                      |
-| `DELIVERY_API_TOKEN`, `DELIVERY_API_KEY` | ABEX credentials, only used in backend headers                                 |
+| `ABEX_WRITES_ENABLED`                    | Enables ABEX TMS parcel creation and readiness. Defaults to `false`.          |
+| `DELIVERY_API_BASE_URL`                  | Legacy Procolis fallback URL                                                  |
+| `DELIVERY_API_TOKEN`, `DELIVERY_API_KEY` | Legacy Procolis credentials for historical lookup                              |
 | `DELIVERY_TIMEOUT_MS`                    | Courier timeout, default 15000 ms                                              |
-| `DELIVERY_STATUS_MAP`                    | JSON object of **verified** provider values to internal statuses; default `{}` |
+| `DELIVERY_STATUS_MAP`                    | Legacy Procolis status label overrides. Defaults to `{}`.                     |
 | `DELIVERY_SYNC_INTERVAL_MS`              | Optional scheduled batch synchronization; 0 disables, minimum 60000            |
 
 Authentication is mandatory. Sessions use opaque random tokens in HTTP-only, SameSite=Strict cookies, with Secure enabled in production; MongoDB stores only token hashes. Disabled users and revoked or expired sessions lose access immediately. Mutating browser requests check the exact configured Origin. Login and API routes are rate limited, Express uses Helmet, and raw database/provider errors are not returned to the browser. Users combine role, explicit permissions, business access and ownership scope; only `SUPER_ADMIN` receives unconditional access.
@@ -107,13 +108,9 @@ The backend is authoritative for prices, quantities, subtotals, business classif
 
 `POST /orders` commits the local order before calling the selected API agency when its `createShipment` capability is enabled. Order creation authorizes this initial action; recovery endpoints retain their existing shipment permissions and business checks. Manual agencies keep their separate shipment action.
 
-The response preserves top-level order fields and adds `shipment` and `shipmentSync` (`attempted`, `success`, and any error). Courier failure still returns HTTP 201 with the saved order ID. Initial Procolis creation sends `Confrimee: "0"`, the Wilaya's provider `agencyId`, the collection balance, and the order number as both `Tracking` and `id_Externe`.
+The response includes `shipment` and `shipmentSync` alongside the order. Courier failure still returns HTTP 201 with the saved order ID. ABEX TMS receives the CRM order number as `externalId` and the outstanding collection balance as `amount`. The CRM stores the returned parcel UUID and tracking number separately.
 
-`MessageRetour: "Good"` marks creation as accepted. The returned tracking, or the deterministic order number when it is omitted, becomes `SYNCED`. `Double Tracking` triggers a `/lire` lookup and never another `/add_colis` request. Unknown responses become `PENDING` with `uncertain: true`; provider rejections and transport errors become `ERROR` while the local order remains created.
-
-Every outbound creation attempt remains reserved, including timeouts and HTTP errors. A later retry checks the order number through `/lire` before any new creation. An administrator can still explicitly confirm parcel absence to unlock one retry. No external-reference search endpoint is assumed. Unknown tracking blocks readiness until reconciliation; linked parcels use `/pret`.
-
-The parser accepts the legacy `{ Colis: [...] }` envelope, a direct array returned by the legacy service, or one direct object with `Tracking`. For `/lire`, it reads `Situation` first and retains `IDSituation` plus `DateH_Action`; legacy `Statut` remains a fallback. The complete sanitized provider response is preserved for diagnostics.
+After a timeout or inconclusive response, refresh tracking to check for the existing parcel by the CRM reference. An authorized administrator can link a verified tracking number or confirm parcel absence when there is no accepted parcel ID or tracking number.
 
 ### Orders and history
 
@@ -170,37 +167,11 @@ ONLINE requires the entire order paid; use MIXED for prepaid products with unpai
 
 Tamqo and Logix each have their own expense manager, configurable categories, search, date/category/payment filters, sorting, pagination, edits and deletion. Expense KPIs reflect the selected filters, including today/month/year intersections, category/month breakdowns and equal-period growth. Category names are snapshotted. No partnership expenses, invented COGS or product margins are calculated. Expenses never modify an order's sales values.
 
-## ABEX / Procolis integration
+## ABEX TMS integration
 
-The supplied `Development DOCs.html` was read before implementation. The adapter uses Axios only on the server, sending `token` and `key` headers with a timeout and no redirects. The supplied HTML itself is not copied into the project because it is an exported account page.
+ABEX TMS uses encrypted per-agency credentials and maps provider territory, product, and workflow UUIDs. The CRM commits the order before attempting a parcel. Ambiguous writes require reconciliation, and shipment creation and readiness can be paused with `ABEX_WRITES_ENABLED=false`.
 
-Documented requests implemented:
-
-- `GET /token` — credentials are valid only when `Statut` is `Accès activé`.
-- `POST /add_colis` — `{ Colis: [...] }` shipment creation.
-- `POST /lire` — `{ Colis: [{ Tracking }] }` parcel lookup.
-- `POST /pret` — ready-to-ship request, only when tracking exists.
-- `POST /tarification` — pricing adapter method. Local shipping remains configurable; no unverified response is automatically imported.
-
-The request mapping includes Tracking, TypeLivraison (`0` home / `1` desk), TypeColis (`0` normal / `1` exchange), Confrimee, Client, MobileA/B, Adresse, IDWilaya, Commune, Total, Note, TProduit, id_Externe, and Source. Creation uses `Confrimee: "0"`; readiness has its own `/pret` action.
-
-### Response verification
-
-Legacy creation responses are read from `Colis[0]`. `Good` is successful, `Double Tracking` is reconciled through `/lire`, and any other `MessageRetour` is retained as a provider rejection. Verified ABEX labels have built-in mappings; `DELIVERY_STATUS_MAP` can extend or override them. Unknown `Situation` values remain successful syncs, retain the exact provider label, and do not change the order.
-
-Known mapped forward status jumps can skip unobserved stages; only the actual observed transition is recorded. Invalid regressions and terminal-state changes are retained as sync errors for review.
-
-### Failure, retries and reconciliation
-
-Order saves and courier requests are separate. An API failure cannot delete an order. One unique Shipment per order stores PENDING/SYNCED/ERROR, raw provider status, sanitized data, last error and sync timestamps. Tracking is unique when present. Credentials and secret-bearing field names are removed from retained provider data.
-
-Creating a parcel uses a database lock and immutable external order number. Missing credentials allow a safe retry without an external attempt. Once a request could have reached the provider, a timeout, unknown response or crash is treated as uncertain: **automatic re-creation is blocked**. HTTP failure does not prove the provider failed to create the parcel.
-
-Use Reconcile shipment in Order Details to verify the order's external reference in the courier portal and link its tracking number. The configured tracking lookup must find the number. If you have verified that no parcel exists, explicitly confirm its absence to unlock one new attempt. Do not link another order's parcel. The supplied API has no documented lookup by `id_Externe`, cancellation route, idempotency guarantee or webhook contract; none has been fabricated. To cancel an order after a possible shipment, first cancel the parcel with ABEX and confirm that action in the workspace. The confirmation is audited.
-
-Manual refresh is available per order. Settings can synchronize up to 100 active shipments in chunks of 20. Optional scheduled sync runs inside the single API process without overlapping itself. In a multi-process deployment, enable the schedule in only one process or use a distributed scheduler.
-
-**Live ABEX requests were not sent during implementation.** Production credentials and verified provider responses are still needed to validate the external integration. Automated delivery tests use explicit test-double responses to verify local behavior, not to assert the real provider contract.
+Existing installations switch the ABEX agency explicitly with `npm run migrate -- --abex`. Historical shipments retain their Procolis contract and use its historical tracking path when available. See the [ABEX integration and rollout guide](docs/abex-tms.md).
 
 ## API overview
 

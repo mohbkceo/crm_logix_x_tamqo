@@ -49,6 +49,7 @@ import {
 } from "../components";
 import { P, Can, useUser, can, hasBusinessAccess } from "../access";
 import { MediaGallery, OptionalImagePreview } from "../MediaGallery";
+import { findAbexCommune } from "../../../shared/abexTerritories.js";
 const statuses = [
   "NEW",
   "CONFIRMED",
@@ -416,6 +417,19 @@ export function OrderForm() {
       form.items.length > 0 &&
       form.items.every((i) => a.businesses.includes(i.business)),
   );
+  const selectedAgency = eligible.find((agency) => agency._id === form.delivery.agencyId);
+  const communeLookup = selectedAgency?.apiProvider === "ABEX" && form.location.wilayaId
+    ? `/delivery-agencies/${selectedAgency._id}/communes?${params({
+        wilayaId: form.location.wilayaId, deliveryType: form.delivery.type,
+      })}`
+    : null;
+  const communeCatalog = useApi(communeLookup);
+  const abexCommunes = communeLookup &&
+    communeCatalog.data?.agencyId === selectedAgency._id &&
+    communeCatalog.data?.wilayaId === form.location.wilayaId &&
+    communeCatalog.data?.deliveryType === form.delivery.type
+      ? communeCatalog.data.communes : [];
+  const selectedCommune = findAbexCommune(abexCommunes, form.location.commune);
   useEffect(() => {
     let active = true;
     if (!form.delivery.agencyId) {
@@ -563,6 +577,8 @@ export function OrderForm() {
       original?.shipment &&
       (original.delivery.agencyId !== form.delivery.agencyId ||
         (original.deliveryAgency?.integrationType === "API" &&
+          (original.shipment.tracking || original.shipment.creationAttemptedAt ||
+            original.shipment.providerAccepted || original.shipment.providerParcelId) &&
           courierFieldsChanged))
     ) {
       setProviderConfirmed(false);
@@ -678,18 +694,33 @@ export function OrderForm() {
                       ))}
                   </select>
                 </Field>
-                <Field label="Commune *">
-                  <input
-                    required
-                    value={form.location.commune}
-                    onChange={(e) =>
-                      set("location", {
-                        ...form.location,
-                        commune: e.target.value,
-                      })
-                    }
-                    placeholder="Commune"
-                  />
+                <Field label="Commune *" hint={
+                  abexCommunes.length && form.location.commune && !selectedCommune
+                    ? `Current commune is “${form.location.commune}”. Choose a commune for the selected wilaya.`
+                    : communeLookup && communeCatalog.error
+                      ? "ABEX commune lookup is unavailable. You can save the order and retry shipping later."
+                      : undefined
+                }>
+                  {abexCommunes.length ? (
+                    <select required value={selectedCommune?.name || ""} onChange={(e) =>
+                      set("location", { ...form.location, commune: e.target.value })
+                    }>
+                      <option value="">Choose a commune</option>
+                      {abexCommunes.map(({ name }) => <option key={name} value={name}>{name}</option>)}
+                    </select>
+                  ) : (
+                    <input
+                      required
+                      value={form.location.commune}
+                      onChange={(e) =>
+                        set("location", {
+                          ...form.location,
+                          commune: e.target.value,
+                        })
+                      }
+                      placeholder="Commune"
+                    />
+                  )}
                 </Field>
                 <Field label="Address *">
                   <input
@@ -1110,7 +1141,9 @@ export function OrderForm() {
                   onChange={(e) => setProviderConfirmed(e.target.checked)}
                 />
                 {agencyChange
-                  ? "I marked the old parcel Supprimée at the delivery agency."
+                  ? original.shipment.provider === "ABEX"
+                    ? "I resolved the old parcel in the ABEX portal."
+                    : "I marked the old parcel Supprimée at the delivery agency."
                   : "I updated the courier parcel to match this order."}
               </label>
             ) : (
@@ -1513,9 +1546,10 @@ export function OrderDetails() {
                   </p>
                   <p>Provider Status: {s.providerStatus || "Not reported"}</p>
                   <p>CRM Status: {s.status ? human(s.status) : "Not mapped"}</p>
-                  {s.providerStatus && !s.status && (
+                  {s.providerStatus && (s.provider === "ABEX" ? !s.providerStatusMapped : !s.status) && (
                     <Badge tone="confirmed">Unmapped provider status</Badge>
                   )}
+                  {s.providerParcelId && <p>ABEX parcel ID {s.providerParcelId}</p>}
                   <p>
                     Provider Situation ID:{" "}
                     {s.providerSituationId || "Not reported"}
@@ -1532,8 +1566,9 @@ export function OrderDetails() {
                   {s.uncertain && (
                     <div className="note">
                       <AlertCircle size={17} />
-                      Refresh tracking to verify this order with Procolis before
-                      retrying creation.
+                      {s.pendingReadinessStateId
+                        ? "Refresh tracking to verify the pending readiness update."
+                        : "Refresh tracking to check for an existing courier parcel."}
                     </div>
                   )}
                   {!o.deletedAt &&
@@ -1748,7 +1783,9 @@ export function OrderDetails() {
             {s && (
               <div className="note">
                 {manualDeletion
-                  ? "First mark the parcel Supprimée at the delivery agency. CRM deletion does not delete the agency parcel for you."
+                  ? s?.provider === "ABEX"
+                    ? "Resolve the parcel in the ABEX portal before deleting the CRM order."
+                    : "First mark the parcel Supprimée at the delivery agency. CRM deletion does not delete the agency parcel for you."
                   : "The delivery agency parcel will be deleted first through its supported integration."}
               </div>
             )}
@@ -1759,7 +1796,7 @@ export function OrderDetails() {
                   checked={providerDeleted}
                   onChange={(e) => setProviderDeleted(e.target.checked)}
                 />
-                I marked the agency parcel Supprimée.
+                {s?.provider === "ABEX" ? "I resolved the parcel in the ABEX portal." : "I marked the agency parcel Supprimée."}
               </label>
             )}
             <Field label="Delete reason (optional)">
@@ -1876,7 +1913,8 @@ export function OrderDetails() {
                 Link verified tracking
               </button>
             </div>
-            {s?.provider !== "MANUAL" && (
+            {s?.provider === agency?.apiProvider && !s.providerParcelId && !s.providerAccepted &&
+              s.provider !== "MANUAL" && (
               <>
                 <hr />
                 <p>

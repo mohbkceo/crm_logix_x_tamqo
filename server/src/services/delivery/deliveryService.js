@@ -7,7 +7,7 @@ import {
   DeliverySyncRun,
 } from "../../models/delivery.js";
 import { audit } from "../../models/security.js";
-import { providerFor } from "./deliveryProviderFactory.js";
+import { providerFor, shipmentProvider } from "./deliveryProviderFactory.js";
 import { DeliverySyncService } from "./deliverySyncService.js";
 import { transaction, transition } from "../orderService.js";
 import { assert, AppError } from "../../errors.js";
@@ -94,12 +94,27 @@ async function context(id, capability, creating = false) {
     `Agency does not support ${capability}`,
     409,
   );
+  const shipment = await Shipment.findOne({ orderId: id }).lean();
+  const existingParcel =
+    shipment &&
+    (shipment.tracking ||
+      shipment.creationAttemptedAt ||
+      shipment.providerAccepted ||
+      shipment.providerParcelId);
   return {
     order,
     agency,
+    shipment,
     service:
       agency.integrationType === "API"
-        ? new DeliverySyncService(await providerFor(agency._id, capability))
+        ? new DeliverySyncService(
+            await providerFor(
+              agency._id,
+              creating && existingParcel ? "tracking" : capability,
+              creating && !existingParcel ? undefined : shipment,
+            ),
+            agency._id,
+          )
         : null,
   };
 }
@@ -120,6 +135,7 @@ export const deliveryService = {
   async createAutomatically(order, actor) {
     let shipment = null;
     let shipmentSync = { attempted: false, success: null };
+    let provider;
     try {
       const agency = await DeliveryAgency.findById(order.delivery.agencyId);
       if (
@@ -127,6 +143,7 @@ export const deliveryService = {
         !agency.capabilities?.createShipment
       )
         return { shipment, shipmentSync };
+      provider = agency.apiProvider;
       shipmentSync.attempted = true;
       shipment = await this.create(order._id, actor);
       shipmentSync = {
@@ -146,21 +163,24 @@ export const deliveryService = {
       // Configuration/factory failures may happen before the sync service creates
       // its record. Never overwrite an existing attempt or unlock its reservation.
       try {
-        shipment = await Shipment.findOneAndUpdate(
-          { orderId: order._id },
-          {
-            $setOnInsert: {
-              agencyId: order.delivery.agencyId,
-              agencyName: order.delivery.agencyName,
-              provider: "PROCOLIS",
-              externalId: order.orderNumber,
-              status: order.status,
-              syncStatus: "ERROR",
-              lastError: shipmentSync.error,
-            },
-          },
-          { upsert: true, new: true },
-        );
+        shipment =
+          error.code === "CONFLICT"
+            ? await Shipment.findOne({ orderId: order._id })
+            : await Shipment.findOneAndUpdate(
+                { orderId: order._id },
+                {
+                  $setOnInsert: {
+                    agencyId: order.delivery.agencyId,
+                    agencyName: order.delivery.agencyName,
+                    provider,
+                    externalId: order.orderNumber,
+                    status: order.status,
+                    syncStatus: "ERROR",
+                    lastError: shipmentSync.error,
+                  },
+                },
+                { upsert: true, new: true },
+              );
       } catch {
         /* Preserve the committed order response even if diagnostics cannot be saved. */
       }
@@ -170,13 +190,18 @@ export const deliveryService = {
     return { shipment: publicShipment, shipmentSync };
   },
   async create(id, actor, input = {}) {
-    const { order, agency, service } = await context(
+    const { order, agency, shipment, service } = await context(
       id,
       "createShipment",
       true,
     );
     let result;
-    if (service) result = await service.create(id, { actor });
+    if (service)
+      result = await service.create(id, {
+        actor,
+        orderSnapshot: order,
+        shipmentSnapshot: shipment,
+      });
     else
       result = await transaction(async (session) => {
         const o = await Order.findById(id).session(session);
@@ -224,7 +249,14 @@ export const deliveryService = {
   },
   async ready(id, actor, options = {}) {
     const { service, order, agency } = await context(id, "readyToShip");
-    assert((service && agency.capabilities?.tracking) || !order.items.some(i => i.business === "LOGIX" && i.type === "PRODUCT"), "This agency cannot verify En préparation for production readiness.", 409);
+    assert(
+      (service && agency.capabilities?.tracking) ||
+        !order.items.some(
+          (i) => i.business === "LOGIX" && i.type === "PRODUCT",
+        ),
+      "This agency cannot verify En préparation for production readiness.",
+      409,
+    );
     const result = service
       ? await service.ready(id, actor, options)
       : await transition(id, "READY_TO_SHIP", actor);
@@ -241,7 +273,14 @@ export const deliveryService = {
     return result;
   },
   async reconcile(id, tracking, absent, actor) {
-    const { service, order } = await context(id, "tracking");
+    const { service, order, shipment, agency } = await context(id, "tracking");
+    assert(
+      !absent ||
+        agency.integrationType !== "API" ||
+        shipment?.provider === agency.apiProvider,
+      "Historical parcels cannot be unlocked for creation through a different courier contract.",
+      409,
+    );
     if (service) return service.reconcile(id, tracking, absent, actor);
     assert(
       typeof tracking === "string" &&
@@ -302,7 +341,16 @@ export const deliveryService = {
       const message = safeError(error),
         began = Date.now();
       await Shipment.updateOne(
-        { _id: entry.shipment._id },
+        {
+          _id: entry.shipment._id,
+          provider: entry.shipment.provider,
+          tracking: entry.shipment.tracking,
+          ...(entry.shipment.provider === "ABEX"
+            ? {
+                $or: [{ lockUntil: null }, { lockUntil: { $lte: new Date() } }],
+              }
+            : {}),
+        },
         { $set: { syncStatus: "ERROR", lastError: message } },
       );
       await DeliverySyncItem.create({
@@ -313,6 +361,7 @@ export const deliveryService = {
         tracking: entry.shipment.tracking,
         agencyId: entry.agency._id,
         agencyName: entry.agency.name,
+        provider: entry.shipment.provider,
         beforeProviderStatus: entry.shipment.providerStatus || null,
         afterProviderStatus: entry.shipment.providerStatus || null,
         beforeOrderStatus: entry.order.status,
@@ -331,7 +380,10 @@ export const deliveryService = {
       if (!lockOwner) {
         return await finish("COMPLETED");
       }
-      const orders = await Order.find({ status: { $nin: TERMINAL }, deletedAt: { $exists: false } })
+      const orders = await Order.find({
+          status: { $nin: TERMINAL },
+          deletedAt: { $exists: false },
+        })
           .sort({ createdAt: 1, _id: 1 })
           .lean(),
         orderIds = orders.map((order) => order._id),
@@ -387,18 +439,23 @@ export const deliveryService = {
       );
       counters.eligible = eligible.length;
       counters.skipped = counters.scanned - counters.eligible;
-      const byAgency = new Map();
+      const byAgencyAndProvider = new Map();
       for (const entry of eligible) {
-        const key = String(entry.agency._id);
-        if (!byAgency.has(key)) byAgency.set(key, []);
-        byAgency.get(key).push(entry);
+        const key = `${entry.agency._id}:${shipmentProvider(entry.agency, entry.shipment)}`;
+        if (!byAgencyAndProvider.has(key)) byAgencyAndProvider.set(key, []);
+        byAgencyAndProvider.get(key).push(entry);
       }
-      for (const entries of byAgency.values()) {
+      for (const entries of byAgencyAndProvider.values()) {
         await extendSyncLock(lockOwner);
         let service;
         try {
           service = new DeliverySyncService(
-            await providerFor(entries[0].agency._id, "tracking"),
+            await providerFor(
+              entries[0].agency._id,
+              "tracking",
+              entries[0].shipment,
+            ),
+            entries[0].agency._id,
           );
         } catch (error) {
           for (const entry of entries) await persistError(entry, error);
@@ -407,34 +464,36 @@ export const deliveryService = {
         for (let index = 0; index < entries.length; index += SYNC_BATCH_SIZE) {
           await extendSyncLock(lockOwner);
           const batch = entries.slice(index, index + SYNC_BATCH_SIZE);
-          let parcels;
-          try {
-            counters.attempted += batch.length;
-            parcels = parsePackages(
-              await service.client.readPackages(
-                batch.map((entry) => entry.shipment.tracking),
-              ),
-            );
-          } catch (error) {
-            for (const entry of batch) await persistError(entry, error);
-            continue;
-          }
-          const parcelsByTracking = new Map(
-            parcels.map((parcel) => [parcel.tracking.toUpperCase(), parcel]),
-          );
-          for (const entry of batch) {
-            const began = Date.now(),
-              parcel = parcelsByTracking.get(
-                entry.shipment.tracking.trim().toUpperCase(),
+          const abex = service.client.provider === "ABEX";
+          let parcelsByTracking;
+          counters.attempted += batch.length;
+          if (!abex) {
+            try {
+              const parcels = parsePackages(
+                await service.client.readPackages(
+                  batch.map((entry) => entry.shipment.tracking),
+                ),
               );
-            if (!parcel) {
-              await persistError(
-                entry,
-                new AppError("Tracking absent from batch response.", 502),
+              parcelsByTracking = new Map(
+                parcels.map((parcel) => [
+                  parcel.tracking.toUpperCase(),
+                  parcel,
+                ]),
               );
+            } catch (error) {
+              for (const entry of batch) await persistError(entry, error);
               continue;
             }
+          }
+          for (const entry of batch) {
+            const began = Date.now();
             try {
+              const parcel = abex
+                ? await service.client.getShipment(entry.shipment)
+                : parcelsByTracking.get(
+                    entry.shipment.tracking.trim().toUpperCase(),
+                  );
+              assert(parcel, "Tracking absent from batch response.", 502);
               const { outcome } = await service.applyWithResult(
                 entry.order._id,
                 parcel,
@@ -448,6 +507,7 @@ export const deliveryService = {
                 tracking: entry.shipment.tracking,
                 agencyId: entry.agency._id,
                 agencyName: entry.agency.name,
+                provider: entry.shipment.provider,
                 ...outcome,
                 durationMs: Math.max(0, Date.now() - began),
               });
@@ -455,6 +515,7 @@ export const deliveryService = {
                 counters.unknownStatuses++;
                 counters.successful++;
               } else if (outcome.result === "ERROR") counters.failed++;
+              else if (outcome.result === "SKIPPED") counters.skipped++;
               else counters.successful++;
               if (outcome.changed) counters.changed++;
               else counters.unchanged++;

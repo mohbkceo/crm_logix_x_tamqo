@@ -12,8 +12,8 @@ import {
   ImportBatch,
   ImportMapping,
 } from "./models/index.js";
-import { encryptCredentials } from "./services/delivery/credentials.js";
-import { migrateTracking } from './services/trackingMigration.js';
+import { abexCapabilities } from "./services/delivery/deliveryProviderFactory.js";
+import { migrateTracking } from "./services/trackingMigration.js";
 export async function bootstrap() {
   const email = (
     process.env.BOOTSTRAP_SUPER_ADMIN_EMAIL ||
@@ -65,36 +65,12 @@ export async function migrate() {
         active: true,
         businesses: ["LOGIX", "TAMQO"],
         integrationType: "API",
-        apiProvider: "PROCOLIS",
-        config: { baseUrl: "https://procolis.com/api_v1" },
-        capabilities: {
-          createShipment: true,
-          tracking: true,
-          readyToShip: true,
-          pricing: true,
-        },
+        apiProvider: "ABEX",
+        capabilities: abexCapabilities,
       },
     },
     { upsert: true, new: true },
   );
-  if (
-    process.env.DELIVERY_API_TOKEN &&
-    process.env.DELIVERY_API_KEY &&
-    process.env.DELIVERY_CREDENTIALS_ENCRYPTION_KEY &&
-    !agency.credentialsConfigured
-  )
-    await DeliveryAgency.updateOne(
-      { _id: agency._id, credentialsConfigured: false },
-      {
-        $set: {
-          encryptedCredentials: encryptCredentials({
-            token: process.env.DELIVERY_API_TOKEN,
-            key: process.env.DELIVERY_API_KEY,
-          }),
-          credentialsConfigured: true,
-        },
-      },
-    );
   for (const w of await Wilaya.find().lean())
     await DeliveryRate.updateOne(
       { agencyId: agency._id, wilayaId: w._id },
@@ -103,9 +79,11 @@ export async function migrate() {
           homePrice: w.homeShippingPrice || 0,
           deskPrice: w.deskShippingPrice || 0,
           active: w.active,
+          createdAt: new Date(),
+          updatedAt: new Date(),
         },
       },
-      { upsert: true },
+      { upsert: true, timestamps: false },
     );
   await Order.updateMany(
     { "delivery.agencyId": { $exists: false } },
@@ -119,6 +97,7 @@ export async function migrate() {
   await Shipment.updateMany(
     {
       agencyId: { $exists: false },
+      providerParcelId: { $exists: false },
       provider: { $in: ["ABEX", "PROCOLIS", null] },
     },
     {
@@ -150,6 +129,52 @@ export async function migrate() {
   await bootstrap();
   await migrateTracking();
 }
+
+export async function cutoverAbexAgency() {
+  return mongoose.connection.transaction(async (session) => {
+    const agency = await DeliveryAgency.findOne({
+      code: "ABEX",
+      integrationType: "API",
+      apiProvider: "PROCOLIS",
+    })
+      .select(
+        "+encryptedCredentials +encryptedLegacyCredentials +legacyBaseUrl",
+      )
+      .session(session);
+    if (!agency) return false;
+    if (
+      await Shipment.exists({
+        agencyId: agency._id,
+        lockUntil: { $gt: new Date() },
+      }).session(session)
+    )
+      throw new Error(
+        "Wait for in-flight courier operations before switching the ABEX agency.",
+      );
+
+    // Older installations used ABEX as the name of the Procolis contract.
+    await Shipment.updateMany(
+      {
+        agencyId: agency._id,
+        provider: { $in: ["ABEX", null] },
+        providerParcelId: { $exists: false },
+      },
+      { $set: { provider: "PROCOLIS" } },
+      { session },
+    );
+    agency.encryptedLegacyCredentials = agency.encryptedCredentials;
+    agency.legacyBaseUrl = agency.config?.baseUrl;
+    agency.legacyTracking = Boolean(agency.capabilities?.tracking);
+    agency.encryptedCredentials = undefined;
+    agency.credentialsConfigured = false;
+    agency.apiProvider = "ABEX";
+    agency.config.baseUrl = undefined;
+    agency.capabilities.updateShipment = false;
+    agency.capabilities.deleteShipment = false;
+    await agency.save({ session });
+    return true;
+  });
+}
 if (
   process.argv[1] &&
   import.meta.url === pathToFileURL(process.argv[1]).href
@@ -157,6 +182,12 @@ if (
   await mongoose.connect(config.mongoUri);
   try {
     await migrate();
+    if (process.argv.includes("--abex"))
+      console.log(
+        (await cutoverAbexAgency())
+          ? "ABEX agency switched to TMS. Configure credentials before enabling writes."
+          : "No Procolis-backed ABEX agency required a switch.",
+      );
     console.log(
       "Migration complete. Existing creators and shipments preserved.",
     );

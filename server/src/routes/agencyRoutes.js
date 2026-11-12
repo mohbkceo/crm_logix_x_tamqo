@@ -12,11 +12,75 @@ import {
 } from "../authorization.js";
 import { assert } from "../errors.js";
 import { objectId } from "../services/filters.js";
-import { encryptCredentials } from "../services/delivery/credentials.js";
+import {
+  decryptCredentials,
+  encryptCredentials,
+} from "../services/delivery/credentials.js";
 import { providerFor } from "../services/delivery/deliveryProviderFactory.js";
 import { transaction } from "../services/orderService.js";
+import { STATUSES } from "../constants.js";
+import { ABEX_HOST, isAbexId } from "../services/delivery/abexMapper.js";
+import { abexCatalogs } from "../services/delivery/abexClient.js";
 export const agencyRoutes = Router();
 const r = agencyRoutes;
+const abexId = z
+  .string()
+  .refine(isAbexId, "Expected an ABEX UUID")
+  .transform((v) => v.toLowerCase());
+const crmId = z.string().regex(/^[a-f0-9]{24}$/);
+const header = z
+  .string()
+  .trim()
+  .min(1)
+  .max(8192)
+  .regex(/^[\x21-\x7e]+$/, "Invalid header value");
+const abexSettings = z
+  .object({
+    destinations: z
+      .array(
+        z.object({
+          wilayaId: crmId,
+          commune: z.string().trim().min(1).max(200),
+          cityTerritoryId: abexId,
+          districtTerritoryId: abexId,
+          hubId: abexId.optional(),
+        }),
+      )
+      .max(2000)
+      .optional(),
+    products: z.record(crmId, abexId).optional(),
+    states: z
+      .array(
+        z.object({
+          workflowId: abexId,
+          stateId: abexId,
+          situationId: abexId.optional(),
+          status: z.enum(STATUSES),
+        }),
+      )
+      .max(500)
+      .optional(),
+  })
+  .superRefine(({ destinations = [], states = [] }, context) => {
+    const destinationKeys = destinations.map(
+      (row) => `${row.wilayaId}:${row.commune.normalize("NFC").toLowerCase()}`,
+    );
+    const stateKeys = states.map(
+      (row) => `${row.workflowId}:${row.stateId}:${row.situationId || ""}`,
+    );
+    if (new Set(destinationKeys).size !== destinationKeys.length)
+      context.addIssue({
+        code: "custom",
+        path: ["destinations"],
+        message: "Duplicate wilaya and commune mapping",
+      });
+    if (new Set(stateKeys).size !== stateKeys.length)
+      context.addIssue({
+        code: "custom",
+        path: ["states"],
+        message: "Duplicate workflow state mapping",
+      });
+  });
 const schema = z.object({
   name: z.string().trim().min(1).max(100),
   code: z
@@ -29,11 +93,12 @@ const schema = z.object({
     .min(1)
     .max(2),
   integrationType: z.enum(["API", "MANUAL"]),
-  apiProvider: z.enum(["PROCOLIS", "MANUAL"]).optional(),
+  apiProvider: z.enum(["ABEX", "PROCOLIS", "MANUAL"]).optional(),
   config: z
     .object({
       baseUrl: z.string().url().optional(),
       notes: z.string().max(2000).optional(),
+      abex: abexSettings.optional(),
     })
     .default({}),
   capabilities: z
@@ -113,23 +178,37 @@ async function save(req, existing) {
       403,
     );
   if (data.integrationType === "API") {
-    assert(data.apiProvider === "PROCOLIS", "Unsupported API provider");
+    data.apiProvider ??= "ABEX";
     assert(
-      !data.config.baseUrl ||
-        data.config.baseUrl === "https://procolis.com/api_v1",
-      "Only the documented Procolis base URL is supported",
+      ["ABEX", "PROCOLIS"].includes(data.apiProvider),
+      "Unsupported API provider",
     );
+    const host =
+      data.apiProvider === "ABEX" ? ABEX_HOST : "https://procolis.com/api_v1";
+    assert(
+      !data.config.baseUrl || data.config.baseUrl === host,
+      "Only the documented provider base URL is supported",
+    );
+    if (data.apiProvider === "ABEX") {
+      data.capabilities.updateShipment = false;
+      data.capabilities.deleteShipment = false;
+    }
   } else data.apiProvider = "MANUAL";
-  if (
+  const providerChanged = Boolean(
     existing &&
     (existing.integrationType !== data.integrationType ||
-      existing.apiProvider !== data.apiProvider)
-  )
+      existing.apiProvider !== data.apiProvider),
+  );
+  if (providerChanged)
     assert(
       !(await Shipment.exists({ agencyId: existing._id })),
       "Cannot change provider on an agency with shipments",
       409,
     );
+  if (providerChanged) {
+    data.encryptedCredentials = undefined;
+    data.credentialsConfigured = false;
+  }
   if (req.body.credentials !== undefined) {
     assert(
       can(req.user, P.deliveryAgencies.manageCredentials),
@@ -140,12 +219,53 @@ async function save(req, existing) {
       data.integrationType === "API",
       "Manual agencies do not need credentials",
     );
-    const credentials = z
-      .object({
-        token: z.string().min(1).max(1000),
-        key: z.string().min(1).max(1000),
-      })
-      .parse(req.body.credentials);
+    const credentials = (
+      data.apiProvider === "ABEX"
+        ? z
+            .object({
+              apiKey: header,
+              tenantId: header.max(255),
+              bearerToken: header.optional(),
+            })
+            .strict()
+        : z.object({ token: header.max(1000), key: header.max(1000) }).strict()
+    ).parse(req.body.credentials);
+    if (
+      data.apiProvider === "ABEX" &&
+      existing &&
+      !providerChanged &&
+      (await Shipment.exists({
+        agencyId: existing._id,
+        provider: "ABEX",
+        $or: [
+          { creationAttemptedAt: { $ne: null } },
+          { providerParcelId: { $ne: null } },
+          { tracking: { $ne: null } },
+        ],
+      }))
+    ) {
+      const stored = await DeliveryAgency.findById(existing._id).select(
+        "+encryptedCredentials",
+      );
+      let previousTenant;
+      try {
+        if (stored.encryptedCredentials)
+          previousTenant = decryptCredentials(
+            stored.encryptedCredentials,
+          ).tenantId;
+      } catch {
+        assert(
+          false,
+          "Restore the delivery encryption key before rotating credentials on this agency.",
+          409,
+        );
+      }
+      assert(
+        previousTenant === credentials.tenantId,
+        "Keep the same ABEX tenant when rotating credentials on an agency with parcels.",
+        409,
+      );
+    }
     data.encryptedCredentials = encryptCredentials(credentials);
     data.credentialsConfigured = true;
   }
@@ -240,6 +360,38 @@ r.get(
   async (req, res) =>
     res.json(await DeliveryRate.find({ agencyId: req.agency._id })),
 );
+r.get(
+  "/:id/communes",
+  requirePermission(
+    P.deliveryAgencies.view,
+    P.orders.create,
+    P.orders.updateOwn,
+    P.orders.updateAll,
+  ),
+  async (req, res) => {
+    assert(
+      req.agency.apiProvider === "ABEX",
+      "Commune lookup requires an ABEX agency.",
+      409,
+    );
+    const { wilayaId, deliveryType } = z
+      .object({
+        wilayaId: crmId,
+        deliveryType: z.enum(["HOME", "STOP_DESK"]),
+      })
+      .strict()
+      .parse(req.query);
+    const wilaya = await Wilaya.findById(wilayaId).select("agencyId").lean();
+    assert(wilaya, "Wilaya not found.", 404);
+    const provider = await providerFor(req.agency._id);
+    res.json({
+      agencyId: String(req.agency._id),
+      wilayaId,
+      deliveryType,
+      communes: await provider.communeOptions(wilaya, deliveryType),
+    });
+  },
+);
 const rateSchema = z.object({
   wilayaId: z.string(),
   homePrice: z.number().finite().min(0).max(1e8),
@@ -295,6 +447,68 @@ r.patch(
   requirePermission(P.deliveryAgencies.manageRates),
   saveRate,
 );
+r.get(
+  "/:id/provider-rates",
+  requirePermission(P.deliveryAgencies.manageRates),
+  async (req, res) => {
+    assert(
+      req.agency.apiProvider === "ABEX",
+      "Provider rates are available for ABEX agencies.",
+      409,
+    );
+    const query = z
+      .object({
+        toTerritoryId: abexId.optional(),
+        fromTerritoryId: abexId.optional(),
+        hubStockId: abexId.optional(),
+      })
+      .strict()
+      .parse(req.query);
+    assert(
+      !(query.fromTerritoryId && query.hubStockId) &&
+        !(query.toTerritoryId && (query.fromTerritoryId || query.hubStockId)),
+      "Choose a destination, origin territory, or stock for the rates lookup.",
+    );
+    const provider = await providerFor(req.agency._id, "pricing");
+    res.json(await provider.getRates(query));
+  },
+);
+r.get(
+  "/:id/provider-catalog/:catalog",
+  requirePermission(P.deliveryAgencies.update),
+  async (req, res) => {
+    assert(
+      req.agency.apiProvider === "ABEX",
+      "Catalogs are available for ABEX agencies.",
+      409,
+    );
+    const catalog = z.enum(abexCatalogs).parse(req.params.catalog);
+    const criteria = z
+      .object({
+        pageNumber: z.coerce.number().int().min(1).max(10000).default(1),
+        pageSize: z.coerce.number().int().min(1).max(100).default(50),
+        keyword: z.string().trim().max(150).optional(),
+      })
+      .strict()
+      .parse(req.query);
+    const provider = await providerFor(req.agency._id);
+    res.json(await provider.getCatalog(catalog, criteria));
+  },
+);
+export async function verifyAgencyConnection(agency) {
+  const provider = await providerFor(agency._id);
+  assert(
+    await provider.testCredentials(),
+    "Delivery provider credentials are not active.",
+    422,
+  );
+  return {
+    success: true,
+    integrationType: "API",
+    provider: agency.apiProvider,
+    message: `${agency.apiProvider === "ABEX" ? "ABEX TMS" : "Procolis"} connection verified.`,
+  };
+}
 r.post(
   "/:id/test",
   requirePermission(P.deliveryAgencies.testConnection),
@@ -308,27 +522,6 @@ r.post(
       });
     }
 
-    assert(
-      req.agency.apiProvider === "PROCOLIS",
-      "Unsupported API provider",
-      400,
-    );
-
-    // The provider validates per-agency credentials or the supported ABEX
-    // environment fallback; credentialsConfigured alone excludes legacy setups.
-    const provider = await providerFor(req.agency._id);
-
-    assert(
-      await provider.testCredentials(),
-      "Procolis credentials are not activated",
-      422,
-    );
-
-    res.json({
-      success: true,
-      integrationType: "API",
-      provider: "PROCOLIS",
-      message: "Procolis API connection and credentials verified successfully.",
-    });
+    res.json(await verifyAgencyConnection(req.agency));
   },
 );

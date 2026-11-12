@@ -20,10 +20,10 @@ import importRoutes from "./routes/importRoutes.js";
 import { analytics } from "./services/analyticsService.js";
 import { Customer, Order } from "./models/index.js";
 import { pagination, escapeRegex, objectId } from "./services/filters.js";
-import { deliveryClient } from "./services/delivery/deliveryClient.js";
+import { DeliveryAgency } from "./models/delivery.js";
 
 import { securityRoutes } from "./routes/securityRoutes.js";
-import { agencyRoutes } from "./routes/agencyRoutes.js";
+import { agencyRoutes, verifyAgencyConnection } from "./routes/agencyRoutes.js";
 import { teamRoutes, employeeOptions } from "./routes/teamRoutes.js";
 import { deliverySyncRoutes } from "./routes/deliverySyncRoutes.js";
 import { P, can, requirePermission, orderScope } from "./authorization.js";
@@ -32,6 +32,7 @@ import { normalizePhone } from "./domain/order.js";
 import { audit } from "./models/security.js";
 import { transaction } from "./services/orderService.js";
 import { deliveryStatusMapping } from "./services/delivery/deliveryStatusMapper.js";
+import { abexWritesEnabled } from "./services/delivery/abexMapper.js";
 export const app = express();
 app.disable("x-powered-by");
 app.use(
@@ -219,15 +220,21 @@ app.patch(
 app.get(
   "/api/delivery/status",
   requirePermission(P.deliveryAgencies.view),
-  (_req, res) => {
+  async (req, res) => {
+    const agency = await DeliveryAgency.findOne({
+      code: "ABEX", integrationType: "API",
+      ...(req.user.role === "SUPER_ADMIN" ? {} : { businesses: { $in: req.user.businessAccess } }),
+    }).lean();
+    const abex = agency?.apiProvider === "ABEX";
     const mapping = deliveryStatusMapping();
     res.json({
-      configured: Boolean(
-        process.env.DELIVERY_API_TOKEN && process.env.DELIVERY_API_KEY,
-      ),
-      statusMappingConfigured: mapping.configured,
-      statusMappingError: mapping.error,
-      invalidStatusMappings: mapping.invalidEntries || 0,
+      provider: agency?.apiProvider || null,
+      configured: Boolean(agency?.credentialsConfigured ||
+        (agency?.apiProvider === "PROCOLIS" && process.env.DELIVERY_API_TOKEN && process.env.DELIVERY_API_KEY)),
+      writesEnabled: abex && abexWritesEnabled(),
+      statusMappingConfigured: abex ? Boolean(agency.config?.abex?.states?.length) : Boolean(agency && mapping.configured),
+      statusMappingError: abex ? null : mapping.error,
+      invalidStatusMappings: abex ? 0 : mapping.invalidEntries || 0,
     });
   },
 );
@@ -240,14 +247,9 @@ app.post(
       "Use agency-specific connection tests",
       403,
     );
-    assert(
-      await deliveryClient.testCredentials(),
-      "Procolis credentials are not activated",
-      422,
-    );
-    res.json({
-      message: "Procolis API connection and credentials verified successfully.",
-    });
+    const agency = await DeliveryAgency.findOne({ code: "ABEX", integrationType: "API" });
+    assert(agency, "ABEX agency is not configured.", 404);
+    res.json(await verifyAgencyConnection(agency));
   },
 );
 app.post(

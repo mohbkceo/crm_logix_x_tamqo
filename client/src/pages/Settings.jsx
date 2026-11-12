@@ -324,13 +324,13 @@ export function Settings() {
         </Panel>
       ) : (
         <Panel
-          title="ABEX / Procolis"
+          title="ABEX delivery"
           subtitle="Delivery requests run securely through your server."
           action={<ShieldCheck size={20} />}
         >
           <div className="detail-body">
             <div className="integration-status">
-              <span>Server credentials</span>
+              <span>{delivery.data?.provider === "PROCOLIS" ? "Procolis credentials" : "ABEX TMS credentials"}</span>
               <Badge
                 tone={
                   delivery.data?.configured ? "delivered" : "failed_delivery"
@@ -348,14 +348,15 @@ export function Settings() {
               </Badge>
             </div>
             <p>
-              Set courier credentials in the server environment. The browser
-              never receives the token or API key.
+              Manage credentials in Delivery agencies. Use the connection test
+              to verify courier access.
             </p>
-            <p>
-              Procolis credentials are valid only when GET /token returns the
-              activated access status. Unknown parcel status values are kept for
-              review without changing the CRM order status.
-            </p>
+            {delivery.data?.provider === "ABEX" && (
+              <div className="integration-status">
+                <span>ABEX parcel writes</span>
+                <Badge>{delivery.data.writesEnabled ? "Enabled" : "Paused"}</Badge>
+              </div>
+            )}
             <ErrorBox error={delivery.error} />
             <div className="row-actions">
               <button
@@ -367,7 +368,7 @@ export function Settings() {
               </button>
               <Can permission={P.deliverySync.run}>
                 <button
-                  disabled={busy || !delivery.data?.configured}
+                  disabled={busy}
                   onClick={() => test("sync")}
                 >
                   <RefreshCw size={15} />

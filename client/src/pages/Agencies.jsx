@@ -17,7 +17,13 @@ export function Agencies() {
       fields = new FormData(form),
       body = { ...editing };
     delete body._id;
-    if (fields.get("token") || fields.get("key"))
+    if (fields.get("apiKey") || fields.get("tenantId") || fields.get("bearerToken"))
+      body.credentials = {
+        apiKey: fields.get("apiKey"),
+        tenantId: fields.get("tenantId"),
+        ...(fields.get("bearerToken") ? { bearerToken: fields.get("bearerToken") } : {}),
+      };
+    else if (fields.get("token") || fields.get("key"))
       body.credentials = { token: fields.get("token"), key: fields.get("key") };
     form.querySelectorAll("input[type=password]").forEach((i) => {
       i.value = "";
@@ -40,6 +46,8 @@ export function Agencies() {
     }
   }
   async function test(r) {
+    setError("");
+    setMessage("");
     try {
       const data = await api(`/delivery-agencies/${r._id}/test`, {
         method: "POST",
@@ -93,7 +101,10 @@ export function Agencies() {
             label: "Businesses",
             render: (r) => r.businesses.join(", "),
           },
-          { key: "integrationType", label: "Integration" },
+          {
+            key: "integrationType", label: "Integration",
+            render: (r) => r.apiProvider === "ABEX" ? "ABEX TMS" : r.apiProvider || r.integrationType,
+          },
           {
             key: "active",
             label: "Status",
@@ -215,13 +226,10 @@ export function Agencies() {
                     ...editing,
                     integrationType: e.target.value,
                     apiProvider:
-                      e.target.value === "API" ? "PROCOLIS" : "MANUAL",
+                      e.target.value === "API" ? "ABEX" : "MANUAL",
                     config: {
                       ...editing.config,
-                      baseUrl:
-                        e.target.value === "API"
-                          ? "https://procolis.com/api_v1"
-                          : undefined,
+                      baseUrl: undefined,
                     },
                   })
                 }
@@ -230,7 +238,21 @@ export function Agencies() {
                 <option>API</option>
               </select>
             </Field>
-            {editing.integrationType === "API" && (
+            {editing.integrationType === "API" && editing.apiProvider === "ABEX" && (
+              <Can permission={P.deliveryAgencies.manageCredentials}>
+                <p>ABEX TMS</p>
+                {[
+                  ["tenantId", "ABEX tenant ID"],
+                  ["apiKey", "Replace ABEX API key"],
+                  ["bearerToken", "Bearer token, if required"],
+                ].map(([name, label]) => (
+                  <Field key={name} label={label}>
+                    <input type="password" name={name} autoComplete="new-password" />
+                  </Field>
+                ))}
+              </Can>
+            )}
+            {editing.integrationType === "API" && editing.apiProvider === "PROCOLIS" && (
               <>
                 <p>API provider: PROCOLIS</p>
                 <Field label="Base URL">
@@ -276,6 +298,7 @@ export function Agencies() {
             <fieldset>
               <legend>Capabilities</legend>
               {["createShipment", "updateShipment", "deleteShipment", "tracking", "readyToShip", "pricing"]
+                .filter((k) => editing.apiProvider !== "ABEX" || !["updateShipment", "deleteShipment"].includes(k))
                 .map((k) => (
                   <label key={k}>
                     <input
@@ -318,7 +341,16 @@ function AgencyRates({ agency }) {
       deskPrice: 0,
       active: true,
     }),
-    [error, setError] = useState("");
+    [error, setError] = useState(""),
+    [providerRates, setProviderRates] = useState(null);
+  async function loadProviderRates() {
+    setError("");
+    try {
+      setProviderRates(await api(`/delivery-agencies/${agency._id}/provider-rates`));
+    } catch (e) {
+      setError(e.message);
+    }
+  }
   async function save(e) {
     e.preventDefault();
     try {
@@ -380,6 +412,21 @@ function AgencyRates({ agency }) {
         ]}
       />
       <Can permission={P.deliveryAgencies.manageRates}>
+        {agency.apiProvider === "ABEX" && agency.capabilities?.pricing && (
+          <details>
+            <summary>ABEX rates</summary>
+            <button type="button" onClick={loadProviderRates}>Fetch ABEX rates</button>
+            {providerRates && <DataTable
+              rows={providerRates.map((row) => ({ ...row, _id: row.territoryId }))}
+              empty="ABEX returned no rates."
+              columns={[
+                { key: "name", label: "Territory", render: (row) => row.name || row.territoryId },
+                { key: "prices", label: "Effective prices", render: (row) => row.prices.map((p) =>
+                  `${p.deliveryType} ${money(p.discountedPriceTtc ?? p.discountedPrice ?? p.priceTtc ?? p.price)}`).join(" / ") },
+              ]}
+            />}
+          </details>
+        )}
         <form onSubmit={save}>
           <Field label="Wilaya">
             <select

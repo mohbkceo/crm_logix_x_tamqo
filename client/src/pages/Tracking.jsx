@@ -1253,7 +1253,12 @@ export function Tracking() {
                             : o.responsible.name || "—"}
                         </bdi>
                       </span>
-                      {o.shipment?.status && (
+                      {o.shipment?.provider === "ABEX" && o.shipment.syncStatus === "ERROR" ? (
+                        <small title={o.shipment.lastError}>تعذّرت مزامنة الشحنة</small>
+                      ) : o.shipment?.provider === "ABEX" && o.shipment.providerStatus &&
+                        !o.shipment.providerStatusMapped ? (
+                        <small title={o.shipment.providerStatus}>حالة الشحنة غير معيّنة</small>
+                      ) : o.shipment?.status && (
                         <small title={o.shipment.providerStatus}>
                           {localizedStatus(o.shipment.status)}
                         </small>

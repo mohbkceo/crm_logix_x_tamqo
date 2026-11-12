@@ -3,6 +3,7 @@ import { MongoMemoryReplSet } from "mongodb-memory-server";
 import mongoose from "mongoose";
 import { createServer } from "node:http";
 import assert from "node:assert/strict";
+import axios from "axios";
 
 // Isolated browser regression: never contacts a live courier or database.
 process.env.NODE_ENV = "test";
@@ -11,10 +12,12 @@ process.env.BOOTSTRAP_SUPER_ADMIN_NAME = "Delivery QA";
 process.env.BOOTSTRAP_SUPER_ADMIN_EMAIL = "delivery-qa@example.test";
 process.env.BOOTSTRAP_SUPER_ADMIN_PASSWORD = "delivery-test-password";
 process.env.DELIVERY_CREDENTIALS_ENCRYPTION_KEY = "b1".repeat(32);
+process.env.ABEX_WRITES_ENABLED = "true";
 const replica = await MongoMemoryReplSet.create({
   replSet: { count: 1, storageEngine: "wiredTiger" },
 });
 let browser, server, courier;
+const createClient = axios.create;
 try {
   await mongoose.connect(replica.getUri("delivery_browser_check"));
   const { seed } = await import("../server/src/seed.js");
@@ -25,35 +28,136 @@ try {
     await import("../server/src/services/delivery/credentials.js");
   await seed();
   await OrderSource.create({ name: "Messages", isDefault: true });
-  await LogixProduct.create({ name: "Test product", price: 1000 });
+  await LogixProduct.create({
+    name: "Test product",
+    price: 1000,
+  });
   const { migrate } = await import("../server/src/migrate.js");
   await migrate();
+  const workflowId = "f0e00000-0000-4000-8000-000000000005";
+  const preparingId = "f0e00000-0000-4000-8000-000000000006";
+  const readyId = "f0e00000-0000-4000-8000-000000000007";
+  const cityTerritoryId = "f0e00000-0000-4000-8000-000000000002";
+  const districtTerritoryId = "f0e00000-0000-4000-8000-000000000003";
   let mode = "success",
-    calls = 0;
-  courier = createServer((req, res) => {
-    req.resume();
+    calls = 0,
+    readinessCalls = 0,
+    parcel;
+  courier = createServer(async (req, res) => {
+    assert.equal(req.headers["x-api-key"], "browser-abex-key");
+    assert.equal(req.headers["x-tenant"], "browser-abex-tenant");
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    const data = chunks.length ? JSON.parse(Buffer.concat(chunks)) : undefined;
+    const reply = (status, body) => {
+      res.writeHead(status, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(body));
+    };
+    if (req.url === "/api/v1/territories/search") {
+      assert.equal(req.method, "POST");
+      const filter = data.advancedFilter;
+      assert.equal(filter.operator, "eq");
+      if (filter.field === "code") assert.equal(filter.value, 16);
+      else
+        assert.deepEqual(filter, {
+          field: "parentId",
+          operator: "eq",
+          value: cityTerritoryId,
+        });
+      const row =
+        filter.field === "code"
+          ? { id: cityTerritoryId, level: "wilaya", code: 16, name: "Alger" }
+          : {
+              id: districtTerritoryId,
+              level: "commune",
+              name: "Alger Centre",
+              parentId: cityTerritoryId,
+              delivery: { hasHomeDelivery: true },
+            };
+      return reply(200, {
+        pageNumber: data.pageNumber,
+        pageSize: data.pageSize,
+        totalCount: 1,
+        hasNext: false,
+        items: [row],
+      });
+    }
+    if (req.url === "/api/v1/workflows/search") {
+      assert.equal(req.method, "POST");
+      return reply(200, {
+        pageNumber: data.pageNumber,
+        pageSize: data.pageSize,
+        totalCount: 1,
+        hasNext: false,
+        items: [
+          {
+            id: workflowId,
+            states: [
+              {
+                id: preparingId,
+                transitions: [{ fromStateId: preparingId, toStateId: readyId }],
+              },
+              { id: readyId, requirements: [] },
+            ],
+          },
+        ],
+      });
+    }
+    if (req.method === "GET" && req.url === "/api/v1/parcels/BROWSER-1")
+      return reply(200, parcel);
+    if (req.method === "PATCH") {
+      assert.equal(req.url, `/api/v1/parcels/${parcel.id}/state`);
+      assert.deepEqual(data, { parcelId: parcel.id, newStateId: readyId });
+      readinessCalls++;
+      parcel.state = { id: readyId, name: "Test ready" };
+      parcel.lastStateUpdateAt = "2026-10-01T10:01:00Z";
+      return reply(200, data);
+    }
+    assert.equal(req.url, "/api/v1/parcels");
+    assert.equal(req.method, "POST");
+    assert.equal(data.deliveryAddress.cityTerritoryId, cityTerritoryId);
+    assert.equal(data.deliveryAddress.districtTerritoryId, districtTerritoryId);
+    assert.equal(data.customer.phone.number1, "+213550123456");
+    assert.deepEqual(data.orderedProducts, [
+      { productName: "Test product", quantity: 1, unitPrice: 0, stockType: "none" },
+    ]);
+    assert.equal(data.description, "--");
     calls++;
-    res.writeHead(mode === "error" ? 400 : 200, {
-      "Content-Type": "application/json",
-    });
-    res.end(
-      JSON.stringify(
-        mode === "success"
-          ? { Colis: [{ Tracking: `BROWSER-${calls}`, MessageRetour: 'Good' }] }
-          : mode === "error"
-            ? { message: "Invalid courier parcel" }
-            : { received: true },
-      ),
-    );
+    const parcelId = `f0e00000-0000-4000-8000-${String(calls).padStart(12, "0")}`;
+    if (mode === "error")
+      return reply(422, { message: "Invalid courier parcel" });
+    const created = {
+      id: parcelId,
+      externalId: data.externalId,
+      trackingNumber: mode === "success" ? `BROWSER-${calls}` : null,
+    };
+    if (mode === "success")
+      parcel = {
+        ...created,
+        state: { id: preparingId, name: "Test preparation" },
+        lastStateUpdateAt: "2026-10-01T10:00:00Z",
+      };
+    return reply(201, created);
   });
   await new Promise((resolve) => courier.listen(0, "127.0.0.1", resolve));
+  axios.create = (options) =>
+    createClient(
+      options.baseURL === "https://app.abex.clawdyatms.app"
+        ? { ...options, baseURL: `http://127.0.0.1:${courier.address().port}` }
+        : options,
+    );
   await DeliveryAgency.updateOne(
     { code: "ABEX" },
     {
-      "config.baseUrl": `http://127.0.0.1:${courier.address().port}`,
+      "config.abex": {
+        states: [
+          { workflowId, stateId: preparingId, status: "PREPARING" },
+          { workflowId, stateId: readyId, status: "READY_TO_SHIP" },
+        ],
+      },
       encryptedCredentials: encryptCredentials({
-        token: "browser-token",
-        key: "browser-key",
+        apiKey: "browser-abex-key",
+        tenantId: "browser-abex-tenant",
       }),
       credentialsConfigured: true,
     },
@@ -102,12 +206,16 @@ try {
       await expect(
         page.getByText("Save this order, then handle its shipment manually."),
       ).toBeVisible();
-    } else
+    } else {
+      await expect(
+        page.getByRole("combobox", { name: "Commune *", exact: true }),
+      ).toHaveValue("Alger Centre");
       await expect(
         page.getByText(
           /Saving this order automatically creates a courier parcel/,
         ),
       ).toBeVisible();
+    }
     const response = page.waitForResponse(
       (r) => r.url().endsWith("/api/orders") && r.request().method() === "POST",
     );
@@ -126,6 +234,23 @@ try {
       await expect(
         page.getByRole("button", { name: /Create shipment|Retry shipment/ }),
       ).toHaveCount(0);
+      const order = await Order.findOne({
+        "customer.name": "Delivery success",
+      });
+      await Order.updateOne(
+        { _id: order._id },
+        { "tracking.stage": "AT_PRODUCTION" },
+      );
+      await page
+        .getByRole("button", { name: "Refresh tracking", exact: true })
+        .click();
+      await page
+        .getByRole("button", { name: "Mark ready to ship", exact: true })
+        .click();
+      await expect
+        .poll(async () => (await Order.findById(order._id)).tracking.stage)
+        .toBe("READY_TO_SHIP");
+      assert.equal(readinessCalls, 1);
     } else if (outcome === "manual") {
       await expect(
         page.getByText("No shipment has been created for this order."),
@@ -172,9 +297,10 @@ try {
   assert.equal(await Shipment.countDocuments(), 4);
   assert.deepEqual(errors, []);
   console.log(
-    "Delivery browser checks passed: automatic success, pending, error, manual workflow, navigation and duplicate-prevention controls.",
+    "Delivery browser checks passed: ABEX creation, confirmed readiness, pending and rejected parcels, and manual delivery.",
   );
 } finally {
+  axios.create = createClient;
   await browser?.close();
   for (const http of [server, courier])
     if (http) {

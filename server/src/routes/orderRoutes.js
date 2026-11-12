@@ -28,6 +28,7 @@ import {
   orderScope,
 } from "../authorization.js";
 import { deliveryService } from "../services/delivery/deliveryService.js";
+import { supportsReadiness } from "../services/delivery/deliveryProviderFactory.js";
 import { DeliveryAgency } from "../models/delivery.js";
 import { eligible, moveStage, stageTargets, trackingScope } from "../services/trackingService.js";
 const router = Router();
@@ -158,15 +159,15 @@ router.get("/:id", async (req, res) => {
   ]);
   assert(order, "Order not found", 404);
   const deliveryAgency = await DeliveryAgency.findById(order.delivery.agencyId)
-    .select("integrationType apiProvider capabilities")
+    .select("integrationType apiProvider capabilities config.abex.states")
     .lean();
   const productionOrder = eligible(order);
   let productionReady = productionOrder && can(req.user, P.tracking.view) &&
-    deliveryAgency?.integrationType === 'API' && deliveryAgency.apiProvider === 'PROCOLIS' &&
-    deliveryAgency.capabilities?.tracking && deliveryAgency.capabilities?.readyToShip &&
+    supportsReadiness(deliveryAgency, shipment) &&
     shipment?.tracking && String(shipment.agencyId) === String(order.delivery.agencyId) &&
     stageTargets(req.user, order, shipment).includes('READY_TO_SHIP');
   if (productionReady) productionReady = Boolean(await Order.exists({ ...trackingScope(req.user), _id: order._id }));
+  if (deliveryAgency) delete deliveryAgency.config;
   res.json({
     ...order,
     shipment,
@@ -337,11 +338,12 @@ router.post("/:id/shipment", async (req, res) =>
 );
 router.post("/:id/shipment/ready", async (req, res) => {
   const order = await Order.findById(req.params.id);
+  const expectedRevision = z.number().int().min(0).optional().parse(req.body?.expectedRevision);
   if (eligible(order)) {
-    await moveStage(req.user, req.params.id, { targetStage: "READY_TO_SHIP", expectedRevision: req.body.expectedRevision ?? order.revision });
+    await moveStage(req.user, req.params.id, { targetStage: "READY_TO_SHIP", expectedRevision: expectedRevision ?? order.revision });
     return res.json(await Shipment.findOne({ orderId: order._id }));
   }
-  res.json(await deliveryService.ready(req.params.id, req.actor));
+  res.json(await deliveryService.ready(req.params.id, req.actor, { expectedRevision }));
 });
 router.post("/:id/shipment/refresh", async (req, res) =>
   res.json(await deliveryService.refresh(req.params.id, req.actor)),

@@ -18,6 +18,7 @@ import {
 import { assert } from "../errors.js";
 import { transaction } from "./orderService.js";
 import { deliveryService } from "./delivery/deliveryService.js";
+import { supportsReadiness } from "./delivery/deliveryProviderFactory.js";
 import { objectId, pagination, escapeRegex } from "./filters.js";
 import {
   COURIER_STAGES,
@@ -55,7 +56,7 @@ export const courierOwns = (order, shipment) =>
     order.tracking?.courierOwned ||
     COURIER_STAGES.includes(order.status) ||
     COURIER_STAGES.includes(shipment?.status) ||
-    COURIER_STAGES.includes(mapProviderStatus(shipment?.providerStatus)),
+    (shipment?.provider !== "ABEX" && COURIER_STAGES.includes(mapProviderStatus(shipment?.providerStatus))),
   );
 const elevated = (user) => ["ADMIN", "SUPER_ADMIN"].includes(user.role);
 const actor = (user) => ({ userId: user._id, name: user.name });
@@ -131,9 +132,16 @@ export function stageTargets(user, order, shipment) {
   )
     return [];
   return PRODUCTION_STAGES.filter((target) => {
+    if (shipment?.pendingReadinessStateId && target !== "READY_TO_SHIP")
+      return false;
+    const preparationVerified = shipment?.provider === "ABEX"
+      ? Boolean(shipment.pendingReadinessStateId ||
+        (shipment.providerStateId && shipment.providerStatusMapped &&
+          shipment.status === "PREPARING" && shipment.syncStatus === "SYNCED"))
+      : normalizeProviderStatus(shipment?.providerStatus) === "en preparation";
     if (
       target === "READY_TO_SHIP" &&
-      normalizeProviderStatus(shipment?.providerStatus) !== "en preparation"
+      !preparationVerified
     )
       return false;
     const action = STAGE_ACTIONS[`${order.tracking?.stage}:${target}`];
@@ -231,16 +239,17 @@ async function moveToCourierReady(user, id, data) {
     DeliveryAgency.findById(order.delivery.agencyId),
   ]);
   assert(
-    stageTargets(user, order, shipment).includes("READY_TO_SHIP"),
-    "Production is locked by courier ownership, a pending courier operation, or a blocking report.",
+    supportsReadiness(agency, shipment),
+    shipment?.provider === "ABEX"
+      ? "ABEX readiness requires enabled parcel writes and a verified agency workflow mapping."
+      : "This delivery agency cannot confirm readiness automatically.",
     409,
   );
   assert(
-    agency?.integrationType === "API" &&
-      agency.apiProvider === "PROCOLIS" &&
-      agency.capabilities?.tracking &&
-      agency.capabilities?.readyToShip,
-    "This delivery agency cannot confirm readiness automatically.",
+    stageTargets(user, order, shipment).includes("READY_TO_SHIP"),
+    shipment?.provider === "ABEX"
+      ? "Ready to Ship requires In Production, a verified ABEX state, and no blocking report or pending courier operation."
+      : "Production is locked by courier ownership, a pending courier operation, or a blocking report.",
     409,
   );
   assert(
@@ -249,7 +258,7 @@ async function moveToCourierReady(user, id, data) {
     409,
   );
 
-  // The provider's /pret acknowledgement must arrive BEFORE the local stage moves.
+  // Courier confirmation must arrive before the local stage moves.
   // A single database transaction then records the commercial and production states.
   await deliveryService.ready(order._id, actor(user), {
     expectedRevision: data.expectedRevision,
@@ -621,11 +630,11 @@ export async function presentOrders(user, orders) {
       .lean(),
     Shipment.find({ orderId: { $in: orders.map((o) => o._id) } })
       .select(
-        "orderId agencyId tracking status providerStatus syncStatus lastError lockUntil uncertain",
+        "orderId agencyId tracking status provider providerParcelId providerStatus providerStateId providerStatusMapped pendingReadinessStateId syncStatus lastError lockUntil uncertain",
       )
       .populate(
         "agencyId",
-        "code name integrationType apiProvider capabilities",
+        "code name integrationType apiProvider capabilities config.abex.states",
       )
       .lean(),
   ]);
@@ -637,10 +646,7 @@ export async function presentOrders(user, orders) {
       owned = courierOwns(o, shipment);
     const readinessProvider = Boolean(
       shipment?.tracking &&
-      shipment.agencyId?.integrationType === "API" &&
-      shipment.agencyId.apiProvider === "PROCOLIS" &&
-      shipment.agencyId.capabilities?.tracking &&
-      shipment.agencyId.capabilities?.readyToShip,
+      supportsReadiness(shipment.agencyId, shipment),
     );
     let responsible = peopleById.get(
       String(
@@ -724,13 +730,15 @@ export async function presentOrders(user, orders) {
       shipment: shipment
         ? {
             tracking: shipment.tracking,
+            provider: shipment.provider,
             status: shipment.status,
             providerStatus: shipment.providerStatus,
+            providerStatusMapped: shipment.providerStatusMapped,
             syncStatus: shipment.syncStatus,
             lastError: shipment.lastError,
             agencyName: shipment.agencyId?.name,
             url:
-              shipment.tracking && shipment.agencyId?.code === "ABEX"
+              shipment.tracking && shipment.provider !== "ABEX" && shipment.agencyId?.code === "ABEX"
                 ? `https://abex-dz.com/ABEX-DZ_WEB/FR/liste.awp?P1=x&P2=Tracking&P3=${encodeURIComponent(shipment.tracking)}`
                 : null,
           }

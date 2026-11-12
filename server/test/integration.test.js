@@ -1,4 +1,5 @@
 import { before, after, beforeEach, test } from "node:test";
+import axios from "axios";
 import assert from "node:assert/strict";
 import mongoose from "mongoose";
 import { MongoMemoryReplSet } from "mongodb-memory-server";
@@ -38,7 +39,7 @@ import {
   DeliverySyncLock,
   DeliverySyncRun,
 } from "../src/models/delivery.js";
-import { migrate } from "../src/migrate.js";
+import { migrate, cutoverAbexAgency } from "../src/migrate.js";
 import { P } from "../../shared/permissions.js";
 import { createServer } from "node:http";
 import { encryptCredentials } from "../src/services/delivery/credentials.js";
@@ -75,6 +76,9 @@ before(
     ]);
     await migrate();
     const abex = await DeliveryAgency.findOne({ code: "ABEX" });
+    assert.equal(abex.apiProvider, "ABEX");
+    // The legacy scenarios use a pre-cutover installation.
+    await DeliveryAgency.updateOne({ _id: abex._id }, { apiProvider: "PROCOLIS" });
     const testWilaya = await Wilaya.findOne({ agencyId: "16" });
     await DeliveryRate.updateOne(
       { agencyId: abex._id, wilayaId: testWilaya._id },
@@ -3423,4 +3427,995 @@ test("delivery sync log permissions protect history and manual execution indepen
     }),
   );
   assert.equal((await denied.get("/api/delivery-sync/status")).status, 403);
+});
+
+const abexIds = {
+  city: "10f10000-0000-4000-8000-000000000001",
+  district: "10f10000-0000-4000-8000-000000000002",
+  hub: "10f10000-0000-4000-8000-000000000003",
+  product: "10f10000-0000-4000-8000-000000000004",
+  parcel: "10f10000-0000-4000-8000-000000000005",
+  workflow: "10f10000-0000-4000-8000-000000000006",
+  preparing: "10f10000-0000-4000-8000-000000000007",
+  ready: "10f10000-0000-4000-8000-000000000008",
+  returning: "10f10000-0000-4000-8000-000000000009",
+  delivered: "10f10000-0000-4000-8000-000000000010",
+  unknown: "10f10000-0000-4000-8000-000000000011",
+};
+const abexCredentials = {
+  apiKey: "test-abex-api-secret",
+  tenantId: "test-abex-tenant",
+};
+const abexTracking = "TMS-TRACKING-1";
+const abexTime = (minute) =>
+  new Date(Date.UTC(2026, 9, 1, 10, minute)).toISOString();
+const abexPage = (items, criteria) => ({
+  status: 200,
+  data: {
+    items,
+    pageNumber: criteria.pageNumber,
+    pageSize: criteria.pageSize,
+    totalCount: items.length,
+    totalPages: 1,
+    hasPrevious: false,
+    hasNext: false,
+  },
+});
+const abexHttpError = (status) =>
+  Object.assign(new Error(abexCredentials.apiKey), {
+    response: { status, data: { detail: abexCredentials.apiKey } },
+  });
+const abexTimeout = () =>
+  Object.assign(new Error(abexCredentials.apiKey), { code: "ECONNABORTED" });
+
+async function abexFixture(
+  t,
+  { credentials = true, canReady = true, useConfiguredTerritory = true } = {},
+) {
+  const previous = {
+    DELIVERY_CREDENTIALS_ENCRYPTION_KEY:
+      process.env.DELIVERY_CREDENTIALS_ENCRYPTION_KEY,
+    ABEX_WRITES_ENABLED: process.env.ABEX_WRITES_ENABLED,
+  };
+  process.env.DELIVERY_CREDENTIALS_ENCRYPTION_KEY = "b8".repeat(32);
+  process.env.ABEX_WRITES_ENABLED = "true";
+  const states = [
+    {
+      workflowId: abexIds.workflow,
+      stateId: abexIds.preparing,
+      status: "PREPARING",
+    },
+    {
+      workflowId: abexIds.workflow,
+      stateId: abexIds.ready,
+      status: "READY_TO_SHIP",
+    },
+    {
+      workflowId: abexIds.workflow,
+      stateId: abexIds.returning,
+      status: "RETURNING",
+    },
+    {
+      workflowId: abexIds.workflow,
+      stateId: abexIds.delivered,
+      status: "DELIVERED",
+    },
+  ];
+  const agency = expectOk(
+    await apiAgent.post("/api/delivery-agencies").send({
+      code: "ABEX_TEST",
+      name: "ABEX contract test",
+      businesses: ["LOGIX", "TAMQO"],
+      integrationType: "API",
+      apiProvider: "ABEX",
+      config: {
+        abex: {
+          destinations: useConfiguredTerritory
+            ? [
+                {
+                  wilayaId: String(wilaya._id),
+                  commune: "Alger Centre",
+                  cityTerritoryId: abexIds.city,
+                  districtTerritoryId: abexIds.district,
+                  hubId: abexIds.hub,
+                },
+              ]
+            : [],
+          products: { [String(product._id)]: abexIds.product },
+          states,
+        },
+      },
+      ...(credentials ? { credentials: abexCredentials } : {}),
+    }),
+  );
+  t.after(async () => {
+    await DeliveryAgency.deleteOne({ _id: agency._id });
+    for (const [name, value] of Object.entries(previous)) {
+      if (value === undefined) delete process.env[name];
+      else process.env[name] = value;
+    }
+  });
+  const fixture = {
+    agency,
+    input: input("PARTNERSHIP", {
+      delivery: { agencyId: agency._id, type: "STOP_DESK", exchange: false },
+      deliveryCharged: 500,
+      payment: { method: "MIXED", amountPaidOnline: 1000 },
+    }),
+    requests: [],
+    stateId: abexIds.preparing,
+    time: abexTime(1),
+    tracking: abexTracking,
+    parcelId: abexIds.parcel,
+  };
+  const parcel = () => ({
+    id: fixture.parcelId,
+    trackingNumber: fixture.tracking,
+    externalId: fixture.referenceOverride ?? fixture.externalId,
+    tenantId: abexCredentials.tenantId,
+    amount: fixture.amountOverride ?? fixture.amount,
+    state: { id: fixture.stateId, name: fixture.stateName || "ABEX state" },
+    lastStateUpdateAt: fixture.time,
+    createdAt: abexTime(0),
+  });
+  const axiosCreate = axios.create;
+  t.mock.method(axios, "create", (config) => {
+    if (config.baseURL !== "https://app.abex.clawdyatms.app")
+      return axiosCreate(config);
+    assert.equal(config.maxRedirects, 0);
+    assert.equal(config.allowAbsoluteUrls, false);
+    return {
+      defaults: config,
+      request: async (req) => {
+        fixture.requests.push(req);
+        assert.equal(req.headers["X-Api-Key"], abexCredentials.apiKey);
+        assert.equal(req.headers["X-Tenant"], abexCredentials.tenantId);
+        assert.equal(req.headers.token, undefined);
+        assert.equal(req.headers.key, undefined);
+        if (fixture.rejectAuth) throw abexHttpError(401);
+        if (req.url === "/api/v1/territories/search") {
+          const filter = req.data.advancedFilter;
+          if (fixture.onTerritories) await fixture.onTerritories(filter);
+          assert.equal(filter.operator, "eq");
+          if (filter.field === "code") {
+            assert.equal(filter.value, 16);
+            return abexPage(
+              [
+                {
+                  id: abexIds.unknown,
+                  code: 16,
+                  level: "commune",
+                  name: "Reggane",
+                  parentId: abexIds.hub,
+                },
+                {
+                  id: abexIds.city,
+                  code: 16,
+                  level: "wilaya",
+                  name: "Alger",
+                  parentId: null,
+                },
+              ],
+              req.data,
+            );
+          }
+          assert.deepEqual(filter, {
+            field: "parentId",
+            operator: "eq",
+            value: abexIds.city,
+          });
+          return abexPage(
+            [
+              {
+                id: abexIds.district,
+                name: "Alger Centre",
+                nameArabic: "الجزائر الوسطى",
+                level: "commune",
+                parentId: abexIds.city,
+                delivery: { hasHomeDelivery: true, hasPickupPoint: true },
+              },
+              {
+                id: abexIds.unknown,
+                name: "Foreign commune",
+                level: "commune",
+                parentId: abexIds.hub,
+                delivery: { hasHomeDelivery: true, hasPickupPoint: true },
+              },
+            ],
+            req.data,
+          );
+        }
+        if (req.url === "/api/v1/parcels" && req.method === "POST") {
+          fixture.externalId = req.data.externalId;
+          fixture.amount = req.data.amount;
+          if (fixture.onCreate) await fixture.onCreate(req);
+          return fixture.createResponse ?? {
+            status: 201,
+            data: {
+              id: fixture.parcelId,
+              trackingNumber: fixture.tracking,
+              externalId: fixture.externalId,
+              amount: req.data.amount,
+            },
+          };
+        }
+        if (req.url === "/api/v1/parcels/search") {
+          if (req.data.keyword) {
+            assert.equal(req.data.keyword, fixture.externalId);
+            if (fixture.parcelAbsent) return abexPage([], req.data);
+            return abexPage(
+              [{ ...parcel(), externalId: "unrelated-order" }, parcel()],
+              req.data,
+            );
+          }
+          if (fixture.invalidRead)
+            return { status: 200, data: { authenticated: true } };
+          return abexPage([], req.data);
+        }
+        if (req.url === "/api/v1/delivery-pricing/rates") {
+          assert.equal(req.method, "GET");
+          return {
+            status: 200,
+            data: {
+              rates: [
+                {
+                  toTerritoryId: abexIds.city,
+                  toTerritoryName: "Alger",
+                  deliveryPrices: [{ deliveryType: "home", price: 600 }],
+                },
+              ],
+            },
+          };
+        }
+        if (req.url === "/api/v1/workflows/search") {
+          return abexPage(
+            [
+              {
+                id: abexIds.workflow,
+                states: states.map(({ stateId }) => ({
+                  id: stateId,
+                  requirements: [],
+                  transitions:
+                    canReady && stateId === abexIds.preparing
+                      ? [
+                          {
+                            fromStateId: abexIds.preparing,
+                            toStateId: abexIds.ready,
+                          },
+                        ]
+                      : [],
+                })),
+              },
+            ],
+            req.data,
+          );
+        }
+        if (
+          req.method === "PATCH" &&
+          req.url === `/api/v1/parcels/${abexIds.parcel}/state`
+        ) {
+          assert.deepEqual(req.data, {
+            parcelId: abexIds.parcel,
+            newStateId: abexIds.ready,
+          });
+          if (fixture.onReady) await fixture.onReady();
+          else {
+            fixture.stateId = abexIds.ready;
+            fixture.time = abexTime(2);
+          }
+          return {
+            status: 200,
+            data: { parcelId: abexIds.parcel, newStateId: abexIds.ready },
+          };
+        }
+        assert.equal(req.url, `/api/v1/parcels/${fixture.requestedTracking ?? abexTracking}`);
+        assert.equal(req.method, "GET");
+        return { status: 200, data: parcel() };
+      },
+    };
+  });
+  return fixture;
+}
+
+test("ABEX connection test validates scoped access and keeps credentials write-only", async (t) => {
+  const f = await abexFixture(t, { credentials: false });
+  const base = `/api/delivery-agencies/${f.agency._id}`;
+  const missing = await apiAgent.post(base + "/test");
+  assert.equal(missing.body.error.code, "DELIVERY_NOT_CONFIGURED");
+  assert.equal(f.requests.length, 0);
+
+  assert.equal(
+    (
+      await apiAgent.patch(base).send({
+        credentials: { token: "old-token", key: "old-key" },
+      })
+    ).status,
+    400,
+  );
+  const updated = expectOk(
+    await apiAgent.patch(base).send({ credentials: abexCredentials }),
+  );
+  assert.equal(updated.credentialsConfigured, true);
+  assert.equal("encryptedCredentials" in updated, false);
+  const stored = await DeliveryAgency.findById(f.agency._id).select(
+    "+encryptedCredentials",
+  );
+  assert.ok(stored.encryptedCredentials);
+  assert.equal(
+    stored.encryptedCredentials.includes(abexCredentials.apiKey),
+    false,
+  );
+  assert.equal(expectOk(await apiAgent.post(base + "/test")).provider, "ABEX");
+  f.invalidRead = true;
+  assert.equal(
+    (await apiAgent.post(base + "/test")).body.error.code,
+    "ABEX_INVALID_RESPONSE",
+  );
+
+  f.rejectAuth = true;
+  const invalid = await apiAgent.post(base + "/test");
+  assert.equal(invalid.body.error.code, "ABEX_AUTHENTICATION");
+  assert.equal(
+    JSON.stringify(invalid.body).includes(abexCredentials.apiKey),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(expectOk(await apiAgent.get(base))).includes(
+      abexCredentials.tenantId,
+    ),
+    false,
+  );
+});
+
+test("ABEX rate lookup returns effective prices and preserves manually configured rates", async (t) => {
+  const f = await abexFixture(t);
+  const rate = await DeliveryRate.create({
+    agencyId: f.agency._id,
+    wilayaId: wilaya._id,
+    homePrice: 500,
+    deskPrice: 400,
+  });
+  t.after(() => DeliveryRate.deleteOne({ _id: rate._id }));
+  const base = `/api/delivery-agencies/${f.agency._id}`;
+  const rates = expectOk(await apiAgent.get(base + "/provider-rates"));
+  assert.equal(rates[0].territoryId, abexIds.city);
+  assert.equal(rates[0].prices[0].price, 600);
+  assert.equal((await DeliveryRate.findById(rate._id)).homePrice, 500);
+});
+
+test("ABEX paused writes and missing mappings leave saved orders safe to retry", async (t) => {
+  const f = await abexFixture(t);
+  process.env.ABEX_WRITES_ENABLED = "false";
+  const paused = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  assert.match(paused.shipment.lastError, /writes are disabled/);
+  assert.equal(paused.shipment.creationAttemptedAt, undefined);
+  assert.equal(f.requests.length, 0);
+  process.env.ABEX_WRITES_ENABLED = "true";
+  const unmapped = expectOk(
+    await apiAgent.post("/api/orders").send({
+      ...f.input,
+      location: { ...f.input.location, commune: "Foreign commune" },
+    }),
+  );
+  assert.match(
+    unmapped.shipment.lastError,
+    /could not verify "Foreign commune" in Alger/,
+  );
+  assert.equal(unmapped.shipment.creationAttemptedAt, undefined);
+  assert.deepEqual(
+    f.requests.map((req) => req.url),
+    ["/api/v1/territories/search", "/api/v1/territories/search"],
+  );
+  const linked = expectOk(
+    await apiAgent.post(`/api/orders/${paused._id}/shipment`),
+  );
+  assert.equal(linked.tracking, abexTracking);
+  assert.equal(
+    f.requests.filter((req) => req.url === "/api/v1/parcels").length,
+    1,
+  );
+});
+
+test("ABEX uses the selected wilaya's live commune IDs without a configured destination", async (t) => {
+  const f = await abexFixture(t, { useConfiguredTerritory: false });
+  const options = expectOk(
+    await apiAgent
+      .get(`/api/delivery-agencies/${f.agency._id}/communes`)
+      .query({ wilayaId: String(wilaya._id), deliveryType: "HOME" }),
+  );
+  assert.deepEqual(options.communes, [
+    { name: "Alger Centre", nameArabic: "الجزائر الوسطى" },
+  ]);
+
+  f.onCreate = ({ data }) => {
+    assert.equal(data.deliveryAddress.cityTerritoryId, abexIds.city);
+    assert.equal(data.deliveryAddress.districtTerritoryId, abexIds.district);
+  };
+  const created = expectOk(
+    await apiAgent.post("/api/orders").send({
+      ...f.input,
+      location: { ...f.input.location, commune: "الجزائر الوسطى" },
+      delivery: { ...f.input.delivery, type: "HOME" },
+    }),
+  );
+  assert.equal(created.shipment.tracking, abexTracking);
+  assert.deepEqual(
+    f.requests.map((req) => req.url),
+    [
+      "/api/v1/territories/search",
+      "/api/v1/territories/search",
+      "/api/v1/parcels",
+    ],
+  );
+});
+
+test("ABEX refuses to reserve creation when the address changes during catalog lookup", async (t) => {
+  const f = await abexFixture(t, { useConfiguredTerritory: false });
+  f.onTerritories = async (filter) => {
+    if (filter.field !== "parentId") return;
+    const pending = await Order.findOne({ "delivery.agencyId": f.agency._id });
+    assert.ok(pending);
+    await Order.updateOne(
+      { _id: pending._id },
+      {
+        $set: { "location.commune": "Edited commune" },
+        $inc: { revision: 1 },
+      },
+    );
+  };
+  const result = expectOk(
+    await apiAgent.post("/api/orders").send({
+      ...f.input,
+      delivery: { ...f.input.delivery, type: "HOME" },
+    }),
+  );
+  assert.match(
+    result.shipmentSync.error,
+    /order changed during ABEX address validation/,
+  );
+  assert.equal(result.shipment, null);
+  assert.equal(
+    f.requests.some((req) => req.url === "/api/v1/parcels"),
+    false,
+  );
+  assert.equal(
+    (await Order.findById(result._id)).location.commune,
+    "Edited commune",
+  );
+});
+
+test("ABEX saves the order before one parcel create and uses the outstanding COD amount", async (t) => {
+  const f = await abexFixture(t);
+  f.input.customer.phoneB = "0770 12 34 56";
+  let releaseCreate;
+  const held = new Promise((resolve) => {
+    releaseCreate = resolve;
+  });
+  let enteredCreate;
+  const started = new Promise((resolve) => {
+    enteredCreate = resolve;
+  });
+  f.onCreate = async ({ data }) => {
+    const saved = await Order.findOne({ orderNumber: data.externalId });
+    enteredCreate(saved);
+    await held;
+    assert.equal(data.amount, saved.payment.amountToCollect);
+    assert.equal(data.amount, saved.totalOrderValue - 1000);
+    assert.equal(data.deliveryType, "pickup-point");
+    assert.equal(data.hubId, abexIds.hub);
+    assert.equal(data.deliveryAddress.cityTerritoryId, abexIds.city);
+    assert.equal(data.deliveryAddress.districtTerritoryId, abexIds.district);
+    assert.equal(data.orderedProducts.length, 1);
+    assert.equal(data.orderedProducts[0].productId, abexIds.product);
+    assert.equal(data.orderedProducts[0].stockType, "local");
+    assert.deepEqual(data.customer.phone, {
+      number1: saved.customer.normalizedPhone,
+      number2: "+213770123456",
+    });
+    assert.equal("Colis" in data, false);
+  };
+  const creating = apiAgent.post("/api/orders").send(f.input).then(expectOk);
+  try {
+    const saved = await started;
+    assert.ok(saved);
+    assert.equal(
+      (await apiAgent.post(`/api/orders/${saved._id}/shipment`)).status,
+      409,
+    );
+  } finally {
+    releaseCreate();
+  }
+  const created = await creating;
+  const shipment = await Shipment.findOne({ orderId: created._id });
+  assert.equal(shipment.provider, "ABEX");
+  assert.equal(shipment.providerParcelId, abexIds.parcel);
+  assert.equal(shipment.tracking, abexTracking);
+  assert.equal(shipment.uncertain, false);
+  assert.equal(created.shipmentSync.success, true);
+  assert.equal(f.requests.length, 1);
+
+  const rotation = await apiAgent
+    .patch(`/api/delivery-agencies/${f.agency._id}`)
+    .send({
+      credentials: { ...abexCredentials, tenantId: "different-tenant" },
+    });
+  assert.equal(rotation.status, 409);
+});
+
+test("ABEX retries a reconciled rejection with manual parcel contents", async (t) => {
+  const f = await abexFixture(t);
+  process.env.ABEX_WRITES_ENABLED = "false";
+  const order = expectOk(
+    await apiAgent.post("/api/orders").send({
+      ...f.input,
+      items: [
+        ...f.input.items,
+        {
+          business: "LOGIX",
+          catalogItemId: String(stand._id),
+          quantity: 3,
+          specifications: "Matte finish",
+        },
+      ],
+    }),
+  );
+  assert.equal(order.shipment.creationAttemptedAt, undefined);
+  await Shipment.updateOne(
+    { _id: order.shipment._id },
+    {
+      creationAttemptedAt: new Date(),
+      syncStatus: "PENDING",
+      uncertain: true,
+      lastError: "ABEX rejected the parcel data. Review parcel contents.",
+      sanitizedProviderData: {
+        creation: {
+          status: 400,
+          code: "ABEX_VALIDATION",
+          fields: ["parcel contents"],
+        },
+        reconciliation: { result: "NOT_FOUND" },
+      },
+    },
+  );
+  expectOk(
+    await apiAgent
+      .post(`/api/orders/${order._id}/shipment/reconcile`)
+      .send({ absentConfirmed: true }),
+  );
+  assert.equal(f.requests.length, 0);
+  process.env.ABEX_WRITES_ENABLED = "true";
+  const shipment = expectOk(
+    await apiAgent.post(`/api/orders/${order._id}/shipment`),
+  );
+  assert.equal(shipment._id, order.shipment._id);
+  assert.equal(shipment.tracking, abexTracking);
+  assert.equal(f.requests.length, 1);
+  const { data } = f.requests[0];
+  assert.deepEqual(data.orderedProducts, [
+    { productName: product.name, quantity: 2, unitPrice: 0, stockType: "none" },
+    { productName: stand.name, quantity: 3, unitPrice: 0, stockType: "none" },
+  ]);
+  assert.equal(data.amount, order.payment.amountToCollect);
+  assert.ok(data.description.includes(`${stand.name} · Matte finish`));
+});
+
+test("ABEX verifies an incomplete create response without sending another create", async (t) => {
+  const f = await abexFixture(t);
+  f.createResponse = { status: 201, data: { trackingNumber: abexTracking } };
+  const linked = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  assert.equal(linked.shipment.tracking, abexTracking);
+  assert.equal(linked.shipment.providerParcelId, abexIds.parcel);
+  assert.equal(linked.shipment.providerAccepted, true);
+  assert.equal(linked.shipment.uncertain, false);
+  assert.deepEqual(f.requests.slice(0, 3).map(({ url }) => url), [
+    "/api/v1/parcels",
+    "/api/v1/parcels/search",
+    `/api/v1/parcels/${abexTracking}`,
+  ]);
+
+  f.parcelId = abexIds.unknown;
+  f.tracking = "ABEX-SECOND-ORDER";
+  f.requestedTracking = f.tracking;
+  f.createResponse = { status: 200, data: null };
+  f.parcelAbsent = true;
+  const order = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  const stored = await Shipment.findById(order.shipment._id).lean();
+  assert.equal(stored.syncStatus, "PENDING");
+  assert.equal(stored.uncertain, true);
+  assert.equal(stored.tracking, undefined);
+  assert.deepEqual(stored.sanitizedProviderData, {
+    creation: { status: 200, code: "ABEX_INVALID_RESPONSE" },
+    reconciliation: { result: "NOT_FOUND" },
+  });
+
+  const route = `/api/orders/${order._id}/shipment/refresh`;
+  f.parcelAbsent = false;
+  f.amountOverride = order.payment.amountToCollect + 1;
+  const mismatched = expectOk(await apiAgent.post(route));
+  assert.equal(mismatched.uncertain, true);
+  assert.match(mismatched.lastError, /collection amount/);
+  assert.equal(mismatched.tracking, undefined);
+
+  f.amountOverride = undefined;
+  const verified = expectOk(await apiAgent.post(route));
+  assert.equal(verified.tracking, f.tracking);
+  assert.equal(verified.uncertain, false);
+  assert.equal(
+    f.requests.filter(({ url }) => url === "/api/v1/parcels").length,
+    2,
+  );
+});
+
+test("ABEX retains safe validation fields through reconciliation without repeating the write", async (t) => {
+  const f = await abexFixture(t);
+  f.parcelAbsent = true;
+  f.onCreate = () => {
+    const error = abexHttpError(400);
+    error.response.data = {
+      detail: abexCredentials.apiKey,
+      errors: [
+        {
+          description: `The stock type is invalid for ${abexCredentials.apiKey}`,
+        },
+        {
+          propertyName: "$.customer.phone.number1",
+          description: `Invalid value ${f.input.customer.phoneA}`,
+        },
+      ],
+    };
+    throw error;
+  };
+  const order = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  assert.match(order.shipment.lastError, /Review stock type, primary phone/);
+  const refreshed = expectOk(
+    await apiAgent.post(`/api/orders/${order._id}/shipment/refresh`),
+  );
+  assert.equal(refreshed.uncertain, true);
+  assert.equal(refreshed.lastError, order.shipment.lastError);
+  assert.deepEqual(refreshed.sanitizedProviderData, {
+    creation: {
+      status: 400,
+      code: "ABEX_VALIDATION",
+      fields: ["stock type", "primary phone"],
+    },
+    reconciliation: { result: "NOT_FOUND" },
+  });
+  assert.equal(
+    JSON.stringify(refreshed).includes(abexCredentials.apiKey),
+    false,
+  );
+  assert.equal(
+    JSON.stringify(refreshed.sanitizedProviderData).includes(
+      f.input.customer.phoneA,
+    ),
+    false,
+  );
+  assert.equal(
+    f.requests.filter((req) => req.url === "/api/v1/parcels").length,
+    1,
+  );
+});
+
+test("ABEX validation errors and timeouts preserve orders and reconciliation never repeats creation", async (t) => {
+  const f = await abexFixture(t);
+  for (const outcome of [422, "timeout", 409]) {
+    f.tracking = abexTracking;
+    f.onCreate = () => {
+      throw outcome === "timeout" ? abexTimeout() : abexHttpError(outcome);
+    };
+    const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+    const order = await Order.findById(created._id);
+    assert.ok(order);
+    const before = await Shipment.findOne({ orderId: order._id });
+    if (outcome === 409) {
+      assert.equal(before.tracking, abexTracking);
+    } else {
+      assert.equal(before.uncertain, true);
+      assert.equal(before.tracking, undefined);
+      assert.equal(
+        JSON.stringify(created).includes(abexCredentials.apiKey),
+        false,
+      );
+      const refreshed = expectOk(
+        await apiAgent.post(`/api/orders/${order._id}/shipment/refresh`),
+      );
+      assert.equal(refreshed.tracking, abexTracking);
+      assert.equal(refreshed.providerParcelId, abexIds.parcel);
+      assert.equal(refreshed.uncertain, false);
+    }
+    await Shipment.deleteOne({ orderId: order._id });
+  }
+  f.tracking = null;
+  f.onCreate = undefined;
+  const acknowledged = expectOk(
+    await apiAgent.post("/api/orders").send(f.input),
+  );
+  assert.equal(acknowledged.shipment.providerParcelId, abexIds.parcel);
+  assert.equal(acknowledged.shipment.tracking, undefined);
+  assert.equal(
+    (
+      await apiAgent
+        .post(`/api/orders/${acknowledged._id}/shipment/reconcile`)
+        .send({ absentConfirmed: true })
+    ).status,
+    409,
+  );
+  assert.equal(
+    f.requests.filter((req) => req.url === "/api/v1/parcels").length,
+    4,
+  );
+  assert.equal(
+    f.requests.filter((req) => req.url === "/api/v1/parcels/search").length,
+    3,
+  );
+});
+
+test("ABEX polling validates parcel identity and protects production, event ordering, and finance", async (t) => {
+  const f = await abexFixture(t);
+  const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  const route = `/api/orders/${created._id}/shipment/refresh`;
+  expectOk(await apiAgent.post(route));
+  assert.equal((await Order.findById(created._id)).status, "PREPARING");
+
+  f.tracking = "WRONG-TRACKING";
+  assert.equal(
+    (await apiAgent.post(route)).body.error.code,
+    "ABEX_IDENTITY_MISMATCH",
+  );
+  f.tracking = abexTracking;
+  f.referenceOverride = "DIFFERENT-ORDER";
+  assert.equal(
+    (await apiAgent.post(route)).body.error.code,
+    "ABEX_IDENTITY_MISMATCH",
+  );
+  f.referenceOverride = undefined;
+  f.stateId = abexIds.delivered;
+  f.time = abexTime(3);
+  assert.match(
+    expectOk(await apiAgent.post(route)).lastError,
+    /before CRM production readiness/,
+  );
+
+  await Order.updateOne(
+    { _id: created._id },
+    { status: "SHIPPED", "tracking.stage": "READY_TO_SHIP" },
+  );
+  f.stateId = abexIds.returning;
+  f.time = abexTime(4);
+  expectOk(await apiAgent.post(route));
+  expectOk(await apiAgent.post(route));
+  assert.equal((await Order.findById(created._id)).status, "RETURNING");
+  const fees = await Expense.find({
+    sourceOrderId: created._id,
+    systemGenerated: true,
+  });
+  assert.equal(
+    fees.reduce((total, fee) => total + fee.amount, 0),
+    150,
+  );
+  assert.equal(
+    await OrderEvent.countDocuments({
+      orderId: created._id,
+      type: "ORDER_RETURNING",
+    }),
+    1,
+  );
+
+  f.stateId = abexIds.unknown;
+  f.stateName = "Supprimée";
+  f.time = abexTime(5);
+  const batch = await deliveryService.syncBatch();
+  assert.equal(batch.unknownStatuses, 1);
+  const unknown = await Shipment.findOne({ orderId: created._id });
+  assert.equal(unknown.providerStatus, "Supprimée");
+  assert.equal(unknown.status, "RETURNING");
+  assert.equal(unknown.providerStatusMapped, false);
+  assert.equal((await Order.findById(created._id)).deletedAt, undefined);
+
+  f.stateId = abexIds.delivered;
+  f.time = abexTime(3);
+  assert.match(expectOk(await apiAgent.post(route)).lastError, /Stale/);
+  f.time = abexTime(6);
+  expectOk(await apiAgent.post(route));
+  const delivered = await Order.findById(created._id);
+  assert.equal(delivered.status, "DELIVERED");
+  assert.equal(delivered.payment.amountCollected, 0);
+  assert.equal(
+    await Expense.countDocuments({
+      sourceOrderId: created._id,
+      systemGenerated: true,
+    }),
+    0,
+  );
+  f.stateId = abexIds.returning;
+  f.time = abexTime(7);
+  assert.equal(expectOk(await apiAgent.post(route)).syncStatus, "ERROR");
+  assert.equal((await Order.findById(created._id)).status, "DELIVERED");
+});
+
+test("ABEX readiness verifies production gates and reconciles a timeout without repeating PATCH", async (t) => {
+  const f = await abexFixture(t);
+  const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  const orderRoute = `/api/orders/${created._id}/shipment`;
+  expectOk(await apiAgent.post(orderRoute + "/refresh"));
+  const patches = () =>
+    f.requests.filter((req) => req.method === "PATCH").length;
+  const ready = async () => {
+    const current = await Order.findById(created._id);
+    return apiAgent
+      .post(orderRoute + "/ready")
+      .send({ expectedRevision: current.revision });
+  };
+  assert.equal((await ready()).status, 409);
+  await Order.updateOne(
+    { _id: created._id },
+    { "tracking.stage": "AT_PRODUCTION", "tracking.blockingIssues": 1 },
+  );
+  assert.equal((await ready()).status, 409);
+  assert.equal(patches(), 0);
+  await Order.updateOne({ _id: created._id }, { "tracking.blockingIssues": 0 });
+  f.onReady = async () => {
+    const pending = await Shipment.findOne({ orderId: created._id });
+    const current = await Order.findById(created._id);
+    assert.equal(pending.pendingReadinessStateId, abexIds.ready);
+    assert.equal(current.tracking.stage, "AT_PRODUCTION");
+    assert.equal(
+      (
+        await apiAgent
+          .patch(`/api/orders/${created._id}`)
+          .send({ ...f.input, revision: current.revision })
+      ).status,
+      409,
+    );
+    throw abexTimeout();
+  };
+  assert.equal((await ready()).body.error.code, "ABEX_TIMEOUT");
+  assert.equal(
+    (await Order.findById(created._id)).tracking.stage,
+    "AT_PRODUCTION",
+  );
+  assert.equal((await ready()).status, 409);
+  assert.equal(patches(), 1);
+
+  f.stateId = abexIds.ready;
+  f.time = abexTime(2);
+  const reconciled = expectOk(await apiAgent.post(orderRoute + "/refresh"));
+  assert.equal(reconciled.uncertain, false);
+  assert.equal((await Order.findById(created._id)).status, "PREPARING");
+  expectOk(await ready());
+  const saved = await Order.findById(created._id);
+  assert.equal(saved.status, "READY_TO_SHIP");
+  assert.equal(saved.tracking.stage, "READY_TO_SHIP");
+  assert.equal(patches(), 1);
+});
+
+test("ABEX readiness rejects a workflow without the configured transition before sending a write", async (t) => {
+  const f = await abexFixture(t, { canReady: false });
+  const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  const route = `/api/orders/${created._id}/shipment`;
+  expectOk(await apiAgent.post(route + "/refresh"));
+  await Order.updateOne(
+    { _id: created._id },
+    { "tracking.stage": "AT_PRODUCTION" },
+  );
+  const response = await apiAgent.post(route + "/ready");
+  assert.equal(response.status, 409);
+  assert.match(
+    response.body.error.message,
+    /does not expose a verified readiness transition/,
+  );
+  assert.equal(f.requests.filter((req) => req.method === "PATCH").length, 0);
+  assert.equal(
+    (await Order.findById(created._id)).tracking.stage,
+    "AT_PRODUCTION",
+  );
+});
+
+test("ABEX readiness commits only after readback confirms the same parcel and target", async (t) => {
+  const f = await abexFixture(t);
+  const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  const route = `/api/orders/${created._id}/shipment`;
+  expectOk(await apiAgent.post(route + "/refresh"));
+  await Order.updateOne(
+    { _id: created._id },
+    { "tracking.stage": "AT_PRODUCTION" },
+  );
+  const confirmed = expectOk(await apiAgent.post(route + "/ready"));
+  assert.equal(confirmed.providerStateId, abexIds.ready);
+  assert.equal(confirmed.status, "READY_TO_SHIP");
+  assert.equal(confirmed.pendingReadinessStateId, undefined);
+  assert.equal(
+    (await Order.findById(created._id)).tracking.stage,
+    "READY_TO_SHIP",
+  );
+  assert.equal(f.requests.filter((req) => req.method === "PATCH").length, 1);
+});
+
+test("ABEX cutover preserves agency ID, historical parcels, credentials and prices across repeat runs", async (t) => {
+  const legacy = await DeliveryAgency.findOne({ code: "ABEX" }).lean();
+  const { apiProvider, capabilities, config: originalConfig } = legacy;
+  t.after(() =>
+    DeliveryAgency.updateOne(
+      { _id: legacy._id },
+      {
+        $set: {
+          apiProvider,
+          capabilities,
+          config: originalConfig,
+          credentialsConfigured: false,
+        },
+        $unset: {
+          encryptedLegacyCredentials: 1,
+          legacyTracking: 1,
+          legacyBaseUrl: 1,
+          encryptedCredentials: 1,
+        },
+      },
+    ),
+  );
+  const created = expectOk(await apiAgent.post("/api/orders").send(input()));
+  const existing = await Shipment.findOneAndUpdate(
+    { orderId: created._id },
+    {
+      tracking: "LEGACY-CUTOVER",
+      trackingKey: "LEGACY-CUTOVER",
+      provider: "PROCOLIS",
+    },
+    { new: true },
+  );
+  const rates = await DeliveryRate.find({ agencyId: legacy._id }).lean();
+  const previousKey = process.env.DELIVERY_CREDENTIALS_ENCRYPTION_KEY;
+  process.env.DELIVERY_CREDENTIALS_ENCRYPTION_KEY = "e9".repeat(32);
+  t.after(() => {
+    if (previousKey === undefined)
+      delete process.env.DELIVERY_CREDENTIALS_ENCRYPTION_KEY;
+    else process.env.DELIVERY_CREDENTIALS_ENCRYPTION_KEY = previousKey;
+  });
+  const encrypted = encryptCredentials({
+    token: "historic-token",
+    key: "historic-key",
+  });
+  await DeliveryAgency.updateOne(
+    { _id: legacy._id },
+    {
+      encryptedCredentials: encrypted,
+      credentialsConfigured: true,
+    },
+  );
+  assert.equal(await cutoverAbexAgency(), true);
+  assert.equal(await cutoverAbexAgency(), false);
+  await migrate();
+
+  const agency = await DeliveryAgency.findOne({ code: "ABEX" }).select(
+    "+encryptedCredentials +encryptedLegacyCredentials",
+  );
+  assert.equal(String(agency._id), String(legacy._id));
+  assert.equal(agency.apiProvider, "ABEX");
+  assert.equal(agency.credentialsConfigured, false);
+  assert.equal(agency.encryptedLegacyCredentials, encrypted);
+  assert.equal(agency.encryptedCredentials, undefined);
+  assert.equal(await DeliveryAgency.countDocuments({ code: "ABEX" }), 1);
+  assert.deepEqual(
+    await DeliveryRate.find({ agencyId: legacy._id }).lean(),
+    rates,
+  );
+  const historical = await Shipment.findById(existing._id);
+  assert.equal(historical.provider, "PROCOLIS");
+  assert.equal(historical.tracking, "LEGACY-CUTOVER");
+  assert.equal(String(historical.agencyId), String(agency._id));
+  assert.equal(
+    String((await Order.findById(created._id)).delivery.agencyId),
+    String(agency._id),
+  );
+  assert.ok(
+    (await providerFor(agency._id, "tracking", historical)) instanceof
+      DeliveryClient,
+  );
+  await assert.rejects(providerFor(agency._id, "readyToShip", historical), {
+    code: "LEGACY_SHIPMENT",
+  });
+  const publicAgency = expectOk(
+    await apiAgent.get(`/api/delivery-agencies/${agency._id}`),
+  );
+  assert.equal("encryptedLegacyCredentials" in publicAgency, false);
 });
