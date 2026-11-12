@@ -51,16 +51,25 @@ export function Empty({
     </div>
   );
 }
-export function Field({ label, children, hint }) {
+export function Field({ label, children, hint, error }) {
   const id = useId();
+  const description = [hint && id + "-hint", error && id + "-error"]
+    .filter(Boolean)
+    .join(" ");
   return (
     <label className="field">
       <span id={id}>{label}</span>
       {cloneElement(children, {
         "aria-labelledby": id,
-        ...(hint ? { "aria-describedby": id + "-hint" } : {}),
+        ...(description ? { "aria-describedby": description } : {}),
+        ...(error ? { "aria-invalid": true } : {}),
       })}
       {hint && <small id={id + "-hint"}>{hint}</small>}
+      {error && (
+        <small className="field-error" id={id + "-error"}>
+          {error}
+        </small>
+      )}
     </label>
   );
 }

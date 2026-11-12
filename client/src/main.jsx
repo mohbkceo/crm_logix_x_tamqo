@@ -6,6 +6,7 @@ import {
   Route,
   NavLink,
   Link,
+  matchPath,
   useLocation,
   Navigate,
 } from "react-router-dom";
@@ -150,6 +151,9 @@ function Workspace({ user, logout }) {
   const configuration = useApi("/config"),
     [collapsed, setCollapsed] = useState(() => window.innerWidth <= 760),
     location = useLocation();
+  const onOrderForm =
+    matchPath("/orders/new", location.pathname) ||
+    matchPath("/orders/:id/edit", location.pathname);
   const [mobile, setMobile] = useState(() => window.innerWidth <= 760);
   const sidebarRef = useRef(null);
   const toggleRef = useRef(null);
@@ -423,12 +427,14 @@ function Workspace({ user, logout }) {
                   <Radio size={13} />
                   Connected workspace
                 </span>
-                <Can permission={P.orders.create}>
-                  <Link className="primary small" to="/orders/new">
-                    <Plus size={15} />
-                    Create order
-                  </Link>
-                </Can>
+                {!onOrderForm && (
+                  <Can permission={P.orders.create}>
+                    <Link className="primary small" to="/orders/new">
+                      <Plus size={15} />
+                      Create order
+                    </Link>
+                  </Can>
+                )}
               </div>
             </header>
             <main id="workspace-content" tabIndex={-1}>

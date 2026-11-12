@@ -33,29 +33,48 @@ export function params(values) {
     ),
   ).toString();
 }
-export function useApi(path) {
+export function useApi(path, { keepPreviousData = true } = {}) {
   const [state, setState] = useState({ data: null, loading: true, error: "" });
   const [version, setVersion] = useState(0);
   const reload = useCallback(() => setVersion((v) => v + 1), []);
   useEffect(() => {
     if (!path) {
-      setState({ data: null, loading: false, error: '' });
+      setState({ data: null, loading: false, error: "" });
       return;
     }
     const controller = new AbortController();
-    setState((s) => ({ ...s, loading: true, error: "" }));
+    setState((s) => ({
+      ...s,
+      path,
+      version,
+      loading: true,
+      error: "",
+      data: keepPreviousData ? s.data : null,
+    }));
     api(path, { signal: controller.signal })
       .then((data) => {
         if (!controller.signal.aborted)
-          setState({ data, loading: false, error: "" });
+          setState({ path, version, data, loading: false, error: "" });
       })
       .catch((error) => {
         if (!controller.signal.aborted)
-          setState({ data: null, loading: false, error: error.message });
+          setState({
+            path,
+            version,
+            data: null,
+            loading: false,
+            error: error.message,
+          });
       });
     return () => controller.abort();
-  }, [path, version]);
-  return { ...state, reload };
+  }, [path, version, keepPreviousData]);
+  if (
+    !keepPreviousData &&
+    (!path || state.path !== path || state.version !== version)
+  )
+    return { data: null, loading: Boolean(path), error: "", reload };
+  const { data, loading, error } = state;
+  return { data, loading, error, reload };
 }
 export const ConfigContext = createContext(null);
 export const useConfig = () => useContext(ConfigContext);

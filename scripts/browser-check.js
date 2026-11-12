@@ -187,27 +187,29 @@ try {
   });
   await goto("/orders/new");
   await page.getByLabel("Customer name *").fill("Browser QA Customer");
-  await page.getByLabel("Phone A *").fill("0550 12 34 56");
-  await page.getByLabel("Wilaya *").selectOption({ label: "Alger" });
-  await page.getByLabel("Commune *").fill("Alger Centre");
-  await page.getByLabel("Address *").fill("12 Test Avenue");
-  await page.locator(".business-selection input").nth(0).check();
+  await page.getByLabel("Primary phone *").fill("0550 12 34 56");
+  await page.getByRole("checkbox", { name: "Tamqo", exact: true }).check();
   await page
-    .getByLabel("Plan", { exact: true })
+    .getByLabel("Plan *", { exact: true })
     .selectOption({ label: "3 Months" });
-  await page.locator(".business-selection input").nth(1).check();
-  await page.getByLabel("Delivery agency").selectOption({ label: "ABEX" });
-  await page.getByLabel("Quantity", { exact: true }).nth(1).fill("2");
+  await page.getByRole("checkbox", { name: "Logix", exact: true }).check();
+  await page.getByLabel("Quantity *", { exact: true }).nth(1).fill("2");
+  await page.getByLabel("Delivery agency *").selectOption({ label: "ABEX" });
+  await page.getByLabel("Wilaya *").selectOption({ label: "Alger" });
+  await page
+    .getByRole("textbox", { name: "Commune *", exact: true })
+    .fill("Alger Centre");
+  await page.getByLabel("Address *").fill("12 Test Avenue");
   await page
     .getByLabel("Payment method", { exact: true })
     .selectOption("MIXED");
   await page.getByLabel("Amount paid online (DA)").fill("11000");
   assert.equal(
-    await page.locator(".order-summary .summary-total b").innerText(),
+    await page.locator(".order-breakdown-total dd").innerText(),
     "11,500 DA",
   );
   assert.equal(
-    await page.locator(".order-summary .collection b").innerText(),
+    await page.locator(".order-payment-totals dd").last().innerText(),
     "500 DA",
   );
   await page.screenshot({

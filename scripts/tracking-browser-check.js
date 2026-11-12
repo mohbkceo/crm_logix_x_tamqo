@@ -161,14 +161,15 @@ try {
   await page.getByRole("link", { name: "Tracking", exact: true }).waitFor();
   await goto("/orders/new");
   await page.getByLabel("Customer name *").fill("Browser Tracking Customer");
-  await page.getByLabel("Phone A *").fill("0550123456");
+  await page.getByLabel("Primary phone *").fill("0550123456");
+  await page.getByRole("checkbox", { name: "Logix", exact: true }).check();
+  await page
+    .getByLabel("Delivery agency *", { exact: true })
+    .selectOption({ label: "Local delivery" });
   await page.getByLabel("Wilaya *").selectOption({ label: "Alger" });
   await page.getByLabel("Commune *").fill("Alger Centre");
   await page.getByLabel("Address *").fill("12 Test Avenue");
-  await page.locator(".business-selection input").check();
-  await page
-    .getByLabel("Delivery agency", { exact: true })
-    .selectOption({ label: "Local delivery" });
+  await page.getByText("Specifications (optional)", { exact: true }).click();
   await page
     .getByLabel("Specifications", { exact: true })
     .fill("Blue 20cm, engraved name");
@@ -177,7 +178,8 @@ try {
   })
     .png()
     .toBuffer();
-  await page.getByLabel("Order images (optional)").setInputFiles({
+  await page.getByText("Reference images (optional)", { exact: true }).click();
+  await page.getByLabel("Order images", { exact: true }).setInputFiles({
     name: "design.png",
     mimeType: "image/png",
     buffer: image,

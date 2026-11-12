@@ -188,28 +188,51 @@ try {
     .fill(process.env.BOOTSTRAP_SUPER_ADMIN_PASSWORD);
   await page.getByRole("button", { name: "Sign in", exact: true }).click();
   await page.getByText("Connected workspace").waitFor();
+  const communeRoute = "**/api/delivery-agencies/*/communes?*";
+  await page.route(communeRoute, (route) =>
+    route.fulfill({
+      status: 503,
+      json: { error: { message: "Unavailable in QA" } },
+    }),
+  );
+  await page.goto(process.env.CLIENT_URL + "/orders/new");
+  await page.getByRole("checkbox", { name: "Logix", exact: true }).check();
+  await page
+    .getByLabel("Delivery agency *", { exact: true })
+    .selectOption({ label: "ABEX" });
+  await page.getByLabel("Wilaya *").selectOption({ label: "Alger" });
+  await expect(page.getByText(/ABEX commune lookup is unavailable/)).toBeVisible();
+  await page
+    .getByRole("textbox", { name: "Commune *", exact: true })
+    .fill("Alger Centre");
+  await page.unroute(communeRoute);
+  await page.getByRole("button", { name: "Retry", exact: true }).click();
+  await expect(
+    page.getByRole("combobox", { name: "Commune *", exact: true }),
+  ).toHaveValue("Alger Centre");
+
   for (const outcome of ["success", "pending", "error", "manual"]) {
     mode = outcome;
     await page.goto(process.env.CLIENT_URL + "/orders/new");
     await page.getByLabel("Customer name *").fill(`Delivery ${outcome}`);
-    await page.getByLabel("Phone A *").fill("0550123456");
-    await page.getByLabel("Wilaya *").selectOption({ label: "Alger" });
-    await page.getByLabel("Commune *").fill("Alger Centre");
-    await page.getByLabel("Address *").fill("12 Test Street");
-    await page.locator(".business-selection input").last().check();
+    await page.getByLabel("Primary phone *").fill("0550123456");
+    await page.getByRole("checkbox", { name: "Logix", exact: true }).check();
     await page
-      .getByLabel("Delivery agency", { exact: true })
+      .getByLabel("Delivery agency *", { exact: true })
       .selectOption({ label: outcome === "manual" ? "Manual QA" : "ABEX" });
+    await page.getByLabel("Wilaya *").selectOption({ label: "Alger" });
+    await page.getByLabel("Address *").fill("12 Test Street");
     if (outcome === "manual") {
       // Agency without rates needs the existing delivery override field.
-      await page.getByLabel("Delivery cost (DA)", { exact: true }).fill("500");
+      await page.getByLabel("Commune *").fill("Alger Centre");
+      await page.getByLabel("Delivery cost (DA) *", { exact: true }).fill("500");
       await expect(
         page.getByText("Save this order, then handle its shipment manually."),
       ).toBeVisible();
     } else {
-      await expect(
-        page.getByRole("combobox", { name: "Commune *", exact: true }),
-      ).toHaveValue("Alger Centre");
+      await page
+        .getByRole("combobox", { name: "Commune *", exact: true })
+        .selectOption("Alger Centre");
       await expect(
         page.getByText(
           /Saving this order automatically creates a courier parcel/,
@@ -237,6 +260,36 @@ try {
       const order = await Order.findOne({
         "customer.name": "Delivery success",
       });
+      await page.goto(process.env.CLIENT_URL + `/orders/${order._id}/edit`);
+      await expect(page.getByLabel("Commune *", { exact: true })).toHaveValue(
+        "Alger Centre",
+      );
+      await page.getByLabel("Address *").fill("14 Test Street");
+      await page.getByRole("button", { name: "Save changes", exact: true }).click();
+      const confirmation = page.getByRole("dialog", {
+        name: "Synchronize courier parcel?",
+      });
+      const confirmSave = confirmation.getByRole("button", { name: "Save changes" });
+      await expect(confirmSave).toBeDisabled();
+      await confirmation.getByRole("button", { name: "Keep editing" }).click();
+      await expect(page.getByLabel("Address *")).toHaveValue("14 Test Street");
+      await page.getByRole("button", { name: "Save changes", exact: true }).click();
+      await confirmation
+        .getByRole("checkbox", {
+          name: "I updated the courier parcel to match this order.",
+        })
+        .check();
+      const editResponse = page.waitForResponse(
+        (r) => r.request().method() === "PATCH" &&
+          r.url().endsWith("/api/orders/" + order._id),
+      );
+      await confirmSave.click();
+      assert.equal((await editResponse).status(), 200);
+      await page.waitForURL(`**/orders/${order._id}`);
+      assert.equal(
+        (await Order.findById(order._id)).location.address,
+        "14 Test Street",
+      );
       await Order.updateOne(
         { _id: order._id },
         { "tracking.stage": "AT_PRODUCTION" },
@@ -297,7 +350,7 @@ try {
   assert.equal(await Shipment.countDocuments(), 4);
   assert.deepEqual(errors, []);
   console.log(
-    "Delivery browser checks passed: ABEX creation, confirmed readiness, pending and rejected parcels, and manual delivery.",
+    "Delivery browser checks passed: ABEX commune retry, creation, edit confirmation, readiness, pending and rejected parcels, and manual delivery.",
   );
 } finally {
   axios.create = createClient;
