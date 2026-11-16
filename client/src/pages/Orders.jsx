@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import {
   Link,
   useNavigate,
@@ -45,6 +45,7 @@ import {
   Badge,
   PeriodFilter,
   Modal,
+  ShippingError,
 } from "../components";
 import { P, Can, useUser, can } from "../access";
 import { MediaGallery } from "../MediaGallery";
@@ -365,6 +366,18 @@ export function Orders() {
     </>
   );
 }
+// One plain label for where a shipment stands.
+function shipmentState(s) {
+  if (s.tracking)
+    return s.syncStatus === "SYNCED"
+      ? "Created"
+      : "Created, tracking update needs attention";
+  if (s.provider === "MANUAL") return "Manual shipment";
+  if (s.uncertain || s.providerAccepted || s.creationAttemptedAt)
+    return "Requires reconciliation";
+  if (s.syncStatus === "ERROR") return "Failed, nothing was sent to the courier";
+  return "Pending";
+}
 export function OrderDetails() {
   const user = useUser();
   const location = useLocation();
@@ -373,6 +386,7 @@ export function OrderDetails() {
     order = useApi("/orders/" + id),
     timeline = useApi(`/orders/${id}/timeline`),
     [error, setError] = useState(""),
+    [errorInfo, setErrorInfo] = useState(null),
     [busy, setBusy] = useState(false),
     [message, setMessage] = useState(""),
     [dialog, setDialog] = useState(""),
@@ -384,9 +398,15 @@ export function OrderDetails() {
     [refundAmount, setRefundAmount] = useState(""),
     [refundNote, setRefundNote] = useState(""),
     [refundAllocation, setRefundAllocation] = useState("WHOLE");
+  // Set synchronously, so a second tap cannot start another request before
+  // the buttons are re-rendered as disabled.
+  const acting = useRef(false);
   async function action(path, body = {}) {
+    if (acting.current) return;
+    acting.current = true;
     setBusy(true);
     setError("");
+    setErrorInfo(null);
     setMessage("");
     try {
       await api(`/orders/${id}/${path}`, { method: "POST", body });
@@ -394,7 +414,9 @@ export function OrderDetails() {
       setDialog("");
     } catch (e) {
       setError(e.message);
+      setErrorInfo(e.info);
     } finally {
+      acting.current = false;
       setBusy(false);
       order.reload();
       timeline.reload();
@@ -475,9 +497,17 @@ export function OrderDetails() {
         <Badge>{o.deletedAt ? "Deleted" : o.status}</Badge>
         {canEdit && <Link to={`/orders/${id}/edit`}>Edit order</Link>}
       </PageHeader>
-      <ErrorBox error={error || order.error} />
+      {errorInfo?.action ? (
+        <ShippingError info={errorInfo} />
+      ) : (
+        <ErrorBox error={error || order.error} />
+      )}
       {!s && location.state?.shipmentSync?.error && (
-        <ErrorBox error={`Order saved. ${location.state.shipmentSync.error}`} />
+        <ShippingError
+          prefix="Order saved. "
+          info={location.state.shipmentSync.errorInfo}
+          fallback={location.state.shipmentSync.error}
+        />
       )}
       <ErrorBox error={location.state?.imageWarning} />
       {(o.images?.length > 0 || canEdit) && (
@@ -689,9 +719,18 @@ export function OrderDetails() {
                 <p>{o.location.address}</p>
                 <hr />
                 <p>
-                  {human(o.delivery.type)} ·{" "}
-                  {o.delivery.exchange ? "Exchange" : "Normal parcel"}
+                  {o.delivery.type === "HOME"
+                    ? "Home delivery"
+                    : "Stop desk (pickup office)"}{" "}
+                  · {o.delivery.exchange ? "Exchange" : "Normal parcel"}
                 </p>
+                {o.delivery.type === "STOP_DESK" &&
+                  (o.delivery.pickupHubName || s?.pickupHubName) && (
+                    <p>
+                      Pickup office:{" "}
+                      <b>{o.delivery.pickupHubName || s.pickupHubName}</b>
+                    </p>
+                  )}
                 {o.note && <p className="note">{o.note}</p>}
               </div>
             </Panel>
@@ -711,6 +750,10 @@ export function OrderDetails() {
                     </div>
                     <Badge>{s.syncStatus}</Badge>
                   </div>
+                  <p className="muted">
+                    Shipment state:{" "}
+                    <b>{shipmentState(s)}</b>
+                  </p>
                   <p>
                     External reference: <b>{s.externalId}</b>
                   </p>
@@ -744,7 +787,14 @@ export function OrderDetails() {
                         })
                       : "Never"}
                   </p>
-                  <ErrorBox error={s.lastError} />
+                  <ShippingError
+                    info={
+                      s.lastErrorInfo?.message === s.lastError
+                        ? s.lastErrorInfo
+                        : null
+                    }
+                    fallback={s.lastError}
+                  />
                   {s.uncertain && (
                     <div className="note">
                       <AlertCircle size={17} />

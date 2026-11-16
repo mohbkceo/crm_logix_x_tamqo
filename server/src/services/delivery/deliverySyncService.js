@@ -21,7 +21,8 @@ import {
   reverseReturnExpense,
 } from "./deliveryFinancialService.js";
 import { COURIER_STAGES } from "../../../../shared/tracking.js";
-import { requireAbexIdentity } from "./abexMapper.js";
+import { ABEX_PAYLOAD_META, requireAbexIdentity } from "./abexMapper.js";
+import { shipmentErrorInfo } from "./abexErrors.js";
 const creationStatuses = ["NEW", "CONFIRMED", "PREPARING", "READY_TO_SHIP"];
 export class DeliverySyncService {
   constructor(client = deliveryClient, agencyId) {
@@ -183,14 +184,20 @@ export class DeliverySyncService {
         );
         s.provider = provider;
         if (attemptError) {
+          // Nothing was sent to the courier, so this attempt stays retryable.
           s.syncStatus = "ERROR";
           s.lastError = this.sanitize(attemptError.message);
+          s.lastErrorInfo = shipmentErrorInfo(attemptError, s.lastError);
         } else {
+          const prepared = payload?.[ABEX_PAYLOAD_META];
+          s.pickupHubId = prepared?.hubId;
+          s.pickupHubName = prepared?.hubName;
           s.creationAttemptedAt = new Date();
           s.uncertain = true;
           s.providerAccepted = false;
           s.syncStatus = "PENDING";
           s.lastError = "";
+          s.lastErrorInfo = undefined;
           s.lockUntil = new Date(
             Date.now() +
               Math.max(
@@ -372,6 +379,9 @@ export class DeliverySyncService {
           $set: {
             syncStatus: accepted ? "PENDING" : "ERROR",
             lastError,
+            lastErrorInfo: accepted
+              ? null
+              : shipmentErrorInfo(error, lastError) || null,
             lockUntil: null,
             ...(error.providerData
               ? { sanitizedProviderData: this.sanitize(error.providerData) }
@@ -390,7 +400,13 @@ export class DeliverySyncService {
         accepted ? "SHIPMENT_TRACKING_UNVERIFIED" : "SHIPMENT_CREATION_FAILED",
         lastError,
         options.actor,
-        { httpStatus: error.providerData?.status },
+        {
+          httpStatus: error.providerData?.status,
+          ...(error instanceof AppError ? { errorCode: error.code } : {}),
+          ...(error.providerData?.traceId
+            ? { providerTraceId: error.providerData.traceId }
+            : {}),
+        },
       );
       if (accepted) return failed;
       if (abex && error instanceof AppError) throw error;

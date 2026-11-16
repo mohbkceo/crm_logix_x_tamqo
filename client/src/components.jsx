@@ -27,6 +27,48 @@ export function ErrorBox({ error }) {
     </div>
   ) : null;
 }
+// Next step shown for each structured shipping error action.
+const shippingActions = {
+  CHOOSE_PICKUP_HUB: "Edit the order and choose a pickup office.",
+  CHANGE_DELIVERY_TYPE:
+    "Edit the order: choose another commune or office, or switch the delivery type.",
+  UPDATE_HUB_MAPPING:
+    "Choose an office on the order, or ask an administrator to update the ABEX mappings in Delivery agencies.",
+  EDIT_ADDRESS: "Edit the order and correct the wilaya or commune.",
+  EDIT_ORDER: "Edit the order and correct the information mentioned above.",
+  CHECK_CREDENTIALS:
+    "An administrator must check the ABEX credentials in Delivery agencies.",
+  CONTACT_ADMIN: "Contact your administrator.",
+  VERIFY_SHIPMENT:
+    "Do not create the parcel again yet. Use Refresh tracking to check whether it already exists.",
+  RETRY_LATER: "Nothing was created. You can try again in a moment.",
+  USE_COURIER_PORTAL: "Handle this parcel in the ABEX portal.",
+};
+// A shipping problem with its Arabic text, next step and support reference.
+// `info` is the structured error; `fallback` is used for plain messages.
+export function ShippingError({ info, fallback, prefix = "" }) {
+  const message = info?.message || fallback;
+  if (!message) return null;
+  const step = shippingActions[info?.action];
+  return (
+    <div className="error shipping-error" role="alert">
+      <AlertCircle size={17} />
+      <div>
+        <span>
+          {prefix}
+          {message}
+        </span>
+        {info?.messageAr && (
+          <span dir="rtl" lang="ar">
+            {info.messageAr}
+          </span>
+        )}
+        {step && <small>{step}</small>}
+        {info?.requestId && <small>Reference: {info.requestId}</small>}
+      </div>
+    </div>
+  );
+}
 export function Loading() {
   return (
     <div className="loading" role="status">

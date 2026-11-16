@@ -6,6 +6,7 @@ import { rateLimit } from "express-rate-limit";
 import mongoose from "mongoose";
 import path from "node:path";
 import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { z, ZodError } from "zod";
 import { config } from "./config.js";
 import { assert, AppError } from "./errors.js";
@@ -33,8 +34,18 @@ import { audit } from "./models/security.js";
 import { transaction } from "./services/orderService.js";
 import { deliveryStatusMapping } from "./services/delivery/deliveryStatusMapper.js";
 import { abexWritesEnabled } from "./services/delivery/abexMapper.js";
+import {
+  publicErrorDetails,
+  withAbexDetails,
+} from "./services/delivery/abexErrors.js";
 export const app = express();
 app.disable("x-powered-by");
+// Correlation ID for support: returned as a header and in every error body.
+app.use((req, res, next) => {
+  req.id = randomUUID();
+  res.setHeader("X-Request-Id", req.id);
+  next();
+});
 app.use(
   helmet({ contentSecurityPolicy: config.production ? undefined : false }),
 );
@@ -278,7 +289,7 @@ if (existsSync(dist)) {
     res.sendFile(path.join(dist, "index.html")),
   );
 }
-app.use((err, _req, res, _next) => {
+app.use((err, req, res, _next) => {
   let status = err.status || 500,
     message = err.message,
     code = err.code || "INTERNAL_ERROR";
@@ -306,5 +317,16 @@ app.use((err, _req, res, _next) => {
         ? "Malformed request."
         : "The request could not be completed.";
   }
-  res.status(status).json({ error: { message, code } });
+  // message and code keep their existing meaning. Known shipping errors also
+  // carry the related field, the next step, retry guidance and Arabic text.
+  res.status(status).json({
+    error: {
+      message,
+      code,
+      ...(err instanceof AppError
+        ? publicErrorDetails(withAbexDetails(err))
+        : {}),
+      requestId: req.id,
+    },
+  });
 });

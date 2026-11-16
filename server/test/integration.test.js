@@ -46,6 +46,7 @@ import { encryptCredentials } from "../src/services/delivery/credentials.js";
 import { providerFor } from "../src/services/delivery/deliveryProviderFactory.js";
 import { deliveryService } from "../src/services/delivery/deliveryService.js";
 import { DeliveryClient } from "../src/services/delivery/deliveryClient.js";
+import { clearAbexCatalogCache } from "../src/services/delivery/abexClient.js";
 let replica, plan, product, plaque15, stand, source, wilaya, apiAgent;
 const request = () => apiAgent;
 before(
@@ -3461,6 +3462,21 @@ const abexPage = (items, criteria) => ({
     hasNext: false,
   },
 });
+const abexHub = (id, name, extra = {}) => ({
+  id,
+  name,
+  type: "agency",
+  isPickupPoint: true,
+  isVisible: true,
+  isReturnCenter: false,
+  address: {
+    cityTerritoryId: abexIds.city,
+    districtTerritoryId: abexIds.district,
+    city: "Alger",
+    district: "Alger Centre",
+  },
+  ...extra,
+});
 const abexHttpError = (status) =>
   Object.assign(new Error(abexCredentials.apiKey), {
     response: { status, data: { detail: abexCredentials.apiKey } },
@@ -3543,11 +3559,16 @@ async function abexFixture(
       payment: { method: "MIXED", amountPaidOnline: 1000 },
     }),
     requests: [],
+    // Hub catalog reads are recorded apart from `requests`, whose exact
+    // sequence the parcel tests assert on.
+    hubRequests: [],
+    hubs: [abexHub(abexIds.hub, "Agence Alger Centre")],
     stateId: abexIds.preparing,
     time: abexTime(1),
     tracking: abexTracking,
     parcelId: abexIds.parcel,
   };
+  clearAbexCatalogCache();
   const parcel = () => ({
     id: fixture.parcelId,
     trackingNumber: fixture.tracking,
@@ -3567,6 +3588,14 @@ async function abexFixture(
     return {
       defaults: config,
       request: async (req) => {
+        if (req.url === "/api/v1/hubs/search") {
+          assert.equal(req.method, "POST");
+          assert.equal(req.headers["X-Api-Key"], abexCredentials.apiKey);
+          assert.equal(req.headers["X-Tenant"], abexCredentials.tenantId);
+          fixture.hubRequests.push(req);
+          if (fixture.onHubs) await fixture.onHubs(req);
+          return abexPage(fixture.hubs, req.data);
+        }
         fixture.requests.push(req);
         assert.equal(req.headers["X-Api-Key"], abexCredentials.apiKey);
         assert.equal(req.headers["X-Tenant"], abexCredentials.tenantId);
@@ -4329,6 +4358,275 @@ test("ABEX readiness commits only after readback confirms the same parcel and ta
     "READY_TO_SHIP",
   );
   assert.equal(f.requests.filter((req) => req.method === "PATCH").length, 1);
+});
+
+test("ABEX home delivery is never blocked by pickup-hub validation", async (t) => {
+  const f = await abexFixture(t, { useConfiguredTerritory: false });
+  // No pickup office exists anywhere and the hub catalog is failing.
+  f.hubs = [];
+  f.onHubs = () => {
+    throw abexHttpError(500);
+  };
+  f.onCreate = ({ data }) => {
+    assert.equal(data.deliveryType, "home");
+    assert.equal("hubId" in data, false);
+  };
+  const created = expectOk(
+    await apiAgent.post("/api/orders").send({
+      ...f.input,
+      delivery: { ...f.input.delivery, type: "HOME", pickupHubId: abexIds.hub },
+    }),
+  );
+  assert.equal(created.shipment.tracking, abexTracking);
+  assert.equal(created.shipmentSync.success, true);
+  assert.equal(f.hubRequests.length, 0);
+  // A pickup office is meaningless on a home order and is not stored.
+  assert.equal(created.delivery.pickupHubId, undefined);
+  // Repeating the request returns the linked parcel without another create.
+  const again = expectOk(
+    await apiAgent.post(`/api/orders/${created._id}/shipment`),
+  );
+  assert.equal(again.tracking, abexTracking);
+  assert.equal(
+    f.requests.filter((req) => req.url === "/api/v1/parcels").length,
+    1,
+  );
+});
+
+test("ABEX stop-desk orders resolve a verified pickup hub or explain what to do", async (t) => {
+  const f = await abexFixture(t, { useConfiguredTerritory: false });
+  const base = `/api/delivery-agencies/${f.agency._id}`;
+  const hubQuery = { wilayaId: String(wilaya._id), commune: "Alger Centre" };
+  const second = "10f10000-0000-4000-8000-000000000021";
+
+  // 1. No compatible office: the order is saved, nothing is sent to ABEX.
+  f.hubs = [abexHub(abexIds.unknown, "Centre de tri", { isPickupPoint: false })];
+  const blocked = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  assert.equal(blocked.shipmentSync.success, false);
+  assert.equal(blocked.shipmentSync.errorInfo.code, "ABEX_HUB_REQUIRED");
+  assert.equal(blocked.shipment.syncStatus, "ERROR");
+  assert.equal(blocked.shipment.creationAttemptedAt, undefined);
+  assert.equal(blocked.shipment.lastErrorInfo.field, "pickupHubId");
+  assert.equal(blocked.shipment.lastErrorInfo.message, blocked.shipment.lastError);
+  const refused = await apiAgent.post(`/api/orders/${blocked._id}/shipment`);
+  assert.equal(refused.status, 409);
+  assert.equal(refused.body.error.code, "ABEX_HUB_REQUIRED");
+  assert.equal(refused.body.error.field, "pickupHubId");
+  assert.equal(refused.body.error.retryable, false);
+  assert.equal(refused.body.error.alternative, "HOME");
+  assert.match(refused.body.error.messageAr, /ABEX/);
+  assert.equal(refused.body.error.requestId, refused.headers["x-request-id"]);
+  assert.equal(
+    expectOk(await apiAgent.get(base + "/pickup-hubs").query(hubQuery)).resolution,
+    "NONE",
+  );
+  assert.equal(
+    f.requests.some((req) => req.url === "/api/v1/parcels"),
+    false,
+  );
+
+  // 2. Two offices in the commune: the user must choose.
+  clearAbexCatalogCache();
+  f.hubs = [abexHub(abexIds.hub, "Agence A"), abexHub(second, "Agence B")];
+  const choice = await apiAgent.post(`/api/orders/${blocked._id}/shipment`);
+  assert.equal(choice.status, 409);
+  assert.equal(choice.body.error.code, "ABEX_HUB_SELECTION_REQUIRED");
+  assert.equal(choice.body.error.action, "CHOOSE_PICKUP_HUB");
+  const options = expectOk(
+    await apiAgent.get(base + "/pickup-hubs").query(hubQuery),
+  );
+  assert.equal(options.resolution, "CHOICE_REQUIRED");
+  assert.deepEqual(
+    options.hubs.map(({ id, name, inCommune }) => [id, name, inCommune]),
+    [
+      [abexIds.hub, "Agence A", true],
+      [second, "Agence B", true],
+    ],
+  );
+  assert.equal(
+    (await Shipment.findOne({ orderId: blocked._id })).creationAttemptedAt,
+    undefined,
+  );
+
+  // 3. A chosen office is sent with its ABEX UUID and remembered.
+  f.onCreate = ({ data }) => {
+    assert.equal(data.deliveryType, "pickup-point");
+    assert.equal(data.hubId, second);
+  };
+  const chosen = expectOk(
+    await apiAgent.post("/api/orders").send({
+      ...f.input,
+      delivery: {
+        ...f.input.delivery,
+        pickupHubId: second.toUpperCase(),
+        pickupHubName: "Agence B",
+      },
+    }),
+  );
+  assert.equal(chosen.shipment.tracking, abexTracking);
+  assert.equal(chosen.delivery.pickupHubId, second);
+  assert.equal(chosen.shipment.pickupHubId, second);
+  assert.equal(chosen.shipment.pickupHubName, "Agence B");
+  assert.equal(chosen.shipment.lastErrorInfo, undefined);
+
+  // 4. An office that is not eligible is refused before any parcel request.
+  const before = f.requests.filter((req) => req.url === "/api/v1/parcels").length;
+  const invalid = expectOk(
+    await apiAgent.post("/api/orders").send({
+      ...f.input,
+      delivery: { ...f.input.delivery, pickupHubId: abexIds.unknown },
+    }),
+  );
+  assert.equal(invalid.shipmentSync.errorInfo.code, "ABEX_HUB_INVALID");
+  assert.equal(
+    f.requests.filter((req) => req.url === "/api/v1/parcels").length,
+    before,
+  );
+  assert.equal(
+    (
+      await apiAgent.post("/api/orders").send({
+        ...f.input,
+        delivery: { ...f.input.delivery, pickupHubId: "16" },
+      })
+    ).status,
+    400,
+  );
+});
+
+test("ABEX mappings are verified against the live catalog when saved and when listed", async (t) => {
+  const f = await abexFixture(t, { useConfiguredTerritory: false });
+  const base = `/api/delivery-agencies/${f.agency._id}/abex-mappings`;
+  const wilayaId = String(wilaya._id);
+  const saved = expectOk(
+    await apiAgent
+      .put(base)
+      .send({ wilayaId, commune: "Alger Centre", hubId: abexIds.hub }),
+  );
+  assert.deepEqual(saved, {
+    wilayaId,
+    commune: "Alger Centre",
+    cityTerritoryId: abexIds.city,
+    districtTerritoryId: abexIds.district,
+    hubId: abexIds.hub,
+  });
+  const stored = await DeliveryAgency.findById(f.agency._id).lean();
+  assert.deepEqual(stored.config.abex.destinations, [saved]);
+  // The other ABEX settings are untouched.
+  assert.equal(stored.config.abex.states.length, 4);
+  assert.equal(stored.config.abex.products[String(product._id)], abexIds.product);
+
+  const listed = expectOk(await apiAgent.get(base));
+  assert.equal(listed.verified, true);
+  assert.equal(listed.destinations[0].status, "OK");
+  assert.equal(listed.destinations[0].hubName, "Agence Alger Centre");
+
+  // The mapped office is used for a stop-desk parcel.
+  f.onCreate = ({ data }) => assert.equal(data.hubId, abexIds.hub);
+  const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  assert.equal(created.shipment.tracking, abexTracking);
+
+  for (const [body, field] of [
+    [{ wilayaId, commune: "Foreign commune" }, "commune"],
+    [{ wilayaId, commune: "Alger Centre", hubId: abexIds.unknown }, "hubId"],
+  ]) {
+    const refused = await apiAgent.put(base).send(body);
+    assert.equal(refused.status, 422);
+    assert.equal(refused.body.error.code, "ABEX_MAPPING_INVALID");
+    assert.equal(refused.body.error.field, field);
+  }
+  assert.equal(
+    (
+      await apiAgent
+        .put(base)
+        .send({ wilayaId, commune: "Alger Centre", cityTerritoryId: abexIds.unknown })
+    ).status,
+    400,
+  );
+
+  // The office closes at ABEX: the mapping is flagged and the next parcel is
+  // refused with guidance instead of being sent with a dead hub.
+  clearAbexCatalogCache();
+  f.hubs = [];
+  const stale = expectOk(await apiAgent.get(base));
+  assert.equal(stale.destinations[0].status, "STALE");
+  assert.deepEqual(stale.destinations[0].issues, ["HUB_UNAVAILABLE"]);
+  const parcels = f.requests.filter((req) => req.url === "/api/v1/parcels").length;
+  const refused = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  assert.equal(refused.shipmentSync.errorInfo.code, "ABEX_HUB_MAPPING_STALE");
+  assert.equal(
+    f.requests.filter((req) => req.url === "/api/v1/parcels").length,
+    parcels,
+  );
+
+  // When ABEX cannot be reached the saved mappings remain readable.
+  f.rejectAuth = true;
+  clearAbexCatalogCache();
+  f.onHubs = () => {
+    throw abexHttpError(401);
+  };
+  const offline = expectOk(await apiAgent.get(base));
+  assert.equal(offline.verified, false);
+  assert.equal(offline.verificationError.code, "ABEX_AUTHENTICATION");
+  assert.equal(offline.destinations[0].status, "UNVERIFIED");
+  f.rejectAuth = false;
+  f.onHubs = undefined;
+
+  assert.equal(
+    (await apiAgent.delete(base).send({ wilayaId, commune: "alger centre" })).status,
+    204,
+  );
+  assert.equal(
+    (await apiAgent.delete(base).send({ wilayaId, commune: "Alger Centre" })).status,
+    404,
+  );
+  assert.deepEqual(
+    (await DeliveryAgency.findById(f.agency._id).lean()).config.abex.destinations,
+    [],
+  );
+});
+
+test("ABEX parcel accepted remotely but not saved locally is reconciled without a second create", async (t) => {
+  const f = await abexFixture(t);
+  const updateOne = Shipment.updateOne.bind(Shipment);
+  let outage = true;
+  t.mock.method(Shipment, "updateOne", (...args) => {
+    // Fail the write that records ABEX's acknowledgement, once.
+    if (outage && args[1]?.$set?.providerAccepted === true) {
+      outage = false;
+      throw new Error("simulated database outage");
+    }
+    return updateOne(...args);
+  });
+  const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  assert.equal(outage, false);
+  // The order exists, the attempt is durable, and nothing claims success.
+  assert.equal(created.status, "NEW");
+  assert.equal(created.shipmentSync.success, false);
+  const pending = await Shipment.findOne({ orderId: created._id });
+  assert.equal(pending.syncStatus, "PENDING");
+  assert.equal(pending.uncertain, true);
+  assert.ok(pending.creationAttemptedAt);
+  assert.equal(pending.tracking, undefined);
+  assert.match(pending.lastError, /local processing is incomplete/);
+  // A new create is refused while the outcome is unverified.
+  assert.equal(
+    f.requests.filter((req) => req.url === "/api/v1/parcels").length,
+    1,
+  );
+  // Verification finds the parcel by the stable order reference and links it.
+  const verified = expectOk(
+    await apiAgent.post(`/api/orders/${created._id}/shipment/refresh`),
+  );
+  assert.equal(verified.tracking, abexTracking);
+  assert.equal(verified.providerParcelId, abexIds.parcel);
+  assert.equal(verified.uncertain, false);
+  assert.equal(verified.syncStatus, "SYNCED");
+  assert.equal(
+    f.requests.filter((req) => req.url === "/api/v1/parcels").length,
+    1,
+  );
+  assert.equal((await Order.findById(created._id)).status, "NEW");
+  assert.equal(await Shipment.countDocuments({ orderId: created._id }), 1);
 });
 
 test("ABEX cutover preserves agency ID, historical parcels, credentials and prices across repeat runs", async (t) => {

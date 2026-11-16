@@ -159,6 +159,10 @@ export const Order = create(
       charged: Number,
       type: { type: String, enum: DELIVERY_TYPES, required: true },
       exchange: Boolean,
+      // ABEX pickup office chosen for a stop-desk order. Optional: when it is
+      // absent the integration resolves the office from the commune.
+      pickupHubId: String,
+      pickupHubName: String,
     },
     payment: {
       method: { type: String, enum: PAYMENT_METHODS, required: true },
@@ -273,6 +277,11 @@ export const Shipment = create("Shipment", {
   providerUpdatedAt: Date,
   lastObservation: Schema.Types.Mixed,
   lastError: String,
+  // Structured form of lastError: { code, message, field, action, ... }.
+  lastErrorInfo: Schema.Types.Mixed,
+  // ABEX pickup office the parcel was created for (pickup-point only).
+  pickupHubId: String,
+  pickupHubName: String,
   sanitizedProviderData: Schema.Types.Mixed,
   creationAttemptedAt: Date,
   providerAccepted: { type: Boolean, default: false },

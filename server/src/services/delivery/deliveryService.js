@@ -17,6 +17,7 @@ import {
   validTracking,
 } from "./deliveryMapper.js";
 import { TERMINAL } from "../../constants.js";
+import { shipmentErrorInfo } from "./abexErrors.js";
 const SYNC_LOCK_ID = "delivery-status-sync";
 const SYNC_BATCH_SIZE = 20;
 const lockDuration = () =>
@@ -160,6 +161,9 @@ export const deliveryService = {
           ? error.message
           : "Courier synchronization failed. Inspect the shipment before retrying.",
       );
+      // Stable code, field and next step for the order page.
+      const errorInfo = shipmentErrorInfo(error, shipmentSync.error);
+      if (errorInfo) shipmentSync.errorInfo = errorInfo;
       // Configuration/factory failures may happen before the sync service creates
       // its record. Never overwrite an existing attempt or unlock its reservation.
       try {
@@ -177,6 +181,7 @@ export const deliveryService = {
                     status: order.status,
                     syncStatus: "ERROR",
                     lastError: shipmentSync.error,
+                    ...(errorInfo ? { lastErrorInfo: errorInfo } : {}),
                   },
                 },
                 { upsert: true, new: true },

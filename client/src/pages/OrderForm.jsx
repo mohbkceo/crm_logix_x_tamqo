@@ -3,7 +3,13 @@ import { Link, useNavigate, useParams } from "react-router-dom";
 import { ArrowLeft, ChevronDown, Plus, Trash2 } from "lucide-react";
 import { hasBusinessAccess, useUser } from "../access";
 import { api, human, money, params, useApi, useConfig } from "../api";
-import { ErrorBox, Field, Loading, Modal } from "../components";
+import {
+  ErrorBox,
+  Field,
+  Loading,
+  Modal,
+  ShippingError,
+} from "../components";
 import { OptionalImagePreview } from "../MediaGallery";
 import { findAbexCommune } from "../../../shared/abexTerritories.js";
 
@@ -168,6 +174,7 @@ function OrderEditor({ original }) {
   const [imageError, setImageError] = useState("");
   const [itemError, setItemError] = useState("");
   const [saveError, setSaveError] = useState("");
+  const [saveErrorInfo, setSaveErrorInfo] = useState(null);
   const [attempted, setAttempted] = useState(false);
   const [busy, setBusy] = useState(false);
   const [editDialog, setEditDialog] = useState(false);
@@ -224,6 +231,40 @@ function OrderEditor({ original }) {
   const communeValue = communeMatchesWilaya ? location.commune : "";
   const selectedCommune = findAbexCommune(communes, communeValue);
   const communeLoading = Boolean(communePath && communeCatalog.loading);
+  // ABEX stop-desk parcels are delivered to a pickup office (an ABEX hub).
+  // Offices are listed only for that case, once the commune is known.
+  const pickupOffice =
+    agency?.apiProvider === "ABEX" && delivery.type === "STOP_DESK";
+  const hubPath =
+    pickupOffice && location.wilayaId && selectedCommune
+      ? `/delivery-agencies/${agency._id}/pickup-hubs?${params({
+          wilayaId: location.wilayaId,
+          commune: selectedCommune.name,
+        })}`
+      : null;
+  const hubCatalog = useApi(hubPath, currentRequest);
+  const hubs = hubCatalog.data?.hubs ?? [];
+  const hubsLoading = Boolean(hubPath && hubCatalog.loading);
+  // The user's choice wins. Otherwise the office ABEX resolves for this
+  // commune (its only office, or the administrator's mapping) is preselected.
+  const selectedHub =
+    hubs.find((hub) => hub.id === delivery.pickupHubId) ??
+    hubs.find((hub) => hub.id === hubCatalog.data?.suggestedHubId);
+  // Without a successful lookup, keep what the order already had.
+  const pickupHubId = !pickupOffice
+    ? null
+    : hubCatalog.data
+      ? (selectedHub?.id ?? null)
+      : (delivery.pickupHubId ?? null);
+  const pickupHubName = !pickupOffice
+    ? null
+    : hubCatalog.data
+      ? (selectedHub?.name ?? null)
+      : (delivery.pickupHubName ?? null);
+  const parcelHubId =
+    original?.delivery?.type === "STOP_DESK"
+      ? original.delivery.pickupHubId || original.shipment?.pickupHubId || ""
+      : "";
   const catalog = (business) =>
     business === "TAMQO" ? config.plans : config.products;
   const subtotals = Object.fromEntries(
@@ -353,6 +394,15 @@ function OrderEditor({ original }) {
       errors.commune = "Select a commune for this Wilaya.";
     else if (!communeValue.trim())
       errors.commune = "Enter the delivery commune.";
+    if (hubPath) {
+      if (hubsLoading)
+        errors.pickupHubId = "Wait for ABEX pickup offices to load.";
+      else if (hubCatalog.data && !hubs.length)
+        errors.pickupHubId =
+          "ABEX has no pickup office for this destination. Choose another commune or switch to home delivery.";
+      else if (hubs.length && !selectedHub)
+        errors.pickupHubId = "Choose the ABEX pickup office.";
+    }
     if (location.address.trim().length < 3)
       errors.address = "Enter the delivery address.";
     if (!validAmount(deliveryCost))
@@ -427,7 +477,12 @@ function OrderEditor({ original }) {
             ?.name || value.source?.name
         : value.source?.name,
       note: value.note || "",
-      delivery: [value.delivery.type, Boolean(value.delivery.exchange)],
+      delivery: [
+        value.delivery.type,
+        Boolean(value.delivery.exchange),
+        // Compared only when the office of the existing parcel is known.
+        parcelHubId ? (current ? pickupHubId || "" : parcelHubId) : "",
+      ],
       collect: current ? balance : value.payment.amountToCollect,
       products: value.items.map((item) => [
         current
@@ -454,12 +509,14 @@ function OrderEditor({ original }) {
     saving.current = true;
     setBusy(true);
     setSaveError("");
+    setSaveErrorInfo(null);
     try {
       const order = await api(id ? `/orders/${id}` : "/orders", {
         method: id ? "PATCH" : "POST",
         body: {
           ...form,
           ...confirmation,
+          delivery: { ...delivery, pickupHubId, pickupHubName },
           items: items.map(({ _key, ...item }) => ({
             ...item,
             quantity: Number(item.quantity),
@@ -490,7 +547,9 @@ function OrderEditor({ original }) {
         state: { shipmentSync: order.shipmentSync, imageWarning },
       });
     } catch (error) {
+      // The form keeps everything that was entered. Only the message changes.
       setSaveError(error.message);
+      setSaveErrorInfo(error.info?.action ? error.info : null);
       requestAnimationFrame(() => saveErrorRef.current?.focus());
     } finally {
       saving.current = false;
@@ -503,6 +562,7 @@ function OrderEditor({ original }) {
     if (saving.current) return;
     setAttempted(true);
     setSaveError("");
+    setSaveErrorInfo(null);
     const [firstError] = Object.keys(validate());
     if (firstError) {
       requestAnimationFrame(() => focusField(firstError));
@@ -890,8 +950,16 @@ function OrderEditor({ original }) {
                   ))}
               </select>
             </Field>
-            <Field label="Delivery type">
+            <Field
+              label="Delivery type"
+              hint={
+                delivery.type === "HOME"
+                  ? "The courier delivers to the customer's address."
+                  : "The customer collects the parcel from a courier office."
+              }
+            >
               <select
+                name="deliveryType"
                 value={delivery.type}
                 onChange={(event) => updateRoute("type", event.target.value)}
               >
@@ -949,6 +1017,60 @@ function OrderEditor({ original }) {
                   ? "ABEX commune lookup is unavailable."
                   : "ABEX returned no communes for this route."}{" "}
                 You can enter the commune manually.
+              </Retry>
+            )}
+            {hubPath && (hubs.length > 0 || errors.pickupHubId) && (
+              <Field
+                label="Pickup office *"
+                error={errors.pickupHubId}
+                hint={
+                  selectedHub
+                    ? [
+                        selectedHub.street,
+                        selectedHub.openingHours,
+                        !selectedHub.inCommune &&
+                          `This office is in ${selectedHub.district || "another commune"}.`,
+                      ]
+                        .filter(Boolean)
+                        .join(" · ") || undefined
+                    : undefined
+                }
+              >
+                <select
+                  name="pickupHubId"
+                  required
+                  disabled={!hubs.length}
+                  value={selectedHub?.id || ""}
+                  onChange={(event) =>
+                    set("delivery", {
+                      ...delivery,
+                      pickupHubId: event.target.value || null,
+                    })
+                  }
+                >
+                  <option value="">
+                    {hubsLoading ? "Loading offices…" : "Choose a pickup office"}
+                  </option>
+                  {hubs.map((hub) => (
+                    <option key={hub.id} value={hub.id}>
+                      {hub.name}
+                      {hub.inCommune
+                        ? ""
+                        : ` (${hub.district || "other commune"})`}
+                    </option>
+                  ))}
+                </select>
+              </Field>
+            )}
+            {hubsLoading && (
+              <small role="status" className="order-muted">
+                Loading ABEX pickup offices…
+              </small>
+            )}
+            {hubPath && !hubsLoading && hubCatalog.error && (
+              <Retry onRetry={hubCatalog.reload}>
+                ABEX pickup offices could not be loaded. You can save the order;
+                the office is confirmed when the parcel is created.
               </Retry>
             )}
             <Field label="Address *" error={errors.address}>
@@ -1183,7 +1305,11 @@ function OrderEditor({ original }) {
           </div>
           {!editDialog && saveError && (
             <div ref={saveErrorRef} tabIndex={-1} className="order-save-error">
-              <ErrorBox error={saveError} />
+              {saveErrorInfo ? (
+                <ShippingError info={saveErrorInfo} />
+              ) : (
+                <ErrorBox error={saveError} />
+              )}
             </div>
           )}
           <div className="order-entry-actions">

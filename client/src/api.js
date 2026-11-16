@@ -23,7 +23,15 @@ export async function api(path, options = {}) {
   });
   if (response.status === 204) return null;
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error?.message || "Request failed.");
+  if (!response.ok) {
+    // `message` stays the primary text. Structured shipping errors also carry
+    // a stable code, the related field, the next step and Arabic text.
+    const error = new Error(data.error?.message || "Request failed.");
+    error.status = response.status;
+    error.code = data.error?.code;
+    error.info = data.error || null;
+    throw error;
+  }
   return data;
 }
 export function params(values) {

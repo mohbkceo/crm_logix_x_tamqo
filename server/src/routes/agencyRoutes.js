@@ -10,7 +10,7 @@ import {
   requireBusinesses,
   requireAnyBusiness,
 } from "../authorization.js";
-import { assert } from "../errors.js";
+import { AppError, assert } from "../errors.js";
 import { objectId } from "../services/filters.js";
 import {
   decryptCredentials,
@@ -390,6 +390,151 @@ r.get(
       deliveryType,
       communes: await provider.communeOptions(wilaya, deliveryType),
     });
+  },
+);
+r.get(
+  "/:id/pickup-hubs",
+  requirePermission(
+    P.deliveryAgencies.view,
+    P.orders.create,
+    P.orders.updateOwn,
+    P.orders.updateAll,
+  ),
+  async (req, res) => {
+    assert(
+      req.agency.apiProvider === "ABEX",
+      "Pickup office lookup requires an ABEX agency.",
+      409,
+    );
+    const { wilayaId, commune } = z
+      .object({ wilayaId: crmId, commune: z.string().trim().min(1).max(150) })
+      .strict()
+      .parse(req.query);
+    const wilaya = await Wilaya.findById(wilayaId)
+      .select("agencyId name")
+      .lean();
+    assert(wilaya, "Wilaya not found.", 404);
+    const provider = await providerFor(req.agency._id);
+    res.json({
+      agencyId: String(req.agency._id),
+      wilayaId,
+      commune,
+      ...(await provider.pickupHubOptions(wilaya, commune)),
+    });
+  },
+);
+// Administrator mappings: CRM wilaya + commune -> ABEX territories and an
+// optional preferred pickup office. Territory UUIDs are resolved by the server
+// from the live ABEX catalog, so a mapping cannot cross wilayas.
+const mappingKey = (row) =>
+  `${row.wilayaId}:${row.commune.normalize("NFC").toLowerCase()}`;
+const requireAbexAgency = (agency) =>
+  assert(
+    agency.apiProvider === "ABEX",
+    "ABEX mappings are available for ABEX agencies.",
+    409,
+  );
+async function saveDestinations(req, change) {
+  return transaction(async (session) => {
+    const agency = await DeliveryAgency.findById(req.agency._id).session(
+      session,
+    );
+    assert(agency, "Agency not found", 404);
+    const abex = { ...(agency.config?.abex || {}) };
+    abex.destinations = change(abex.destinations || []);
+    assert(abex.destinations.length <= 2000, "Too many ABEX mappings.", 409);
+    agency.set("config.abex", abex);
+    agency.markModified("config.abex");
+    await agency.save({ session });
+    await audit(
+      req.actor,
+      "DELIVERY_AGENCY_UPDATED",
+      "DeliveryAgency",
+      agency._id,
+      undefined,
+      { abexMappings: true },
+      session,
+    );
+  });
+}
+r.get(
+  "/:id/abex-mappings",
+  requirePermission(P.deliveryAgencies.update),
+  async (req, res) => {
+    requireAbexAgency(req.agency);
+    const wilayas = await Wilaya.find().select("agencyId name").lean();
+    try {
+      const provider = await providerFor(req.agency._id);
+      res.json({
+        verified: true,
+        destinations: await provider.verifyDestinations(wilayas),
+      });
+    } catch (error) {
+      if (!(error instanceof AppError)) throw error;
+      // The saved mappings stay readable when ABEX cannot be reached.
+      res.json({
+        verified: false,
+        verificationError: { code: error.code, message: error.message },
+        destinations: (req.agency.config?.abex?.destinations || []).map(
+          (row) => ({
+            wilayaId: row.wilayaId,
+            wilayaName: wilayas.find(
+              (wilaya) => String(wilaya._id) === row.wilayaId,
+            )?.name,
+            commune: row.commune,
+            hubId: row.hubId,
+            status: "UNVERIFIED",
+            issues: [],
+          }),
+        ),
+      });
+    }
+  },
+);
+r.put(
+  "/:id/abex-mappings",
+  requirePermission(P.deliveryAgencies.update),
+  async (req, res) => {
+    requireAbexAgency(req.agency);
+    const body = z
+      .object({
+        wilayaId: crmId,
+        commune: z.string().trim().min(1).max(200),
+        districtTerritoryId: abexId.optional(),
+        hubId: abexId.nullish(),
+      })
+      .strict()
+      .parse(req.body);
+    const wilaya = await Wilaya.findById(body.wilayaId)
+      .select("agencyId name")
+      .lean();
+    assert(wilaya, "Wilaya not found.", 404);
+    const provider = await providerFor(req.agency._id);
+    const row = await provider.resolveDestinationMapping(wilaya, body);
+    await saveDestinations(req, (rows) => [
+      ...rows.filter((entry) => mappingKey(entry) !== mappingKey(row)),
+      row,
+    ]);
+    res.json(row);
+  },
+);
+r.delete(
+  "/:id/abex-mappings",
+  requirePermission(P.deliveryAgencies.update),
+  async (req, res) => {
+    requireAbexAgency(req.agency);
+    const body = z
+      .object({ wilayaId: crmId, commune: z.string().trim().min(1).max(200) })
+      .strict()
+      .parse(req.body);
+    await saveDestinations(req, (rows) => {
+      const kept = rows.filter(
+        (entry) => mappingKey(entry) !== mappingKey(body),
+      );
+      assert(kept.length < rows.length, "ABEX mapping not found.", 404);
+      return kept;
+    });
+    res.status(204).end();
   },
 );
 const rateSchema = z.object({

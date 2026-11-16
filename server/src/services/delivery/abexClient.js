@@ -4,69 +4,84 @@ import { AppError, assert } from "../../errors.js";
 import { sanitizeProviderData, validTracking } from "./deliveryMapper.js";
 import { findAbexCommune } from "../../../../shared/abexTerritories.js";
 import {
+  ABEX_BULK_CREATE_PATH,
+  ABEX_BULK_LIMIT,
   ABEX_CREATE_PATH,
   ABEX_HOST,
+  ABEX_PAYLOAD_META,
   abexParcel,
   abexResponseError,
   abexState,
   isAbexId,
   mapAbexOrder,
+  parseAbexBulkResult,
   requireAbexIdentity,
   requireAbexWrites,
+  validateAbexOrder,
 } from "./abexMapper.js";
+import { abexAssert, abexError } from "./abexErrors.js";
+import {
+  choosePickupHub,
+  describePickupHubs,
+  pickupHub,
+  pickupHubCandidates,
+} from "./abexHubs.js";
 
 const root = "/api/v1";
-const failures = {
-  400: [422, "ABEX_VALIDATION", "ABEX rejected the parcel data."],
-  401: [
-    502,
-    "ABEX_AUTHENTICATION",
-    "ABEX rejected the credentials. Check or rotate the API credentials.",
-  ],
-  403: [
-    502,
-    "ABEX_PERMISSION",
-    "ABEX denied access. Check the tenant and supplier role.",
-  ],
-  404: [404, "ABEX_NOT_FOUND", "ABEX could not find the requested record."],
-  409: [
-    409,
-    "ABEX_CONFLICT",
-    "ABEX reported a conflict. Verify the parcel in the courier portal.",
-  ],
-  422: [422, "ABEX_VALIDATION", "ABEX rejected the parcel data."],
-  429: [
-    503,
-    "ABEX_RATE_LIMIT",
-    "ABEX rate limit reached. Try again after the quota resets.",
-  ],
+// HTTP status returned by ABEX -> normalized CRM error code. The status,
+// messages and retry guidance for each code live in abexErrors.js.
+// 409 is the only one of these that ABEX documents for parcel creation
+// (external reference reused within 12 hours). The others follow ordinary
+// HTTP semantics because the public specification lists 200 responses only.
+const failureCodes = {
+  400: "ABEX_VALIDATION",
+  401: "ABEX_AUTHENTICATION",
+  403: "ABEX_PERMISSION",
+  404: "ABEX_NOT_FOUND",
+  409: "ABEX_CONFLICT",
+  422: "ABEX_VALIDATION",
+  429: "ABEX_RATE_LIMIT",
 };
+const timeoutCodes = ["ECONNABORTED", "ETIMEDOUT"];
 const httpStatus = (error) => error.response?.status;
+// [pattern in the provider's validation text, label shown to users, CRM field]
 const validationLabels = [
-  [/\b(?:stock\s*type|stock\s*mode|type de stock)\b/i, "stock type"],
-  [/\bproduct\s*id\b/i, "ABEX product ID"],
+  [/\b(?:stock\s*type|stock\s*mode|type de stock)\b/i, "stock type", "items"],
+  [/\bproduct\s*id\b/i, "ABEX product ID", "items"],
   [
     /\b(?:ordered\s*products|product\s*name|products?\s*description|parcel contents)\b/i,
     "parcel contents",
+    "items",
   ],
-  [/\b(?:number1|primary phone)\b/i, "primary phone"],
-  [/\b(?:number2|secondary phone)\b/i, "secondary phone"],
-  [/\b(?:phone(?:\s*number)?|mobile|téléphone)\b/i, "customer phone"],
+  [/\b(?:number1|primary phone)\b/i, "primary phone", "phoneA"],
+  [/\b(?:number2|secondary phone)\b/i, "secondary phone", "phoneB"],
+  [/\b(?:phone(?:\s*number)?|mobile|téléphone)\b/i, "customer phone", "phoneA"],
   [
     /\b(?:delivery\s*address|city\s*territory\s*id|district\s*territory\s*id|wilaya|commune|postal\s*code|street)\b/i,
     "delivery address",
+    "address",
   ],
-  [/\b(?:hub\s*id|pickup point)\b/i, "pickup hub"],
-  [/\b(?:delivery\s*type)\b/i, "delivery type"],
+  [/\b(?:hub\s*id|pickup point)\b/i, "pickup hub", "pickupHubId"],
+  [/\b(?:delivery\s*type)\b/i, "delivery type", "deliveryType"],
   [
     /\b(?:amount|collection\s*amount|montant)\b|^ExternalCarrier_AmountAboveCarrierLimit$/i,
     "collection amount",
+    "amount",
   ],
   [/\b(?:weight|dimensional\s*weight|poids)\b/i, "parcel weight"],
   [/\b(?:external\s*id|external reference)\b/i, "order reference"],
   [/\b(?:state\s*id|initial state)\b/i, "initial parcel state"],
-  [/\bcustomer\b/i, "customer details"],
+  [/\bcustomer\b/i, "customer details", "customerName"],
 ];
+const fieldForLabel = Object.fromEntries(
+  validationLabels.map(([, label, field]) => [label, field]),
+);
+// ASP.NET problem details usually carry a trace identifier. It is optional and
+// absent from the public specification, so it is kept only when well formed.
+const providerTraceId = (body) =>
+  typeof body?.traceId === "string" && /^[\w:.-]{8,128}$/.test(body.traceId)
+    ? body.traceId
+    : undefined;
 
 function validationFields(body) {
   const errors = body?.errors;
@@ -106,7 +121,31 @@ export const abexCatalogs = [
   "stock-origins",
 ];
 const territoryCache = new Map();
-const territoryCacheMs = 10 * 60 * 1000;
+const hubCache = new Map();
+const catalogCacheMs = 10 * 60 * 1000;
+
+// Short-lived, per-agency cache for ABEX reference data. Empty and failed
+// lookups are never kept, so a repaired configuration is picked up at once.
+async function cachedCatalog(cache, key, load) {
+  const existing = cache.get(key);
+  if (existing?.expiresAt > Date.now()) return existing.result;
+  if (cache.size >= 500) cache.delete(cache.keys().next().value);
+  const entry = { expiresAt: Date.now() + catalogCacheMs, result: load() };
+  cache.set(key, entry);
+  try {
+    const rows = await entry.result;
+    if (!rows.length && cache.get(key) === entry) cache.delete(key);
+    return rows;
+  } catch (error) {
+    if (cache.get(key) === entry) cache.delete(key);
+    throw error;
+  }
+}
+
+export function clearAbexCatalogCache() {
+  territoryCache.clear();
+  hubCache.clear();
+}
 
 export class AbexClient {
   #credentials;
@@ -153,8 +192,9 @@ export class AbexClient {
   async #request(
     method,
     url,
-    { data, params, status = 200, read = true } = {},
+    { data, params, status = 200, read = true, raw = false } = {},
   ) {
+    const accepted = Array.isArray(status) ? status : [status];
     this.ensureConfigured();
     if (!read) requireAbexWrites();
     const { apiKey, tenantId, bearerToken } = this.#credentials;
@@ -165,7 +205,15 @@ export class AbexClient {
       ...(bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {}),
     };
     const send = () =>
-      this.http.request({ method, url, headers, data, params });
+      this.http.request({
+        method,
+        url,
+        headers,
+        data,
+        params,
+        // Lets a caller read a documented non-2xx body (bulk create's 400).
+        ...(raw ? { validateStatus: (code) => accepted.includes(code) } : {}),
+      });
     const rememberRateLimit = (error) => {
       if (httpStatus(error) !== 429) return;
       const seconds = Number(error.response?.headers?.["retry-after"] ?? 60);
@@ -173,8 +221,7 @@ export class AbexClient {
         Date.now() +
         (Number.isFinite(seconds) && seconds >= 0 ? seconds : 60) * 1000;
     };
-    if (Date.now() < this.#retryAt)
-      throw new AppError(failures[429][2], failures[429][0], failures[429][1]);
+    if (Date.now() < this.#retryAt) throw abexError("ABEX_RATE_LIMIT");
 
     let response;
     try {
@@ -190,7 +237,7 @@ export class AbexClient {
           retryDelay > 2000 ||
           !(
             [429, 502, 503, 504].includes(upstream) ||
-            ["ECONNABORTED", "ETIMEDOUT", "ECONNRESET"].includes(error.code)
+            [...timeoutCodes, "ECONNRESET"].includes(error.code)
           )
         )
           throw error;
@@ -200,36 +247,52 @@ export class AbexClient {
     } catch (error) {
       rememberRateLimit(error);
       this.lastResponseStatus = httpStatus(error);
-      const [status, code, message] =
-        failures[this.lastResponseStatus] ||
-        (["ECONNABORTED", "ETIMEDOUT"].includes(error.code)
-          ? [
-              504,
-              "ABEX_TIMEOUT",
-              "ABEX did not respond in time. Verify any pending parcel operation before retrying.",
-            ]
-          : [502, "ABEX_UNAVAILABLE", "ABEX could not complete the request."]);
+      const code =
+        failureCodes[this.lastResponseStatus] ||
+        (timeoutCodes.includes(error.code)
+          ? "ABEX_TIMEOUT"
+          : "ABEX_UNAVAILABLE");
       const fields =
         code === "ABEX_VALIDATION"
           ? validationFields(error.response?.data)
           : [];
-      const failure = new AppError(
-        fields.length ? `${message} Review ${fields.join(", ")}.` : message,
-        status,
-        code,
-      );
+      // A timeout, dropped connection or 5xx says nothing about whether ABEX
+      // processed the request. A read can simply be repeated. A write must be
+      // verified first and is never repeated automatically.
+      const unknownOutcome = ["ABEX_TIMEOUT", "ABEX_UNAVAILABLE"].includes(code);
+      const base = abexError(code).message;
+      const failure = abexError(code, {
+        ...(fields.length
+          ? {
+              message: `${base} Review ${fields.join(", ")}.`,
+              fields,
+              field: fields.map((label) => fieldForLabel[label]).find(Boolean),
+            }
+          : {}),
+        ...(unknownOutcome
+          ? {
+              retryable: read,
+              reconcile: !read,
+              action: read ? "RETRY_LATER" : "VERIFY_SHIPMENT",
+            }
+          : {}),
+      });
       // Provider bodies may echo parcel data or credentials. Store only the
       // status, our error code, and labels from the allowlist.
+      const traceId = providerTraceId(error.response?.data);
       failure.providerData = {
         status: this.lastResponseStatus,
         code,
         ...(fields.length ? { fields } : {}),
+        ...(traceId ? { traceId } : {}),
       };
       throw failure;
     }
     this.lastResponseStatus = response.status;
-    if (response.status !== status) throw abexResponseError();
-    return response.data;
+    if (!accepted.includes(response.status)) throw abexResponseError();
+    return raw
+      ? { status: response.status, data: response.data }
+      : response.data;
   }
 
   async #page(resource, criteria) {
@@ -302,26 +365,64 @@ export class AbexClient {
             districtTerritoryId: row.id,
             home: row.delivery?.hasHomeDelivery === true,
             pickup: row.delivery?.hasPickupPoint === true,
+            // DeliveryCapability.canSend is published without a description.
+            // It is reported to administrators and never used to block a
+            // destination, because its meaning for a destination is unverified.
+            canSend: row.delivery?.canSend,
           }),
         );
     };
     if (!this.#agencyVersion) return load();
-    const key = `${this.#agencyVersion}:${code}`;
-    const existing = territoryCache.get(key);
-    if (existing?.expiresAt > Date.now()) return existing.result;
-    if (territoryCache.size >= 500)
-      territoryCache.delete(territoryCache.keys().next().value);
-    const entry = { expiresAt: Date.now() + territoryCacheMs, result: load() };
-    territoryCache.set(key, entry);
-    try {
-      const territories = await entry.result;
-      if (!territories.length && territoryCache.get(key) === entry)
-        territoryCache.delete(key);
-      return territories;
-    } catch (error) {
-      if (territoryCache.get(key) === entry) territoryCache.delete(key);
-      throw error;
-    }
+    return cachedCatalog(
+      territoryCache,
+      `${this.#agencyVersion}:${code}`,
+      load,
+    );
+  }
+
+  // Every ABEX hub that can receive pickup-point parcels right now.
+  async #pickupHubs() {
+    const load = async () => {
+      const rows = await this.#allPages("hubs");
+      if (rows.some((row) => !isAbexId(row?.id))) throw abexResponseError();
+      return rows
+        .map(pickupHub)
+        .filter(Boolean)
+        .map((hub) => this.sanitize(hub));
+    };
+    if (!this.#agencyVersion) return load();
+    return cachedCatalog(hubCache, this.#agencyVersion, load);
+  }
+
+  // Resolves a CRM wilaya and commune to ABEX territory UUIDs. An
+  // administrator's mapping wins. Otherwise the commune must match exactly one
+  // child of the wilaya in the live ABEX catalog and offer the delivery type.
+  async #destination({ wilayaId, agencyId, commune }, deliveryType) {
+    const configured = findAbexCommune(
+      this.#configuredDestinations(wilayaId),
+      commune,
+    );
+    if (configured) return { ...configured, source: "MAPPING" };
+    const rows = await this.#territories(agencyId);
+    const offers = (row) => (deliveryType === "HOME" ? row.home : row.pickup);
+    const match = findAbexCommune(rows.filter(offers), commune);
+    if (match) return { ...match, source: "CATALOG" };
+    const known = findAbexCommune(rows, commune);
+    if (!known) return undefined;
+    const alternative =
+      deliveryType === "HOME"
+        ? known.pickup && "STOP_DESK"
+        : known.home && "HOME";
+    throw abexError("ABEX_DELIVERY_UNSUPPORTED", {
+      message: `ABEX does not offer ${
+        deliveryType === "HOME" ? "home delivery" : "pickup-point delivery"
+      } in "${known.name}". ${
+        alternative
+          ? `Switch to ${alternative === "HOME" ? "home delivery" : "stop desk"} or choose another commune.`
+          : "Choose another commune."
+      }`,
+      ...(alternative ? { alternative } : {}),
+    });
   }
 
   async communeOptions(wilaya, deliveryType) {
@@ -344,30 +445,162 @@ export class AbexClient {
     );
   }
 
+  // Pickup offices a user may choose for a stop-desk order to this commune.
+  async pickupHubOptions(wilaya, commune) {
+    const none = (resolution) => ({
+      resolution,
+      suggestedHubId: null,
+      mappingStale: false,
+      hubs: [],
+    });
+    let destination;
+    try {
+      destination = await this.#destination(
+        { wilayaId: wilaya._id, agencyId: wilaya.agencyId, commune },
+        "STOP_DESK",
+      );
+    } catch (error) {
+      if (error.code !== "ABEX_DELIVERY_UNSUPPORTED") throw error;
+      return none("UNSUPPORTED");
+    }
+    if (!destination) return none("TERRITORY_UNRESOLVED");
+    return describePickupHubs({
+      hubs: await this.#pickupHubs(),
+      destination,
+      configuredHubId: destination.hubId,
+    });
+  }
+
+  // Builds the POST /parcels body. Local checks run first, then the territory
+  // is resolved, then (pickup-point only) the hub is verified against the
+  // live ABEX hub list. Home delivery never looks up or requires a hub.
   async prepareShipment(order) {
     requireAbexWrites();
+    validateAbexOrder(order);
     const { wilayaId, agencyId, commune } = order.location;
-    const configured = findAbexCommune(
-      this.#configuredDestinations(wilayaId),
-      commune,
+    const destination = await this.#destination(
+      { wilayaId, agencyId, commune },
+      order.delivery.type,
     );
-    const destination =
-      configured ||
-      findAbexCommune(
-        (await this.#territories(agencyId)).filter((row) =>
-          order.delivery.type === "HOME" ? row.home : row.pickup,
-        ),
-        commune,
+    const pickup =
+      destination && order.delivery.type === "STOP_DESK"
+        ? choosePickupHub({
+            hubs: await this.#pickupHubs(),
+            destination,
+            selectedHubId: order.delivery.pickupHubId,
+            configuredHubId: destination.hubId,
+          })
+        : undefined;
+    const payload = mapAbexOrder(
+      order,
+      this.#settings,
+      destination && { ...destination, hubId: pickup?.hub.id },
+    );
+    if (pickup)
+      Object.defineProperty(payload, ABEX_PAYLOAD_META, {
+        value: {
+          hubId: pickup.hub.id,
+          hubName: pickup.hub.name,
+          hubSource: pickup.source,
+        },
+      });
+    return payload;
+  }
+
+  // Checks every administrator mapping against the live ABEX catalog.
+  // `wilayas` are the CRM wilayas ({ _id, agencyId, name }).
+  async verifyDestinations(wilayas) {
+    const destinations = this.#settings.destinations || [];
+    const hubs = destinations.some((row) => row.hubId)
+      ? await this.#pickupHubs()
+      : [];
+    const results = [];
+    for (const row of destinations) {
+      const wilaya = wilayas.find((entry) => String(entry._id) === row.wilayaId);
+      const territories = wilaya ? await this.#territories(wilaya.agencyId) : [];
+      const live = territories.find(
+        (entry) => entry.districtTerritoryId.toLowerCase() === row.districtTerritoryId,
       );
-    return mapAbexOrder(order, this.#settings, destination);
+      const hub = row.hubId
+        ? hubs.find((entry) => entry.id === row.hubId)
+        : undefined;
+      const issues = [];
+      if (!wilaya) issues.push("WILAYA_MISSING");
+      else if (!territories.length) issues.push("WILAYA_UNRESOLVED");
+      else if (
+        territories[0].cityTerritoryId.toLowerCase() !== row.cityTerritoryId
+      )
+        issues.push("CITY_MISMATCH");
+      else if (!live) issues.push("COMMUNE_NOT_IN_WILAYA");
+      if (row.hubId && !hub) issues.push("HUB_UNAVAILABLE");
+      else if (hub && hub.cityTerritoryId !== row.cityTerritoryId)
+        issues.push("HUB_OTHER_WILAYA");
+      results.push({
+        wilayaId: row.wilayaId,
+        wilayaName: wilaya?.name,
+        commune: row.commune,
+        abexCommune: live?.name,
+        home: live?.home,
+        pickup: live?.pickup,
+        canSend: live?.canSend,
+        hubId: row.hubId,
+        hubName: hub?.name,
+        status: issues.includes("WILAYA_UNRESOLVED")
+          ? "UNVERIFIED"
+          : issues.length
+            ? "STALE"
+            : "OK",
+        issues,
+      });
+    }
+    return results;
+  }
+
+  // Turns an administrator's choice into a verified mapping row. Territory
+  // UUIDs always come from the live catalog under the CRM wilaya, and the hub
+  // must be an active pickup office in that same wilaya.
+  async resolveDestinationMapping(wilaya, { commune, districtTerritoryId, hubId }) {
+    const territories = await this.#territories(wilaya.agencyId);
+    abexAssert(territories.length, "ABEX_MAPPING_INVALID", {
+      field: "wilayaId",
+      message: `ABEX has no wilaya with code ${wilaya.agencyId}.`,
+    });
+    const match = districtTerritoryId
+      ? territories.find(
+          (row) => row.districtTerritoryId.toLowerCase() === districtTerritoryId,
+        )
+      : findAbexCommune(territories, commune);
+    abexAssert(match, "ABEX_MAPPING_INVALID", {
+      field: "commune",
+      message: `ABEX has no commune matching "${commune}" in ${wilaya.name}.`,
+    });
+    let hub;
+    if (hubId) {
+      hub = pickupHubCandidates(await this.#pickupHubs(), match).wilayaHubs.find(
+        (entry) => entry.id === hubId,
+      );
+      abexAssert(hub, "ABEX_MAPPING_INVALID", {
+        field: "hubId",
+        message: `That hub is not an active ABEX pickup office in ${wilaya.name}.`,
+      });
+    }
+    return {
+      wilayaId: String(wilaya._id),
+      commune,
+      cityTerritoryId: match.cityTerritoryId.toLowerCase(),
+      districtTerritoryId: match.districtTerritoryId.toLowerCase(),
+      ...(hub ? { hubId: hub.id } : {}),
+    };
   }
 
   async createShipment(payload) {
     let parcel;
     try {
+      // The public specification documents 200 for POST /parcels. 201 is
+      // accepted as well because earlier account testing observed it.
       const data = await this.#request("POST", ABEX_CREATE_PATH, {
         data: payload,
-        status: 201,
+        status: [200, 201],
         read: false,
       });
       parcel = abexParcel(data, (value) => this.sanitize(value));
@@ -392,6 +625,35 @@ export class AbexClient {
         providerParcelId: parcel.parcelId,
       });
     return parcel;
+  }
+
+  // POST /parcels/bulk for up to 100 prepared payloads. Sent once and never
+  // retried. The order workflow does not use it: it reserves and creates one
+  // parcel per order. A caller must hold a durable reservation for every
+  // parcel first, and must reconcile each UNKNOWN result (and every parcel
+  // when this method throws) by external reference before trying again.
+  async createShipmentsBulk(payloads) {
+    assert(
+      Array.isArray(payloads) &&
+        payloads.length >= 1 &&
+        payloads.length <= ABEX_BULK_LIMIT,
+      `ABEX accepts 1 to ${ABEX_BULK_LIMIT} parcels per bulk request.`,
+    );
+    const references = payloads.map((payload) => payload?.externalId);
+    assert(
+      references.every((value) => typeof value === "string" && value.trim()) &&
+        new Set(references).size === references.length,
+      "Every bulk parcel needs its own order reference.",
+    );
+    const { status, data } = await this.#request("POST", ABEX_BULK_CREATE_PATH, {
+      data: { parcels: payloads },
+      status: [200, 207, 400],
+      read: false,
+      raw: true,
+    });
+    return parseAbexBulkResult(status, data, payloads, (value) =>
+      this.sanitize(value),
+    );
   }
 
   async #allPages(resource, criteria = {}) {
@@ -618,13 +880,22 @@ export class AbexClient {
       ),
       "Rates require ABEX territory or stock UUIDs.",
     );
-    const result = await this.#request(
-      "GET",
-      `${root}/delivery-pricing/rates${toTerritoryId ? "/" + toTerritoryId : ""}`,
-      {
-        params: { fromTerritoryId, hubStockId },
-      },
-    );
+    let result;
+    try {
+      result = await this.#request(
+        "GET",
+        `${root}/delivery-pricing/rates${toTerritoryId ? "/" + toTerritoryId : ""}`,
+        {
+          params: { fromTerritoryId, hubStockId },
+        },
+      );
+    } catch (error) {
+      // Documented: 404 when the supplier has no price assignment.
+      if (error.code !== "ABEX_NOT_FOUND") throw error;
+      const missing = abexError("ABEX_PRICING_NOT_FOUND");
+      missing.providerData = error.providerData;
+      throw missing;
+    }
     const rows = toTerritoryId ? [result] : result?.rates;
     if (
       !Array.isArray(rows) ||
@@ -706,6 +977,7 @@ export class AbexClient {
           ...(catalog === "hubs"
             ? {
                 isPickupPoint: row.isPickupPoint,
+                isVisible: row.isVisible,
                 cityTerritoryId: row.address?.cityTerritoryId,
                 districtTerritoryId: row.address?.districtTerritoryId,
               }

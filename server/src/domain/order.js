@@ -58,6 +58,15 @@ export const orderInput = z.object({
     agencyId: id.optional(),
     type: z.enum(DELIVERY_TYPES),
     exchange: z.boolean().default(false),
+    pickupHubId: z
+      .string()
+      .regex(
+        /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i,
+        "Invalid pickup office",
+      )
+      .transform((value) => value.toLowerCase())
+      .nullish(),
+    pickupHubName: z.string().trim().max(200).nullish(),
   }),
   deliveryCharged: amount.optional(),
   payment: z.object({

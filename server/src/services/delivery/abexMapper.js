@@ -1,9 +1,17 @@
-import { AppError, assert } from "../../errors.js";
+import { assert } from "../../errors.js";
 import { normalizePhone } from "../../domain/order.js";
 import { validTracking, sanitizeProviderStatus } from "./deliveryMapper.js";
+import { abexAssert, abexError, abexErrorDetails } from "./abexErrors.js";
 
 export const ABEX_HOST = "https://app.abex.clawdyatms.app";
 export const ABEX_CREATE_PATH = "/api/v1/parcels";
+export const ABEX_BULK_CREATE_PATH = "/api/v1/parcels/bulk";
+// POST /parcels/bulk accepts at most 100 parcels per request.
+export const ABEX_BULK_LIMIT = 100;
+// deliveryType values accepted by POST /parcels.
+export const ABEX_DELIVERY_TYPES = { HOME: "home", STOP_DESK: "pickup-point" };
+// Non-serialized details about a prepared payload (resolved hub name).
+export const ABEX_PAYLOAD_META = Symbol("abexPayloadMeta");
 export const isAbexId = (value) =>
   typeof value === "string" &&
   /^[a-f0-9]{8}(?:-[a-f0-9]{4}){3}-[a-f0-9]{12}$/i.test(value) &&
@@ -23,36 +31,98 @@ export function requireAbexWrites() {
     "ABEX parcel writes are disabled. Contact your administrator.",
     503,
     "DELIVERY_NOT_CONFIGURED",
+    abexErrorDetails("DELIVERY_NOT_CONFIGURED"),
   );
 }
 
-export function mapAbexOrder(order, settings, destination) {
-  assert(
+const invalidOrder = (field, message) =>
+  abexError("ABEX_ORDER_INVALID", { field, message });
+
+// Checks performed on CRM data before any ABEX request is sent. These are CRM
+// rules (the order form applies the same ones); ABEX may still reject a parcel
+// for reasons its public specification does not describe.
+export function validateAbexOrder(order) {
+  abexAssert(
+    Object.hasOwn(ABEX_DELIVERY_TYPES, order.delivery?.type),
+    "ABEX_DELIVERY_UNSUPPORTED",
+  );
+  abexAssert(!order.delivery.exchange, "ABEX_EXCHANGE_UNSUPPORTED");
+  if (
+    typeof order.orderNumber !== "string" ||
+    !order.orderNumber.trim() ||
+    order.orderNumber.length > 100
+  )
+    throw invalidOrder("orderNumber", "The order has no usable reference.");
+  if (
+    typeof order.customer?.name !== "string" ||
+    order.customer.name.trim().length < 2
+  )
+    throw invalidOrder(
+      "customerName",
+      "Enter the customer's full name before creating the parcel.",
+    );
+  for (const [field, value, required] of [
+    ["phoneA", order.customer.phoneA, true],
+    ["phoneB", order.customer.phoneB?.trim(), false],
+  ]) {
+    if (!value && !required) continue;
+    try {
+      normalizePhone(value);
+    } catch {
+      throw invalidOrder(
+        field,
+        field === "phoneA"
+          ? "The customer's phone number is missing or is not a valid Algerian mobile number."
+          : "The customer's second phone number is not a valid Algerian mobile number.",
+      );
+    }
+  }
+  if (
+    order.delivery.type === "HOME" &&
+    (typeof order.location?.address !== "string" ||
+      !order.location.address.trim())
+  )
+    throw invalidOrder(
+      "address",
+      "Enter the delivery address before creating a home-delivery parcel.",
+    );
+  const amount = order.payment?.amountToCollect;
+  if (!Number.isFinite(amount) || amount < 0)
+    throw invalidOrder("amount", "Invalid courier collection amount.");
+  for (const item of order.items || []) {
+    if (item.type !== "PRODUCT") continue;
+    if (
+      typeof item.name !== "string" ||
+      !item.name.trim() ||
+      !Number.isInteger(item.quantity) ||
+      item.quantity < 1 ||
+      !Number.isFinite(item.unitPrice) ||
+      item.unitPrice < 0
+    )
+      throw invalidOrder(
+        "items",
+        "Every product needs a name, a whole quantity of at least 1 and a valid price.",
+      );
+  }
+}
+
+export function mapAbexOrder(order, settings = {}, destination) {
+  validateAbexOrder(order);
+  abexAssert(
     isAbexId(destination?.cityTerritoryId) &&
       isAbexId(destination?.districtTerritoryId),
-    `ABEX could not verify "${order.location.commune}" in ${order.location.wilayaName}. Edit the order and select a commune for the correct wilaya.`,
-    409,
     "ABEX_TERRITORY_REQUIRED",
+    {
+      message: `ABEX could not verify "${order.location.commune}" in ${order.location.wilayaName}. Edit the order and select a commune for the correct wilaya.`,
+    },
   );
   const desk = order.delivery.type === "STOP_DESK";
-  assert(
-    !desk || isAbexId(destination.hubId),
-    "Configure an ABEX pickup hub for this wilaya and commune.",
-    409,
-    "ABEX_HUB_REQUIRED",
-  );
-  assert(
-    !order.delivery.exchange,
-    "ABEX exchanges require an existing provider parcel and must be arranged in the courier portal.",
-    409,
-    "ABEX_EXCHANGE_UNSUPPORTED",
-  );
+  // The hub is resolved and verified by AbexClient before this point. A
+  // pickup-point parcel is never built without one.
+  abexAssert(!desk || isAbexId(destination.hubId), "ABEX_HUB_REQUIRED", {
+    alternative: "HOME",
+  });
   const amount = order.payment.amountToCollect;
-  assert(
-    Number.isFinite(amount) && amount >= 0,
-    "Invalid courier collection amount.",
-    409,
-  );
   const physicalItems = order.items.filter((item) => item.type === "PRODUCT");
   const lines = physicalItems.map((item) => ({
     item,
@@ -79,23 +149,24 @@ export function mapAbexOrder(order, settings, destination) {
       .filter(Boolean)
       .join("\n") || (useCatalogStock ? "" : "--");
   const secondaryPhone = order.customer.phoneB?.trim();
+  const street = order.location.address?.trim();
   return {
     externalId: order.orderNumber,
     customer: {
-      name: order.customer.name,
+      name: order.customer.name.trim(),
       phone: {
         number1: normalizePhone(order.customer.phoneA),
         ...(secondaryPhone ? { number2: normalizePhone(secondaryPhone) } : {}),
       },
     },
     deliveryAddress: {
-      cityTerritoryId: destination.cityTerritoryId,
-      districtTerritoryId: destination.districtTerritoryId,
-      street: order.location.address,
+      cityTerritoryId: destination.cityTerritoryId.toLowerCase(),
+      districtTerritoryId: destination.districtTerritoryId.toLowerCase(),
+      ...(street ? { street } : {}),
     },
-    ...(desk ? { hubId: destination.hubId } : {}),
+    ...(desk ? { hubId: destination.hubId.toLowerCase() } : {}),
     ...(orderedProducts.length ? { orderedProducts } : {}),
-    deliveryType: desk ? "pickup-point" : "home",
+    deliveryType: ABEX_DELIVERY_TYPES[order.delivery.type],
     amount,
     ...(description ? { description } : {}),
   };
@@ -113,7 +184,13 @@ export function abexOrderSnapshot(order) {
       order.location.commune,
       order.location.address,
     ],
-    delivery: [order.delivery.type, Boolean(order.delivery.exchange)],
+    delivery: [
+      order.delivery.type,
+      Boolean(order.delivery.exchange),
+      order.delivery.type === "STOP_DESK"
+        ? String(order.delivery.pickupHubId || "").toLowerCase()
+        : "",
+    ],
     amount: order.payment.amountToCollect,
     note: order.note || "",
     products: order.items
@@ -129,11 +206,90 @@ export function abexOrderSnapshot(order) {
 }
 
 export function abexResponseError() {
-  return new AppError(
-    "ABEX returned an invalid or incomplete response.",
-    502,
-    "ABEX_INVALID_RESPONSE",
-  );
+  return abexError("ABEX_INVALID_RESPONSE");
+}
+
+// Interprets CreateBulkParcelsResponse for POST /parcels/bulk.
+//   200: every parcel was created, 207: some were, 400: none were.
+// Each submitted parcel gets exactly one result. A parcel that the response
+// does not account for is reported as UNKNOWN and must be reconciled by its
+// external reference before any new attempt. A batch is never reported as
+// complete unless every parcel has a verified success entry.
+export function parseAbexBulkResult(httpStatus, data, payloads, sanitize) {
+  const clean = (value) =>
+    sanitizeProviderStatus(sanitize ? sanitize(value) : value);
+  const results = payloads.map((payload, index) => ({
+    index,
+    externalId: payload.externalId,
+    outcome: "UNKNOWN",
+  }));
+  const rows = (list) => (Array.isArray(list) ? list : []);
+  const bulkShape =
+    data &&
+    typeof data === "object" &&
+    (Array.isArray(data.successes) || Array.isArray(data.failures));
+  // A 400 without the bulk body is a rejected request: nothing was created.
+  if (httpStatus === 400 && !bulkShape)
+    return {
+      status: "FAILED",
+      results: results.map((result) => ({
+        ...result,
+        outcome: "FAILED",
+        errorCode: "ABEX_VALIDATION",
+      })),
+    };
+  if (![200, 207, 400].includes(httpStatus) || !bulkShape)
+    throw abexResponseError();
+  const seen = new Set();
+  const claim = (row) => {
+    const result = Number.isInteger(row?.index) ? results[row.index] : undefined;
+    if (
+      !result ||
+      seen.has(row.index) ||
+      (row.externalId != null && row.externalId !== result.externalId)
+    )
+      throw abexResponseError();
+    seen.add(row.index);
+    return result;
+  };
+  for (const row of rows(data.successes)) {
+    const result = claim(row);
+    if (
+      !isAbexId(row.parcelId) ||
+      (row.trackingNumber != null && !validTracking(row.trackingNumber)) ||
+      (row.amount != null && row.amount !== payloads[row.index].amount)
+    )
+      throw abexResponseError();
+    result.outcome = "CREATED";
+    result.parcelId = row.parcelId.toLowerCase();
+    result.tracking = row.trackingNumber?.trim() || undefined;
+  }
+  for (const row of rows(data.failures)) {
+    const result = claim(row);
+    result.outcome = "FAILED";
+    result.errorCode = clean(row.errorCode) || "ABEX_VALIDATION";
+    result.errorMessage = clean(row.errorMessage) || undefined;
+  }
+  const created = results.filter((result) => result.outcome === "CREATED");
+  const failed = results.filter((result) => result.outcome === "FAILED");
+  // The status code must agree with the per-parcel entries. If it does not,
+  // the entries are kept and the batch is reported as needing reconciliation.
+  const consistent =
+    (httpStatus === 200 && created.length === results.length) ||
+    (httpStatus === 207 && created.length > 0 && failed.length > 0) ||
+    (httpStatus === 400 && created.length === 0);
+  const complete = created.length + failed.length === results.length;
+  return {
+    status:
+      !consistent || !complete
+        ? "RECONCILE"
+        : created.length === results.length
+          ? "COMPLETE"
+          : created.length
+            ? "PARTIAL"
+            : "FAILED",
+    results,
+  };
 }
 
 // Keep only the identifiers and status fields needed by the CRM.

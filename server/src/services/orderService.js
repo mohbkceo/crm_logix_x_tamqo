@@ -122,6 +122,8 @@ export async function materialize(input, session, existing, { persistCustomer = 
   const deliveryCharged =
     p.deliveryCharged ??
     (p.delivery.type === "HOME" ? rate.homePrice : rate.deskPrice);
+  const pickupOffice =
+    p.delivery.type === "STOP_DESK" && agency.apiProvider === "ABEX";
   return {
     customerId: person?._id || existing?.customerId,
     customer,
@@ -144,6 +146,12 @@ export async function materialize(input, session, existing, { persistCustomer = 
     note: p.note,
     delivery: {
       ...p.delivery,
+      // A pickup office only applies to an ABEX stop-desk order.
+      pickupHubId:
+        (pickupOffice && p.delivery.pickupHubId) || undefined,
+      pickupHubName:
+        (pickupOffice && p.delivery.pickupHubId && p.delivery.pickupHubName) ||
+        undefined,
       agencyId: agency._id,
       agencyName:
         String(existing?.delivery.agencyId) === String(agency._id)
@@ -206,9 +214,19 @@ const editable = (order) => {
     "This order can no longer be edited.", 409);
 };
 const parcelOptions = (order) => ({ confirmed: ["READY_TO_SHIP", "SHIPPED", "OUT_FOR_DELIVERY", "FAILED_DELIVERY"].includes(order.status) });
-const sameParcel = (before, after, provider) => {
-  const snapshot = provider === "ABEX" ? abexOrderSnapshot : (order) =>
-    mapOrderToPackage(order, parcelOptions(order));
+const sameParcel = (before, after, provider, parcelHubId) => {
+  if (provider === "ABEX") {
+    const previous = abexOrderSnapshot(before), next = abexOrderSnapshot(after);
+    // The office the parcel was created for is recorded on the shipment when
+    // the order itself carries none. Parcels created before offices were
+    // recorded have nothing to compare, so the office alone is not a change.
+    if (before.delivery.type === "STOP_DESK")
+      previous.delivery[2] ||= String(parcelHubId || "").toLowerCase();
+    if (!previous.delivery[2] || !next.delivery[2])
+      previous.delivery[2] = next.delivery[2] = "";
+    return JSON.stringify(previous) === JSON.stringify(next);
+  }
+  const snapshot = (order) => mapOrderToPackage(order, parcelOptions(order));
   return JSON.stringify(snapshot(before)) === JSON.stringify(snapshot(after));
 };
 const safeFailure = (error) => sanitizeProviderData(error instanceof Error ? error.message : "Courier synchronization failed");
@@ -254,7 +272,7 @@ export async function editOrder(id, input, actor = "admin") {
         "An item business with allocated refunds cannot be removed.", 409);
   const oldAgency = shipment && await DeliveryAgency.findById(shipment.agencyId);
   const agencyChanged = Boolean(shipment && String(shipment.agencyId) !== String(preview.delivery.agencyId));
-  const parcelChanged = Boolean(shipment && !sameParcel(order, { ...order.toObject(), ...preview }, shipment.provider));
+  const parcelChanged = Boolean(shipment && !sameParcel(order, { ...order.toObject(), ...preview }, shipment.provider, shipment.pickupHubId));
   const remote = Boolean(shipment && oldAgency?.integrationType === "API" && (shipment.creationAttemptedAt || shipment.tracking || shipment.providerAccepted));
   assert(shipment?.provider !== "ABEX" || !(agencyChanged || parcelChanged) ||
     (!shipment.uncertain && !shipment.pendingReadinessStateId),
