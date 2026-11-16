@@ -4224,6 +4224,75 @@ test("ABEX validation errors and timeouts preserve orders and reconciliation nev
   );
 });
 
+test("ABEX rate-limited creation is released for retry instead of waiting for verification", async (t) => {
+  const f = await abexFixture(t);
+  const creates = () =>
+    f.requests.filter((req) => req.url === "/api/v1/parcels").length;
+  f.tracking = abexTracking;
+  f.onCreate = () => {
+    throw abexHttpError(429);
+  };
+  const created = expectOk(await apiAgent.post("/api/orders").send(f.input));
+  const limited = await Shipment.findOne({ orderId: created._id });
+  assert.equal(limited.uncertain, false);
+  assert.equal(limited.creationAttemptedAt, undefined);
+  assert.equal(limited.syncStatus, "ERROR");
+  assert.equal(limited.lastErrorInfo.code, "ABEX_RATE_LIMIT");
+  assert.equal(creates(), 1);
+  // Once the quota resets the same shipment is created normally.
+  f.onCreate = undefined;
+  const retried = expectOk(
+    await apiAgent.post(`/api/orders/${created._id}/shipment`),
+  );
+  assert.equal(retried._id, String(limited._id));
+  assert.equal(retried.tracking, abexTracking);
+  assert.equal(creates(), 2);
+  await Shipment.deleteOne({ orderId: created._id });
+
+  // A shipment left stuck by an earlier release is freed by Refresh tracking
+  // after ABEX confirms no parcel exists, without sending a create.
+  f.onCreate = () => {
+    throw abexHttpError(429);
+  };
+  const stuckOrder = expectOk(
+    await apiAgent.post("/api/orders").send(f.input),
+  );
+  f.onCreate = undefined;
+  f.parcelAbsent = true;
+  await Shipment.updateOne(
+    { orderId: stuckOrder._id },
+    {
+      $set: {
+        creationAttemptedAt: new Date(),
+        syncStatus: "PENDING",
+        uncertain: true,
+        providerAccepted: false,
+        lastError:
+          "Shipment awaiting verification. Parcel existence could not be confirmed.",
+        sanitizedProviderData: {
+          creation: { status: 429, code: "ABEX_RATE_LIMIT" },
+          reconciliation: { result: "NOT_FOUND" },
+        },
+      },
+    },
+  );
+  const before = creates();
+  const released = expectOk(
+    await apiAgent.post(`/api/orders/${stuckOrder._id}/shipment/refresh`),
+  );
+  assert.equal(released.uncertain, false);
+  assert.equal(released.creationAttemptedAt, undefined);
+  assert.equal(released.syncStatus, "ERROR");
+  assert.match(released.lastError, /No ABEX parcel exists/);
+  assert.equal(creates(), before);
+  f.parcelAbsent = false;
+  const recreated = expectOk(
+    await apiAgent.post(`/api/orders/${stuckOrder._id}/shipment`),
+  );
+  assert.equal(recreated.tracking, abexTracking);
+  assert.equal(creates(), before + 1);
+});
+
 test("ABEX polling validates parcel identity and protects production, event ordering, and finance", async (t) => {
   const f = await abexFixture(t);
   const created = expectOk(await apiAgent.post("/api/orders").send(f.input));

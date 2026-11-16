@@ -181,6 +181,13 @@ const detailKeys = [
 
 export const abexErrorCodes = Object.keys(catalog);
 
+// Codes that prove ABEX refused a write without processing it. A rate-limited
+// request (HTTP 429, or refused locally while the quota window is open) never
+// creates a parcel, so the attempt can be released for a normal retry instead
+// of being held for reconciliation.
+const notProcessedCodes = new Set(["ABEX_RATE_LIMIT"]);
+export const abexWriteNotProcessed = (code) => notProcessedCodes.has(code);
+
 export function abexErrorDetails(code, overrides = {}) {
   const entry = catalog[code] || {};
   const details = {

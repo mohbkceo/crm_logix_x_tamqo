@@ -22,7 +22,11 @@ import {
 } from "./deliveryFinancialService.js";
 import { COURIER_STAGES } from "../../../../shared/tracking.js";
 import { ABEX_PAYLOAD_META, requireAbexIdentity } from "./abexMapper.js";
-import { shipmentErrorInfo } from "./abexErrors.js";
+import {
+  abexError,
+  abexWriteNotProcessed,
+  shipmentErrorInfo,
+} from "./abexErrors.js";
 const creationStatuses = ["NEW", "CONFIRMED", "PREPARING", "READY_TO_SHIP"];
 export class DeliverySyncService {
   constructor(client = deliveryClient, agencyId) {
@@ -373,6 +377,10 @@ export class DeliverySyncService {
               ? error.message
               : "Courier request failed. Reconcile before retrying.",
           );
+      // ABEX refused the request outright (rate limit): no parcel exists, so
+      // release the attempt and let the shipment be created again normally.
+      const notProcessed =
+        abex && !accepted && abexWriteNotProcessed(error.code);
       const failed = await Shipment.findOneAndUpdate(
         reservation,
         {
@@ -383,10 +391,14 @@ export class DeliverySyncService {
               ? null
               : shipmentErrorInfo(error, lastError) || null,
             lockUntil: null,
+            ...(notProcessed
+              ? { uncertain: false, providerAccepted: false }
+              : {}),
             ...(error.providerData
               ? { sanitizedProviderData: this.sanitize(error.providerData) }
               : {}),
           },
+          ...(notProcessed ? { $unset: { creationAttemptedAt: 1 } } : {}),
         },
         { new: true },
       );
@@ -465,6 +477,15 @@ export class DeliverySyncService {
           creation: original,
           reconciliation: { result: "NOT_FOUND" },
         };
+        if (abexWriteNotProcessed(original?.code) && !shipment.providerParcelId)
+          return this.releaseRejectedCreation(
+            order,
+            shipment,
+            reservation,
+            original.code,
+            diagnostics,
+            actor,
+          );
       } else {
         const raw = this.sanitize(
           await this.client.readPackages([order.orderNumber]),
@@ -519,6 +540,46 @@ export class DeliverySyncService {
       { new: true },
     );
     return pending || Shipment.findById(shipment._id);
+  }
+  // The earlier create was refused by ABEX before processing and a search by
+  // the order reference confirms no parcel exists: clear the attempt so the
+  // order offers "Retry shipment" again instead of waiting for verification.
+  async releaseRejectedCreation(
+    order,
+    shipment,
+    reservation,
+    code,
+    diagnostics,
+    actor,
+  ) {
+    const reason = abexError(code),
+      lastError = `No ABEX parcel exists for this order: the previous attempt was refused (${reason.message}) Retry the shipment.`,
+      released = await Shipment.findOneAndUpdate(
+        { ...reservation, providerAccepted: { $ne: true } },
+        {
+          $set: {
+            syncStatus: "ERROR",
+            uncertain: false,
+            providerAccepted: false,
+            lockUntil: null,
+            lastError,
+            lastErrorInfo: shipmentErrorInfo(reason, lastError),
+            sanitizedProviderData: diagnostics,
+          },
+          $unset: { creationAttemptedAt: 1 },
+        },
+        { new: true },
+      );
+    if (!released) return Shipment.findById(shipment._id);
+    await this.creationEvent(
+      order,
+      released,
+      "SHIPMENT_CREATION_RELEASED",
+      lastError,
+      actor,
+      { errorCode: code },
+    );
+    return released;
   }
   async apply(orderId, parcel, options) {
     return (await this.applyWithResult(orderId, parcel, options)).shipment;
