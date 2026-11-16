@@ -13,7 +13,7 @@ const groups = {
   imports: ['view','execute'],
   tamqoPlans: ['view','manage'], logixProducts: ['view','manage'], sources: ['view','manage'], wilayas: ['view','manage'],
   deliveryAgencies: ['view','create','update','disable','delete','assignBusinesses','manageRates','manageCredentials','testConnection'],
-  deliverySync: ['view','run'],
+  deliverySync: ['view','run','configure'],
   users: ['view','create','update','disable','permissions'], sessions: ['viewOwn','revokeOwn'],
   'users.sessions': ['view','revoke'], audit: ['view'], settings: ['view','manage'], registrationKey: ['manage'],
 };

@@ -28,6 +28,7 @@ import {
   DEFAULT_DELIVERY_SYNC_INTERVAL_MS,
   deliverySyncSettings,
   startDeliverySyncScheduler,
+  stopDeliverySyncScheduler,
 } from "../src/services/delivery/deliveryScheduler.js";
 import {
   mapImportSituation,
@@ -368,6 +369,11 @@ test("delivery scheduler runs once at startup and every fifteen minutes by defau
       intervalMs: DEFAULT_DELIVERY_SYNC_INTERVAL_MS,
     });
     startDeliverySyncScheduler({
+      loadSettings: async () => ({
+        cronEnabled: true,
+        intervalMinutes: 15,
+        loggingEnabled: true,
+      }),
       sync: async (trigger) => triggers.push(trigger),
       setIntervalFn: (fn, ms) => {
         callback = fn;
@@ -383,6 +389,7 @@ test("delivery scheduler runs once at startup and every fifteen minutes by defau
     await new Promise((resolve) => setImmediate(resolve));
     assert.deepEqual(triggers, ["STARTUP", "CRON"]);
   } finally {
+    stopDeliverySyncScheduler();
     if (previousInterval === undefined)
       delete process.env.DELIVERY_SYNC_INTERVAL_MS;
     else process.env.DELIVERY_SYNC_INTERVAL_MS = previousInterval;

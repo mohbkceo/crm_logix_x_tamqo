@@ -75,7 +75,8 @@ All environment configuration is server-side. There are no `VITE_DELIVERY_*` sec
 | `DELIVERY_API_TOKEN`, `DELIVERY_API_KEY` | Legacy Procolis credentials for historical lookup                              |
 | `DELIVERY_TIMEOUT_MS`                    | Courier timeout, default 15000 ms                                              |
 | `DELIVERY_STATUS_MAP`                    | Legacy Procolis status label overrides. Defaults to `{}`.                     |
-| `DELIVERY_SYNC_INTERVAL_MS`              | Optional scheduled batch synchronization; 0 disables, minimum 60000            |
+| `DELIVERY_SYNC_ENABLED`                  | Initial cron on/off, used until it is saved in Settings / Delivery Sync Logs   |
+| `DELIVERY_SYNC_INTERVAL_MS`              | Initial cron interval (minimum 60000), used until saved in Settings            |
 
 Authentication is mandatory. Sessions use opaque random tokens in HTTP-only, SameSite=Strict cookies, with Secure enabled in production; MongoDB stores only token hashes. Disabled users and revoked or expired sessions lose access immediately. Mutating browser requests check the exact configured Origin. Login and API routes are rate limited, Express uses Helmet, and raw database/provider errors are not returned to the browser. Users combine role, explicit permissions, business access and ownership scope; only `SUPER_ADMIN` receives unconditional access.
 

@@ -158,3 +158,17 @@ export const DeliverySyncLock = mongoose.model(
     { timestamps: true },
   ),
 );
+
+export const DeliverySyncSettings = mongoose.model(
+  "DeliverySyncSettings",
+  new Schema(
+    {
+      _id: { type: String, default: "delivery-sync" },
+      cronEnabled: { type: Boolean, default: true },
+      intervalMinutes: { type: Number, default: 15, min: 1, max: 1440 },
+      loggingEnabled: { type: Boolean, default: true },
+      updatedBy: actorSchema,
+    },
+    { timestamps: true },
+  ),
+);

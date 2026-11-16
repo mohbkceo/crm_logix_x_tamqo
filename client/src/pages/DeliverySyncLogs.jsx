@@ -1,11 +1,12 @@
 import { useState } from "react";
-import { RefreshCw, Radio } from "lucide-react";
+import { Check, RefreshCw, Radio, Save } from "lucide-react";
 import { P, Can } from "../access";
 import { api, number, useApi } from "../api";
 import {
   Badge,
   DataTable,
   ErrorBox,
+  Field,
   Loading,
   Metric,
   Modal,
@@ -113,20 +114,148 @@ function RunDetails({ id, onClose }) {
   );
 }
 
+const MIN_INTERVAL_MINUTES = 1,
+  MAX_INTERVAL_MINUTES = 1440;
+
+function SyncSettings({ status, onSaved }) {
+  const [form, setForm] = useState({
+      cronEnabled: Boolean(status.cronEnabled),
+      intervalMinutes: String(status.intervalMinutes ?? 15),
+      loggingEnabled: Boolean(status.loggingEnabled),
+    }),
+    [busy, setBusy] = useState(false),
+    [error, setError] = useState(""),
+    minutes = Number(form.intervalMinutes),
+    validInterval =
+      Number.isInteger(minutes) &&
+      minutes >= MIN_INTERVAL_MINUTES &&
+      minutes <= MAX_INTERVAL_MINUTES,
+    dirty =
+      form.cronEnabled !== Boolean(status.cronEnabled) ||
+      minutes !== status.intervalMinutes ||
+      form.loggingEnabled !== Boolean(status.loggingEnabled);
+  async function save(event) {
+    event.preventDefault();
+    setBusy(true);
+    setError("");
+    try {
+      await api("/delivery-sync/settings", {
+        method: "PUT",
+        body: {
+          cronEnabled: form.cronEnabled,
+          intervalMinutes: minutes,
+          loggingEnabled: form.loggingEnabled,
+        },
+      });
+      onSaved("Delivery sync settings saved.");
+    } catch (e) {
+      setError(e.message);
+      setBusy(false);
+    }
+  }
+  return (
+    <Panel
+      title="Configuration"
+      subtitle="Changes apply immediately, without restarting the server."
+    >
+      <form className="sync-settings" onSubmit={save}>
+        <ErrorBox error={error} />
+        <label className="switch-field">
+          <input
+            type="checkbox"
+            role="switch"
+            className="switch"
+            checked={form.cronEnabled}
+            onChange={(e) =>
+              setForm({ ...form, cronEnabled: e.target.checked })
+            }
+          />
+          <span>
+            <b>Cron</b>
+            <small>
+              {form.cronEnabled
+                ? "On — statuses are checked automatically."
+                : "Off — statuses are only checked with Run Sync Now."}
+            </small>
+          </span>
+        </label>
+        <Field
+          label="Interval (minutes)"
+          hint={`How often the cron runs. ${MIN_INTERVAL_MINUTES} to ${MAX_INTERVAL_MINUTES} minutes.`}
+          error={
+            validInterval
+              ? ""
+              : `Enter a whole number from ${MIN_INTERVAL_MINUTES} to ${MAX_INTERVAL_MINUTES}.`
+          }
+        >
+          <input
+            type="number"
+            inputMode="numeric"
+            min={MIN_INTERVAL_MINUTES}
+            max={MAX_INTERVAL_MINUTES}
+            step={1}
+            disabled={!form.cronEnabled}
+            value={form.intervalMinutes}
+            onChange={(e) =>
+              setForm({ ...form, intervalMinutes: e.target.value })
+            }
+          />
+        </Field>
+        <label className="switch-field">
+          <input
+            type="checkbox"
+            role="switch"
+            className="switch"
+            checked={form.loggingEnabled}
+            onChange={(e) =>
+              setForm({ ...form, loggingEnabled: e.target.checked })
+            }
+          />
+          <span>
+            <b>Logging</b>
+            <small>
+              {form.loggingEnabled
+                ? "On — every run and its orders are saved to the database."
+                : "Off — syncs still update orders, but nothing is saved to the run history."}
+            </small>
+          </span>
+        </label>
+        <div className="sync-settings-actions">
+          <button
+            className="primary"
+            type="submit"
+            disabled={busy || !dirty || !validInterval}
+          >
+            <Save size={15} />
+            {busy ? "Saving…" : "Save settings"}
+          </button>
+        </div>
+      </form>
+    </Panel>
+  );
+}
+
 export function DeliverySyncLogs() {
   const [page, setPage] = useState(1),
     [selected, setSelected] = useState(null),
     [busy, setBusy] = useState(false),
     [error, setError] = useState(""),
+    [message, setMessage] = useState(""),
     status = useApi("/delivery-sync/status"),
     runs = useApi(`/delivery-sync/runs?page=${page}&limit=20`),
     last = status.data?.lastRun;
   async function runNow() {
     setBusy(true);
     setError("");
+    setMessage("");
     try {
       const run = await api("/delivery-sync/run", { method: "POST" });
-      setSelected(run.runId);
+      // A run made while logging is off has no saved details to open.
+      if (run.logged === false)
+        setMessage(
+          `Sync finished: ${number(run.attempted)} attempted, ${number(run.changed)} changed, ${number(run.failed)} failed. Logging is off, so this run was not saved.`,
+        );
+      else setSelected(run.runId);
       status.reload();
       runs.reload();
     } catch (e) {
@@ -161,6 +290,12 @@ export function DeliverySyncLogs() {
         </Can>
       </PageHeader>
       <ErrorBox error={error || status.error || runs.error} />
+      {message && (
+        <div className="success">
+          <Check size={17} />
+          {message}
+        </div>
+      )}
       {status.loading ? (
         <Loading />
       ) : (
@@ -178,6 +313,14 @@ export function DeliverySyncLogs() {
                 <b>{interval(status.data?.intervalMs)}</b>
               </div>
               <div>
+                <span>Logging</span>
+                <Badge
+                  tone={status.data?.loggingEnabled ? "delivered" : "cancelled"}
+                >
+                  {status.data?.loggingEnabled ? "Enabled" : "Disabled"}
+                </Badge>
+              </div>
+              <div>
                 <span>Last run</span>
                 <b>{dateTime(last?.startedAt)}</b>
               </div>
@@ -191,6 +334,18 @@ export function DeliverySyncLogs() {
               </div>
             </div>
           </Panel>
+          {status.data && (
+            <Can permission={P.deliverySync.configure}>
+              <SyncSettings
+                status={status.data}
+                onSaved={(text) => {
+                  setError("");
+                  setMessage(text);
+                  status.reload();
+                }}
+              />
+            </Can>
+          )}
           {last && (
             <>
               <div className="metrics-grid">
@@ -223,7 +378,11 @@ export function DeliverySyncLogs() {
           <>
             <DataTable
               rows={runs.data?.items}
-              empty="No delivery sync runs have been recorded yet."
+              empty={
+                status.data && status.data.loggingEnabled === false
+                  ? "Logging is off, so new runs are not recorded."
+                  : "No delivery sync runs have been recorded yet."
+              }
               columns={[
                 {
                   key: "startedAt",

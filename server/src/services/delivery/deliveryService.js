@@ -18,18 +18,16 @@ import {
 } from "./deliveryMapper.js";
 import { TERMINAL } from "../../constants.js";
 import { shipmentErrorInfo } from "./abexErrors.js";
+import { loadDeliverySyncSettings } from "./deliverySyncSettings.js";
 const SYNC_LOCK_ID = "delivery-status-sync";
 const SYNC_BATCH_SIZE = 20;
-const lockDuration = () =>
-  Math.max(
-    30 * 60 * 1000,
-    Number(process.env.DELIVERY_SYNC_INTERVAL_MS || 900000) * 2,
-  );
+const lockDuration = (intervalMs) =>
+  Math.max(30 * 60 * 1000, Number(intervalMs || 900000) * 2);
 const safeError = (error) =>
   sanitizeProviderData(
     error instanceof Error ? error.message : "Delivery synchronization failed.",
   );
-async function acquireSyncLock(runId) {
+async function acquireSyncLock(runId, intervalMs) {
   const owner = randomUUID(),
     now = new Date();
   try {
@@ -42,7 +40,7 @@ async function acquireSyncLock(runId) {
         $set: {
           owner,
           runId,
-          expiresAt: new Date(Date.now() + lockDuration()),
+          expiresAt: new Date(Date.now() + lockDuration(intervalMs)),
         },
       },
       { upsert: true, new: true },
@@ -57,10 +55,12 @@ const releaseSyncLock = (owner) =>
   owner
     ? DeliverySyncLock.deleteOne({ _id: SYNC_LOCK_ID, owner })
     : Promise.resolve();
-const extendSyncLock = (owner) =>
+const extendSyncLock = (owner, intervalMs) =>
   DeliverySyncLock.updateOne(
     { _id: SYNC_LOCK_ID, owner },
-    { $set: { expiresAt: new Date(Date.now() + lockDuration()) } },
+    {
+      $set: { expiresAt: new Date(Date.now() + lockDuration(intervalMs)) },
+    },
   );
 function syncSummary(run) {
   console.log(
@@ -309,11 +309,20 @@ export const deliveryService = {
   },
   async syncBatch({ trigger = "MANUAL" } = {}) {
     const started = Date.now(),
-      run = await DeliverySyncRun.create({
+      settings = await loadDeliverySyncSettings(),
+      // With logging switched off the run and its per-order rows are kept in
+      // memory only: orders and shipments are still updated, nothing is
+      // written to the sync history.
+      logging = settings.loggingEnabled,
+      intervalMs = settings.intervalMinutes * 60000,
+      run = new DeliverySyncRun({
         trigger,
         startedAt: new Date(started),
         status: "RUNNING",
-      });
+      }),
+      recordItem = (item) =>
+        logging ? DeliverySyncItem.create(item) : Promise.resolve();
+    if (logging) await run.save();
     let lockOwner;
     const counters = {
       scanned: 0,
@@ -338,9 +347,9 @@ export const deliveryService = {
       const finishedAt = new Date(),
         durationMs = Math.max(0, Date.now() - started);
       Object.assign(run, counters, { status, finishedAt, durationMs });
-      await run.save();
+      if (logging) await run.save();
       syncSummary(run);
-      return publicRun(run);
+      return { ...publicRun(run), logged: logging };
     };
     const persistError = async (entry, error) => {
       const message = safeError(error),
@@ -358,7 +367,7 @@ export const deliveryService = {
         },
         { $set: { syncStatus: "ERROR", lastError: message } },
       );
-      await DeliverySyncItem.create({
+      await recordItem({
         runId: run._id,
         orderId: entry.order._id,
         orderNumber: entry.order.orderNumber,
@@ -381,7 +390,7 @@ export const deliveryService = {
       counters.unchanged++;
     };
     try {
-      lockOwner = await acquireSyncLock(run._id);
+      lockOwner = await acquireSyncLock(run._id, intervalMs);
       if (!lockOwner) {
         return await finish("COMPLETED");
       }
@@ -451,7 +460,7 @@ export const deliveryService = {
         byAgencyAndProvider.get(key).push(entry);
       }
       for (const entries of byAgencyAndProvider.values()) {
-        await extendSyncLock(lockOwner);
+        await extendSyncLock(lockOwner, intervalMs);
         let service;
         try {
           service = new DeliverySyncService(
@@ -467,7 +476,7 @@ export const deliveryService = {
           continue;
         }
         for (let index = 0; index < entries.length; index += SYNC_BATCH_SIZE) {
-          await extendSyncLock(lockOwner);
+          await extendSyncLock(lockOwner, intervalMs);
           const batch = entries.slice(index, index + SYNC_BATCH_SIZE);
           const abex = service.client.provider === "ABEX";
           let parcelsByTracking;
@@ -504,7 +513,7 @@ export const deliveryService = {
                 parcel,
                 { requireStatus: true },
               );
-              await DeliverySyncItem.create({
+              await recordItem({
                 runId: run._id,
                 orderId: entry.order._id,
                 orderNumber: entry.order.orderNumber,

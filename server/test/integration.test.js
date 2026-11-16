@@ -3129,6 +3129,43 @@ test("delivery sync batches by agency, uses order terminal state, persists outco
   );
   assert.equal(detail.run.trigger, "MANUAL");
   assert.equal(detail.items.length, 2);
+
+  const initial = expectOk(await apiAgent.get("/api/delivery-sync/status"));
+  assert.equal(initial.cronEnabled, true);
+  assert.equal(initial.loggingEnabled, true);
+  assert.equal(
+    (
+      await apiAgent
+        .put("/api/delivery-sync/settings")
+        .send({ intervalMinutes: 0 })
+    ).status,
+    400,
+  );
+  const saved = expectOk(
+    await apiAgent.put("/api/delivery-sync/settings").send({
+      cronEnabled: false,
+      intervalMinutes: 5,
+      loggingEnabled: false,
+    }),
+  );
+  assert.equal(saved.enabled, false);
+  assert.equal(saved.intervalMs, 300000);
+  assert.equal(saved.loggingEnabled, false);
+  assert.equal(saved.nextRunAt, null);
+  try {
+    const silent = expectOk(await apiAgent.post("/api/delivery-sync/run"));
+    assert.equal(silent.logged, false);
+    assert.equal(silent.trigger, "MANUAL");
+    assert.equal(await DeliverySyncRun.countDocuments(), 2);
+    assert.equal(
+      await DeliverySyncItem.countDocuments({ runId: silent.runId }),
+      0,
+    );
+  } finally {
+    await mongoose.connection
+      .collection("deliverysyncsettings")
+      .deleteMany({});
+  }
 });
 
 test("delivery sync scans all non-terminal orders and reports eligibility skip reasons", async (t) => {
@@ -3412,6 +3449,14 @@ test("delivery sync log permissions protect history and manual execution indepen
   );
   assert.equal((await viewerAgent.get("/api/delivery-sync/runs")).status, 200);
   assert.equal((await viewerAgent.post("/api/delivery-sync/run")).status, 403);
+  assert.equal(
+    (
+      await viewerAgent
+        .put("/api/delivery-sync/settings")
+        .send({ cronEnabled: false })
+    ).status,
+    403,
+  );
   const deniedUser = expectOk(
     await apiAgent.post("/api/users").send({
       name: "No sync access",
