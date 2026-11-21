@@ -371,7 +371,7 @@ function Workspace({ user, logout }) {
                 </Can>
                 <Can permission={P.deliverySync.view}>
                   <NavLink to="/settings/delivery-sync">
-                    Delivery Sync Logs
+                    Delivery Synchronization
                   </NavLink>
                 </Can>
                 <Can permission={P.sessions.viewOwn}>

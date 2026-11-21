@@ -17,8 +17,10 @@ import {
 } from "../services/delivery/deliverySyncSettings.js";
 import { audit } from "../models/security.js";
 import { assert } from "../errors.js";
+import { deliveryWebhookAdminRoutes } from "./deliveryWebhookAdminRoutes.js";
 
 export const deliverySyncRoutes = Router();
+deliverySyncRoutes.use("/webhooks", deliveryWebhookAdminRoutes);
 
 const settingsSchema = z
   .object({

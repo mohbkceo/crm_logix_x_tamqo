@@ -164,7 +164,7 @@ export function Settings() {
         )}
         {can(user, P.deliverySync.view) && (
           <Link to="/settings/delivery-sync">
-            <Radio size={15} /> Delivery Sync Logs
+            <Radio size={15} /> Delivery Synchronization
           </Link>
         )}
       </div>

@@ -585,7 +585,7 @@ export class DeliverySyncService {
     return (await this.applyWithResult(orderId, parcel, options)).shipment;
   }
   async applyWithResult(orderId, parcel, options = {}) {
-    return transaction(async (session) => {
+    const apply = async (session) => {
       const s = await Shipment.findOne({
           orderId,
           ...options.reservation,
@@ -639,6 +639,7 @@ export class DeliverySyncService {
             beforeOrderStatus,
             afterOrderStatus: beforeOrderStatus,
             result: "SKIPPED",
+            code: "DELIVERY_OPERATION_BUSY",
             changed: false,
             terminalReached: false,
             error: "A courier operation is in progress.",
@@ -737,6 +738,11 @@ export class DeliverySyncService {
             changed: false,
             terminalReached: false,
             result: "ERROR",
+            code: waitingForReadiness ? "DELIVERY_READINESS_UNVERIFIED"
+              : productionBlocked ? "DELIVERY_PRODUCTION_BLOCKED"
+                : stale ? "DELIVERY_STALE_OBSERVATION"
+                  : wrongTracking || wrongReference ? "ABEX_IDENTITY_MISMATCH"
+                    : "DELIVERY_TRANSITION_REJECTED",
             error: s.lastError,
           },
         };
@@ -897,7 +903,10 @@ export class DeliverySyncService {
           error: s.lastError || null,
         },
       };
-    });
+    };
+    // The inbox worker commits its completion in the same transaction as the
+    // existing delivery effects. Polling/manual callers still own a transaction.
+    return options.session ? apply(options.session) : transaction(apply);
   }
   async refresh(orderId) {
     const s = await Shipment.findOne({ orderId });

@@ -2,6 +2,7 @@ import { useState } from "react";
 import { Check, RefreshCw, Radio, Save } from "lucide-react";
 import { P, Can } from "../access";
 import { api, number, useApi } from "../api";
+import { DeliveryWebhookEvents } from "./DeliveryWebhookEvents";
 import {
   Badge,
   DataTable,
@@ -175,7 +176,7 @@ function SyncSettings({ status, onSaved }) {
             <small>
               {form.cronEnabled
                 ? "On — statuses are checked automatically."
-                : "Off — statuses are only checked with Run Sync Now."}
+                : "Off — manual refresh and the independent webhook inbox remain available."}
             </small>
           </span>
         </label>
@@ -278,9 +279,9 @@ export function DeliverySyncLogs() {
   return (
     <>
       <PageHeader
-        eyebrow="SETTINGS / DELIVERY SYNC LOGS"
-        title="Delivery sync, without the guesswork."
-        description="Every automatic and manual status check is recorded here."
+        eyebrow="SETTINGS / DELIVERY"
+        title="Delivery Synchronization"
+        description="Monitor webhook reception, delivery polling and manual status checks."
       >
         <Can permission={P.deliverySync.run}>
           <button className="primary" disabled={busy} onClick={runNow}>
@@ -296,6 +297,7 @@ export function DeliverySyncLogs() {
           {message}
         </div>
       )}
+      <DeliveryWebhookEvents />
       {status.loading ? (
         <Loading />
       ) : (

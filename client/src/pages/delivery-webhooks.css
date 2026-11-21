@@ -1,0 +1,29 @@
+.delivery-webhook-summary .metric-rows > div,
+.delivery-webhook-details .metric-rows > div {
+  display: grid;
+  grid-template-columns: minmax(110px, 1fr) minmax(0, 1.6fr);
+}
+
+.delivery-webhook-summary .metric-rows b,
+.delivery-webhook-details .metric-rows b {
+  min-width: 0;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: end;
+}
+
+.delivery-webhook-details .metric-rows {
+  grid-template-columns: minmax(0, 1fr);
+  padding: 0 0 20px;
+}
+
+.delivery-webhook-summary > .notice {
+  padding: 0 20px 20px;
+  margin: 0;
+}
+
+@media (max-width: 600px) {
+  .delivery-webhook-summary > .notice {
+    padding: 0 14px 14px;
+  }
+}

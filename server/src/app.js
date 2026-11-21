@@ -27,6 +27,7 @@ import { securityRoutes } from "./routes/securityRoutes.js";
 import { agencyRoutes, verifyAgencyConnection } from "./routes/agencyRoutes.js";
 import { teamRoutes, employeeOptions } from "./routes/teamRoutes.js";
 import { deliverySyncRoutes } from "./routes/deliverySyncRoutes.js";
+import { abexWebhookRoutes } from "./routes/abexWebhookRoutes.js";
 import { P, can, requirePermission, orderScope } from "./authorization.js";
 import { deliveryService } from "./services/delivery/deliveryService.js";
 import { normalizePhone } from "./domain/order.js";
@@ -49,6 +50,9 @@ app.use((req, res, next) => {
 app.use(
   helmet({ contentSecurityPolicy: config.production ? undefined : false }),
 );
+// Signed server-to-server requests need the original bytes. Only this exact
+// route precedes JSON parsing, browser-origin checks, and CRM authentication.
+app.use("/api/webhooks/delivery/abex", abexWebhookRoutes);
 app.use(cors({ origin: config.clientUrl, credentials: true }));
 app.use(express.json({ limit: "150kb" }), cookieParser());
 app.use(

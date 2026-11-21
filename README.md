@@ -47,6 +47,7 @@ The seed script is repeatable and uses insert-only catalog defaults. It does not
 | `npm run lint`                                | ESLint for JavaScript/JSX                                                             |
 | `npm test`                                    | Domain and transaction-backed HTTP/service tests with an isolated MongoDB replica set |
 | `npm run build`                               | Build React into `client/dist`                                                        |
+| `npm run test:webhook-browser`                | Signed webhook reception and delivery monitoring/retry UI on an isolated database     |
 | `npm start`                                   | Start Express; serves `client/dist` if built                                          |
 | `npm run test:browser`                        | Browser workflows against a separate disposable database and port 4019                |
 | `npm run format`                              | Format project source with Prettier                                                   |
@@ -55,6 +56,8 @@ The seed script is repeatable and uses insert-only catalog defaults. It does not
 The browser test uses installed Microsoft Edge on Windows and Playwright Chromium elsewhere. On other platforms install the browser once with `npx playwright install chromium`. Screenshots are written under `.local/qa`. Browser test records never enter the preview database.
 
 ## Configuration and authentication
+
+For inbound ABEX signing, the durable event inbox, monitoring and explicit polling cutover, see [ABEX webhooks](docs/abex-webhooks.md). The delivery event contract is currently unverified, so webhook mutations remain disabled and scheduled polling should stay enabled.
 
 All environment configuration is server-side. There are no `VITE_DELIVERY_*` secrets.
 
