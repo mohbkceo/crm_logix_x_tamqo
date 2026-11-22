@@ -35,7 +35,11 @@ const messages = {
   WEBHOOK_UNKNOWN_EVENT: "Event topic has no supported parcel notification.",
   WEBHOOK_SCHEMA_INVALID: "Provider event schema requires review.",
   WEBHOOK_SHIPMENT_NOT_LINKED:
-    "No linked ABEX shipment in the configured agency; resolution will be retried.",
+    "No matching CRM ABEX shipment by parcel UUID or saved tracking. Retry checks the CRM only; verify the order's agency and shipment tracking. No provider scan or order creation is performed.",
+  ABEX_BACKGROUND_DEFERRED:
+    "Webhook read queued to preserve API capacity for order intake or respect the provider cooldown. No retry budget consumed.",
+  ABEX_RATE_LIMIT:
+    "ABEX rate limit reached. Background reads are paused through the shared provider cooldown.",
   WEBHOOK_AGENCY_UNCONFIGURED:
     "Bind the destination to its CRM agency before processing supported notifications.",
   WEBHOOK_AGENCY_MISMATCH:
@@ -124,6 +128,7 @@ export async function processWebhookClaim(
       adapter.contractVersion !== event.contractVersion
     )
       throw new WebhookProcessingError("WEBHOOK_CONTRACT_CHANGED");
+    const refreshStartedAt = new Date();
     const refresh = await prepare(event, config);
     await transaction(async (session) => {
       // Touch the fenced inbox row first: a reclaimed/expired lease cannot
@@ -137,15 +142,19 @@ export async function processWebhookClaim(
       );
       if (owned.matchedCount !== 1)
         throw new WebhookProcessingError("WEBHOOK_LEASE_LOST", true);
-      const { outcome } = await refresh.service.applyWithResult(
-        refresh.shipment.orderId,
-        refresh.parcel,
-        {
+      const { outcome } = await refresh.service
+        .applyWithResult(refresh.shipment.orderId, refresh.parcel, {
           session,
           reservation: refresh.reservation,
           requireStatus: true,
-        },
-      );
+        })
+        .catch((error) => {
+          // A reservation changed during the provider read. Resolve it again;
+          // never discard a valid event or force a stale shipment link.
+          if (error.status === 404)
+            throw new WebhookProcessingError("CONFLICT", true);
+          throw error;
+        });
       if (outcome.result === "SKIPPED")
         throw new WebhookProcessingError(
           outcome.code || "DELIVERY_OPERATION_BUSY",
@@ -171,12 +180,61 @@ export async function processWebhookClaim(
           orderId: refresh.shipment.orderId,
           orderNumber: refresh.shipment.externalId,
           shipmentId: refresh.shipment._id,
-          trackingNumber: refresh.shipment.tracking,
+          trackingNumber: refresh.parcel.tracking,
         },
         session,
       );
+      if (!stale && !["ERROR", "UNKNOWN_STATUS"].includes(outcome.result)) {
+        // A fresh authoritative read covers notifications already queued for
+        // this exact parcel. Never absorb a later arrival or another claim.
+        await DeliveryWebhookEvent.updateMany(
+          {
+            _id: { $ne: event._id },
+            provider: event.provider,
+            destinationId: event.destinationId,
+            agencyId: event.agencyId,
+            contractVersion: event.contractVersion,
+            "notification.parcelId": event.notification.parcelId,
+            "notification.trackingNumber":
+              event.notification.trackingNumber ?? null,
+            processingStatus: { $in: ["RECEIVED", "RETRY_PENDING"] },
+            receivedAt: { $lte: refreshStartedAt },
+          },
+          {
+            $set: {
+              processingStatus: "PROCESSED",
+              resultCode: "WEBHOOK_COALESCED",
+              processedAt: new Date(),
+              expiresAt: terminalExpiry(config),
+              orderId: refresh.shipment.orderId,
+              orderNumber: refresh.shipment.externalId,
+              shipmentId: refresh.shipment._id,
+              trackingNumber: refresh.parcel.tracking,
+              lastErrorCode: "",
+              lastErrorMessage: "",
+            },
+            $unset: { nextRetryAt: 1, lockedUntil: 1, lockToken: 1 },
+          },
+          { session },
+        );
+      }
     });
   } catch (error) {
+    if (error.code === "ABEX_BACKGROUND_DEFERRED") {
+      await DeliveryWebhookEvent.updateOne(claimFilter(event), {
+        $set: {
+          processingStatus: "RETRY_PENDING",
+          nextRetryAt: new Date(
+            Math.max(Date.now() + 5000, +error.retryAt || 0),
+          ),
+          lastErrorCode: error.code,
+          lastErrorMessage: messages[error.code],
+        },
+        $inc: { retryCount: -1 },
+        $unset: { lockToken: 1, lockedUntil: 1 },
+      });
+      return;
+    }
     const failure = safeFailure(error);
     const retry = failure.retryable && event.retryCount < config.maxAttempts;
     await DeliveryWebhookEvent.updateOne(claimFilter(event), {
@@ -188,8 +246,17 @@ export async function processWebhookClaim(
         ...(retry
           ? {
               nextRetryAt: new Date(
-                Date.now() +
-                  Math.min(3600000, 15000 * 2 ** (event.retryCount - 1)),
+                Math.max(
+                  +error.retryAt || 0,
+                  Date.now() +
+                    Math.min(
+                      3600000,
+                      (failure.code === "WEBHOOK_SHIPMENT_NOT_LINKED"
+                        ? 300000
+                        : 15000) *
+                        2 ** (event.retryCount - 1),
+                    ),
+                ),
               ),
             }
           : {}),

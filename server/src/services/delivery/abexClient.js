@@ -20,6 +20,7 @@ import {
   validateAbexOrder,
 } from "./abexMapper.js";
 import { abexAssert, abexError } from "./abexErrors.js";
+import { retryAfterDate } from "./abexApiTraffic.js";
 import {
   choosePickupHub,
   describePickupHubs,
@@ -122,18 +123,28 @@ export const abexCatalogs = [
 ];
 const territoryCache = new Map();
 const hubCache = new Map();
+const workflowCache = new Map();
 const catalogCacheMs = 10 * 60 * 1000;
 
 // Short-lived, per-agency cache for ABEX reference data. Empty and failed
 // lookups are never kept, so a repaired configuration is picked up at once.
-async function cachedCatalog(cache, key, load) {
+async function cachedCatalog(cache, key, load, { background = false } = {}) {
   const existing = cache.get(key);
-  if (existing?.expiresAt > Date.now()) return existing.result;
+  if (
+    existing?.expiresAt > Date.now() &&
+    (background || !existing.background || existing.settled)
+  )
+    return existing.result;
   if (cache.size >= 500) cache.delete(cache.keys().next().value);
-  const entry = { expiresAt: Date.now() + catalogCacheMs, result: load() };
+  const entry = {
+    expiresAt: Date.now() + catalogCacheMs,
+    result: load(),
+    background,
+  };
   cache.set(key, entry);
   try {
     const rows = await entry.result;
+    entry.settled = true;
     if (!rows.length && cache.get(key) === entry) cache.delete(key);
     return rows;
   } catch (error) {
@@ -145,6 +156,7 @@ async function cachedCatalog(cache, key, load) {
 export function clearAbexCatalogCache() {
   territoryCache.clear();
   hubCache.clear();
+  workflowCache.clear();
 }
 
 export class AbexClient {
@@ -153,11 +165,18 @@ export class AbexClient {
   #agencyVersion;
   #workflows;
   #retryAt = 0;
+  #traffic;
 
-  constructor({ credentials = {}, settings = {}, agencyVersion } = {}) {
+  constructor({
+    credentials = {},
+    settings = {},
+    agencyVersion,
+    traffic,
+  } = {}) {
     this.#credentials = credentials;
     this.#settings = settings;
     this.#agencyVersion = agencyVersion;
+    this.#traffic = traffic;
     this.provider = "ABEX";
     this.creationEndpoint = ABEX_CREATE_PATH;
     const timeout = Number(process.env.DELIVERY_TIMEOUT_MS || 15000);
@@ -204,8 +223,9 @@ export class AbexClient {
       "X-Tenant": tenantId,
       ...(bearerToken ? { Authorization: `Bearer ${bearerToken}` } : {}),
     };
-    const send = () =>
-      this.http.request({
+    const send = async () => {
+      await this.#traffic?.beforeRequest();
+      return this.http.request({
         method,
         url,
         headers,
@@ -214,12 +234,12 @@ export class AbexClient {
         // Lets a caller read a documented non-2xx body (bulk create's 400).
         ...(raw ? { validateStatus: (code) => accepted.includes(code) } : {}),
       });
-    const rememberRateLimit = (error) => {
+    };
+    const rememberRateLimit = async (error) => {
       if (httpStatus(error) !== 429) return;
-      const seconds = Number(error.response?.headers?.["retry-after"] ?? 60);
-      this.#retryAt =
-        Date.now() +
-        (Number.isFinite(seconds) && seconds >= 0 ? seconds : 60) * 1000;
+      const until = retryAfterDate(error.response?.headers?.["retry-after"]);
+      this.#retryAt = +until;
+      await this.#traffic?.rateLimited(until);
     };
     if (Date.now() < this.#retryAt) throw abexError("ABEX_RATE_LIMIT");
 
@@ -228,12 +248,13 @@ export class AbexClient {
       try {
         response = await send();
       } catch (error) {
-        rememberRateLimit(error);
+        await rememberRateLimit(error);
         const upstream = httpStatus(error);
         const retryDelay =
           upstream === 429 ? Math.max(0, this.#retryAt - Date.now()) : 250;
         if (
           !read ||
+          this.#traffic?.background ||
           retryDelay > 2000 ||
           !(
             [429, 502, 503, 504].includes(upstream) ||
@@ -245,7 +266,9 @@ export class AbexClient {
         response = await send();
       }
     } catch (error) {
-      rememberRateLimit(error);
+      if (["ABEX_BACKGROUND_DEFERRED", "ABEX_RATE_LIMIT"].includes(error.code))
+        throw error;
+      await rememberRateLimit(error);
       this.lastResponseStatus = httpStatus(error);
       const code =
         failureCodes[this.lastResponseStatus] ||
@@ -259,7 +282,9 @@ export class AbexClient {
       // A timeout, dropped connection or 5xx says nothing about whether ABEX
       // processed the request. A read can simply be repeated. A write must be
       // verified first and is never repeated automatically.
-      const unknownOutcome = ["ABEX_TIMEOUT", "ABEX_UNAVAILABLE"].includes(code);
+      const unknownOutcome = ["ABEX_TIMEOUT", "ABEX_UNAVAILABLE"].includes(
+        code,
+      );
       const base = abexError(code).message;
       const failure = abexError(code, {
         ...(fields.length
@@ -277,6 +302,7 @@ export class AbexClient {
             }
           : {}),
       });
+      if (code === "ABEX_RATE_LIMIT") failure.retryAt = new Date(this.#retryAt);
       // Provider bodies may echo parcel data or credentials. Store only the
       // status, our error code, and labels from the allowlist.
       const traceId = providerTraceId(error.response?.data);
@@ -516,10 +542,15 @@ export class AbexClient {
       : [];
     const results = [];
     for (const row of destinations) {
-      const wilaya = wilayas.find((entry) => String(entry._id) === row.wilayaId);
-      const territories = wilaya ? await this.#territories(wilaya.agencyId) : [];
+      const wilaya = wilayas.find(
+        (entry) => String(entry._id) === row.wilayaId,
+      );
+      const territories = wilaya
+        ? await this.#territories(wilaya.agencyId)
+        : [];
       const live = territories.find(
-        (entry) => entry.districtTerritoryId.toLowerCase() === row.districtTerritoryId,
+        (entry) =>
+          entry.districtTerritoryId.toLowerCase() === row.districtTerritoryId,
       );
       const hub = row.hubId
         ? hubs.find((entry) => entry.id === row.hubId)
@@ -559,7 +590,10 @@ export class AbexClient {
   // Turns an administrator's choice into a verified mapping row. Territory
   // UUIDs always come from the live catalog under the CRM wilaya, and the hub
   // must be an active pickup office in that same wilaya.
-  async resolveDestinationMapping(wilaya, { commune, districtTerritoryId, hubId }) {
+  async resolveDestinationMapping(
+    wilaya,
+    { commune, districtTerritoryId, hubId },
+  ) {
     const territories = await this.#territories(wilaya.agencyId);
     abexAssert(territories.length, "ABEX_MAPPING_INVALID", {
       field: "wilayaId",
@@ -567,7 +601,8 @@ export class AbexClient {
     });
     const match = districtTerritoryId
       ? territories.find(
-          (row) => row.districtTerritoryId.toLowerCase() === districtTerritoryId,
+          (row) =>
+            row.districtTerritoryId.toLowerCase() === districtTerritoryId,
         )
       : findAbexCommune(territories, commune);
     abexAssert(match, "ABEX_MAPPING_INVALID", {
@@ -576,9 +611,10 @@ export class AbexClient {
     });
     let hub;
     if (hubId) {
-      hub = pickupHubCandidates(await this.#pickupHubs(), match).wilayaHubs.find(
-        (entry) => entry.id === hubId,
-      );
+      hub = pickupHubCandidates(
+        await this.#pickupHubs(),
+        match,
+      ).wilayaHubs.find((entry) => entry.id === hubId);
       abexAssert(hub, "ABEX_MAPPING_INVALID", {
         field: "hubId",
         message: `That hub is not an active ABEX pickup office in ${wilaya.name}.`,
@@ -645,12 +681,16 @@ export class AbexClient {
         new Set(references).size === references.length,
       "Every bulk parcel needs its own order reference.",
     );
-    const { status, data } = await this.#request("POST", ABEX_BULK_CREATE_PATH, {
-      data: { parcels: payloads },
-      status: [200, 207, 400],
-      read: false,
-      raw: true,
-    });
+    const { status, data } = await this.#request(
+      "POST",
+      ABEX_BULK_CREATE_PATH,
+      {
+        data: { parcels: payloads },
+        status: [200, 207, 400],
+        read: false,
+        raw: true,
+      },
+    );
     return parseAbexBulkResult(status, data, payloads, (value) =>
       this.sanitize(value),
     );
@@ -699,8 +739,8 @@ export class AbexClient {
   }
 
   async #getWorkflows() {
-    this.#workflows ??= this.#allPages("workflows")
-      .then((items) =>
+    const load = () =>
+      this.#allPages("workflows").then((items) =>
         items.map((workflow) => {
           if (
             !isAbexId(workflow?.id) ||
@@ -718,11 +758,17 @@ export class AbexClient {
             throw abexResponseError();
           return { ...workflow, states: workflow.states || [] };
         }),
-      )
-      .catch((error) => {
-        this.#workflows = undefined;
-        throw error;
-      });
+      );
+    this.#workflows ??= (
+      this.#agencyVersion
+        ? cachedCatalog(workflowCache, this.#agencyVersion, load, {
+            background: this.#traffic?.background,
+          })
+        : load()
+    ).catch((error) => {
+      this.#workflows = undefined;
+      throw error;
+    });
     return this.#workflows;
   }
 
@@ -733,6 +779,12 @@ export class AbexClient {
       409,
       "ABEX_INVALID_TRACKING",
     );
+    // Warm reference data before the parcel read. If intake interrupts the
+    // second request, the catalog remains cached for the next queued attempt.
+    const workflows =
+      this.#traffic?.background && this.#settings.states?.length
+        ? await this.#getWorkflows()
+        : undefined;
     const data = await this.#request(
       "GET",
       `${root}/parcels/${encodeURIComponent(reference.tracking)}`,
@@ -755,7 +807,7 @@ export class AbexClient {
     if (parcel.stateId && this.#settings.states?.length) {
       const { workflow, normalizedStatus } = abexState(
         this.#settings,
-        await this.#getWorkflows(),
+        workflows || (await this.#getWorkflows()),
         parcel,
       );
       parcel.workflowId = workflow?.id;

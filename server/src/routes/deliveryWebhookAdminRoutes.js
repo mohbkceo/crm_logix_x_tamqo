@@ -13,6 +13,7 @@ import { audit } from "../models/security.js";
 import { transaction } from "../services/orderService.js";
 import { webhookConfig } from "../services/delivery/webhooks/webhookConfig.js";
 import { abexWebhookAdapter } from "../services/delivery/webhooks/abexWebhookAdapter.js";
+import { backgroundIntervalMs } from "../services/delivery/abexApiTraffic.js";
 
 export const deliveryWebhookAdminRoutes = Router();
 const routes = deliveryWebhookAdminRoutes;
@@ -125,6 +126,7 @@ routes.get("/status", async (req, res) => {
     receiverConfigured: config.configured,
     processingEnabled: config.processingEnabled,
     agencyBound: Boolean(config.agencyId),
+    backgroundRequestIntervalSeconds: backgroundIntervalMs() / 1000,
     contractVerified: abexWebhookAdapter.contractVerified,
     contractVersion: abexWebhookAdapter.contractVersion,
     supportedEventTypes: abexWebhookAdapter.supportedEventTypes,

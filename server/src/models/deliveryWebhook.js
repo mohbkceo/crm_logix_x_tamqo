@@ -67,6 +67,13 @@ schema.index({
 });
 schema.index({ receivedAt: -1, _id: -1 });
 schema.index({ agencyId: 1, receivedAt: -1 });
+schema.index({
+  destinationId: 1,
+  agencyId: 1,
+  "notification.parcelId": 1,
+  processingStatus: 1,
+  receivedAt: 1,
+});
 schema.index({ expiresAt: 1 }, { expireAfterSeconds: 0 });
 export const DeliveryWebhookEvent = mongoose.model(
   "DeliveryWebhookEvent",

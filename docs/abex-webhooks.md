@@ -1,6 +1,6 @@
 # ABEX inbound webhooks
 
-Implementation status: secure receiver, durable inbox, worker, targeted-refresh integration, admin monitoring and recovery are implemented. **The two parcel notification topics below are verified from real ABEX portal deliveries and are supported by the adapter. Keep polling enabled until the deployed release processes an approved live event successfully.** No live destination, signing secret, production setting or shipment was changed during implementation or read-only contract inspection.
+Implementation status: secure receiver, durable inbox, worker, targeted-refresh integration, admin monitoring and recovery are implemented. **The two parcel notification topics below are verified from real ABEX portal deliveries and are supported by the adapter. Cron can remain disabled; targeted webhook reads are paced and yield to order intake. Validate an approved live event before relying on webhook coverage.** No live destination, signing secret, production setting or shipment was changed during implementation or read-only contract inspection.
 
 ## Verified contract and live acceptance
 
@@ -25,10 +25,10 @@ The portal also lists `parcel.isReturn.updated`, `courier.state.updated` and `we
 
 To accept the deployed feature:
 
-1. Deploy/restart every backend and rebuild the client. Configure the correct existing CRM ABEX agency ObjectId, valid signing secret and processing enablement; retain polling.
+1. Deploy/restart every backend and rebuild the client. Configure the correct existing CRM ABEX agency ObjectId, valid signing secret and processing enablement. Keep Cron disabled when provider-wide polling affects order intake.
 2. In Delivery Synchronization, verify the two supported topics and enablement, then observe an approved pilot notification reaching `PROCESSED` and the corresponding existing order matching its current authenticated ABEX state. HTTP 200 alone proves inbox acceptance, not business processing.
 3. Investigate `FAILED`, `RETRY_PENDING`, identity, production-readiness or unmapped-status outcomes through the existing review/reconciliation tools. Never force an order transition or infer cash collection from a notification.
-4. Disable polling only after that live acceptance. Unknown/new topics need their own verified contract before extending the allowlist.
+4. Unknown/new topics need their own verified contract before extending the allowlist. Missed notifications and unmatched shipments need individual review; webhook-only mode cannot guarantee recovery of events ABEX never delivered.
 
 The original receiver stored unverified events only as hashes/metadata, so they cannot be reparsed from CRM history alone. After deployment, the ABEX delivery portal's **Retry** action can supply a fresh authenticated copy of a supported body. The receiver can atomically reclassify an old `unverified / ABEX_CONTRACT_UNVERIFIED` record in `IGNORED` or unclaimed `RECEIVED` state only when the event ID, raw body hash and original agency binding match. It preserves the unique record and total attempt count, clears only the old terminal metadata and queues the supported refresh. It never upgrades an event that already had delivery effects or redirects it to a different agency. An active old claim returns retryable `503 / WEBHOOK_UPGRADE_BUSY`; retry once that lease/processing has completed. Different bytes under the same ID still return 409. Otherwise recover via manual sync or new notifications.
 
@@ -78,6 +78,7 @@ ABEX_WEBHOOK_PROCESSING_ENABLED=false
 ABEX_WEBHOOK_RETENTION_DAYS=30
 ABEX_WEBHOOK_FAILED_RETENTION_DAYS=90
 ABEX_WEBHOOK_MAX_ATTEMPTS=8
+ABEX_WEBHOOK_REQUEST_INTERVAL_SECONDS=15
 ```
 
 `ABEX_WEBHOOK_SECRET` must be `whsec_` plus canonical base64 encoding of at least 32 bytes. Use the **rotated destination signing secret from ABEX**, not its API token. `ABEX_WEBHOOK_AGENCY_ID` is the existing CRM ABEX agency's 24-character ObjectId. It is captured at reception; changing the binding does not redirect already accepted events to another agency. The destination UUID is mandatory when enabling reception. Enabled reception with an invalid/missing secret or destination aborts production startup and fails closed at request time. Invalid agency IDs abort startup too.
@@ -89,7 +90,7 @@ ABEX_WEBHOOK_MAX_ATTEMPTS=8
 1. Back up MongoDB and confirm it is a replica set with transaction support. Deploy the reviewed release through the normal deployment process.
 2. Run `npm ci`, `npm run lint`, `npm test`, `npm run build`, and the browser checks listed below. Retain the existing session secret, credential encryption key, database URI, ABEX API credentials and frontend origin. Do not run the ABEX migration cutover again for webhook setup.
 3. Obtain/rotate the destination signing secret through the existing ABEX destination UI or authorized provider support. The public API documents authenticated `GET /api/v1/webhooks/endpoints/{endpointId}/secret` for supplier admins. The inspected Settings page has a **Rotate** control and says the previous secret expires after 24 hours; no credential rotation was performed during inspection. Keep the destination and URL unchanged. Coordinate the environment update across all backend instances; use the provider's retry facility for deliveries during the switch.
-4. Set `ABEX_WEBHOOK_ENABLED=true`, the real signing secret, the destination UUID, and its CRM agency ID. Set `ABEX_WEBHOOK_PROCESSING_ENABLED=true` to process supported notifications and surface health. Keep saved `cronEnabled=true`. Restart every backend instance. The process waits for the unique index before accepting requests and starts the independent inbox worker.
+4. Set `ABEX_WEBHOOK_ENABLED=true`, the real signing secret, the destination UUID, and its CRM agency ID. Set `ABEX_WEBHOOK_PROCESSING_ENABLED=true` to process supported notifications and surface health. Keep saved `cronEnabled=false` when bulk polling affects intake. Restart every backend instance. The process waits for the unique index before accepting requests and starts the independent inbox worker.
 5. Route the exact HTTPS path through the existing reverse proxy to Express, preserving body bytes, content type and signature headers. Do not add browser login/CSRF interception, rewrite the body or transparently decompress it. For Nginx, preserve the existing `/api/` upstream behavior or use an exact location equivalent to:
 
    ```nginx
@@ -129,13 +130,19 @@ For unavailable MongoDB, fix connectivity/replica-set health; `503` requests sho
 
 Stop reception with `ABEX_WEBHOOK_ENABLED=false`; pause processing separately with `ABEX_WEBHOOK_PROCESSING_ENABLED=false`. Do not delete inbox rows to clear a backlog. Failed rows have a finite review window, so resolve/export sanitized operational records before their configured expiry. No raw customer payload archive exists.
 
-## Explicit polling migration and rollback
+## Webhook operation with Cron disabled
 
-Run polling and webhooks together during validation. Supported updates share the same authoritative business transaction, so overlap does not duplicate transition events or return expenses. The independent worker never starts provider-wide polling.
+The inbox worker is independent of the bulk delivery scheduler. Leave the saved Cron switch disabled; startup does not overwrite it. Confirm no new `CRON` runs across every backend after its next settings check (a running sync may finish). Supported updates share the authoritative business transaction, so concurrent manual reads do not duplicate transitions or return expenses.
 
-Only after a reviewed adapter release and real ABEX pilot acceptance should an administrator disable **Cron** and save settings (authenticated `PUT /api/delivery-sync/settings` with `{ "cronEnabled": false }`). Confirm saved settings and no new `CRON` runs/provider-wide polling across every instance after its next settings check; an already running sync may finish. Startup does not overwrite saved settings. The webhook worker continues claiming/retrying inbox events while cron is off. Run Sync Now, per-order tracking refresh and reconciliation remain available.
+All production ABEX clients share a MongoDB traffic row keyed by a SHA-256 digest of the API key/tenant scope; credentials are never stored there. Background reads reserve one request slot every 15 seconds by default, across workers and destinations. Set `ABEX_WEBHOOK_REQUEST_INTERVAL_SECONDS` to an integer from 5 to 30 to tune this conservative starting rate to the actual account quota. Invalid values use 15 seconds. This is an application budget, not a claim about ABEX's undocumented quota. Each actual background HTTP request, including workflow catalog pages, consumes a slot; background requests do not retry inline on failure. Active foreground requests reserve a 30-second quiet window for order intake and bypass background pacing. A request already in flight cannot be preempted. HTTP 429 cooldowns (numeric or HTTP-date `Retry-After`, default 60 seconds) are persisted with majority acknowledgement and respected by new clients/processes. Queue deferrals preserve the event without consuming its failure retry budget. Workflow catalogs are cached for ten minutes per agency configuration version and warmed before background parcel reads; foreground catalog loads never wait for an in-progress background load.
 
-For webhook outages, re-enable saved `cronEnabled=true`, use Run Sync Now to catch up, and inspect inbox failures. If rolling back application code, retain inbox collections and TTL/index definitions, enable polling first, and drain/stop the independent worker cleanly. Do not switch historical Procolis shipments to ABEX or recreate parcels as a recovery action.
+One successful fresh read completes already queued supported notifications for the same destination, agency, contract, parcel UUID and tracking. Notifications arriving after the refresh began, and claims owned by other workers, are excluded. Completion and all business effects are atomic. Each notification keeps its own durable history; covered rows show `WEBHOOK_COALESCED`.
+
+Missing UUID links are repaired only for existing `ABEX` shipments with exactly matching saved tracking in the bound CRM agency. A known local UUID with missing tracking may use the signed tracking for its single targeted read. In both cases the authenticated response must match the notification UUID, tracking, CRM order number and returned tenant before the existing guarded transaction saves anything. Concurrent link changes invalidate the reservation and retry. Production readiness, parcel creation locks and normal status/finance rules still apply; no parcel/order is created and historical Procolis/manual/imported shipments are never relabeled.
+
+If neither the parcel UUID nor saved tracking matches a CRM ABEX shipment, the worker makes **zero ABEX calls**. It retries the local lookup from five minutes with exponential backoff, bounded by the normal attempt budget. Verify the actual CRM order, its ABEX agency and its saved shipment tracking. External parcels without CRM orders cannot be linked automatically. After correcting a real CRM shipment, use the scoped event **Retry** action. Do not assign unrelated order numbers or change agency IDs to make an event match.
+
+For webhook outages or gaps, inspect the provider delivery log and use authenticated redelivery or a per-order tracking refresh after quota recovery. Avoid Run Sync Now while rate limited because it remains a bulk operation. If rolling back code, retain inbox/traffic collections and indexes, stop the worker cleanly, and choose a recovery plan compatible with available API capacity. Do not enable bulk polling automatically or recreate parcels as recovery. Events outside the two verified topics, including changes with no subsequent supported notification, still need manual review.
 
 ## Verification
 
@@ -156,12 +163,12 @@ The webhook tests use generated signing keys, real HTTP requests, isolated Mongo
 
 ## Validation results
 
-Final validation on 2026-11-22 after adding the verified parcel adapter:
+Final validation on 2026-11-22 after adding targeted link recovery and intake-priority traffic protection:
 
 | Command | Actual final result |
 | --- | --- |
 | `npm run lint` | Passed. |
-| `npm test` | 271 passed, 0 failed, 0 skipped; includes 64 webhook tests and 207 existing tests. |
+| `npm test` | 290 passed, 0 failed, 0 skipped; includes 83 webhook tests and 207 existing tests. |
 | `npm run build` | Passed. |
 | `npm run test:webhook-browser` | Passed: signed reception, monitoring, pagination, filters, sanitized details, audited recovery and desktop/390px mobile layout. Screenshots inspected; long mobile values wrap. |
 | `npm run test:delivery-browser` | Passed: ABEX parcel creation, edit confirmation, readiness, pending/rejected shipments and manual agency behavior. |
@@ -173,6 +180,8 @@ An intermediate future-timestamp fixture was moved from 301 to 360 seconds ahead
 
 The 2026-11-22 adapter tests use the production parser for both observed topics and exercise malformed payloads, unsigned topic headers, authoritative refresh rather than snapshot application, and concurrent authenticated reclassification of legacy ignored events. The initial malformed-data fixtures were corrected to preserve explicit missing/null values rather than supplying defaults. The webhook browser test uses port 4028 so it can run independently from the readiness suite on 4026; the latter was rerun successfully after diagnosing the shared-port collision.
 
+The traffic-protection tests additionally verify shared cooldowns across new clients, numeric/HTTP-date Retry-After parsing, actual paced loopback HTTP reads, foreground interruption and warm-catalog recovery, retry-budget preservation under repeated deferrals, account isolation, catalog-version invalidation, concurrent link reservations, zero provider calls for unmanaged shipments, and twelve queued parcel notifications sharing one refresh and one return expense. The legacy rate-limit creation test now explicitly simulates quota recovery and checks that a fresh client cannot bypass a live cooldown. Initial failures exposed the old immediate-retry assumption and a stale repair reservation during concurrent polling; both were corrected before the final run.
+
 ## Changed file inventory
 
 | File | Purpose |
@@ -180,6 +189,7 @@ The 2026-11-22 adapter tests use the production parser for both observed topics 
 | `server/src/app.js` | Mounts only the signed receiver before browser middleware and login. |
 | `server/src/index.js` | Validates webhook configuration, awaits indexes, starts/drains the independent worker. |
 | `server/src/models/deliveryWebhook.js` | Durable event model, uniqueness, lease/retention indexes and worker health. |
+| `server/src/models/abexApiTraffic.js`, `server/src/services/delivery/abexApiTraffic.js` | Shared credential-scope pacing, intake priority and persistent provider cooldowns. |
 | `server/src/routes/abexWebhookRoutes.js` | HTTP method/type/size/rate controls, authentication and durable acknowledgement. |
 | `server/src/routes/deliveryWebhookAdminRoutes.js` | Scoped health/history/detail APIs and audited recovery. |
 | `server/src/routes/deliverySyncRoutes.js` | Mounts the authenticated webhook monitoring routes. |
@@ -190,6 +200,7 @@ The 2026-11-22 adapter tests use the production parser for both observed topics 
 | `server/src/services/delivery/webhooks/webhookReconciliationService.js` | Resolves only a server-bound existing parcel and reads its authoritative state. |
 | `server/src/services/delivery/webhooks/webhookProcessor.js` | Fenced worker, atomic completion with business effects, bounded retries and health. |
 | `server/src/services/delivery/deliverySyncService.js` | Allows a shared transaction and adds stable observation result codes; retains existing status rules. |
+| `server/src/services/delivery/abexClient.js`, `server/src/services/delivery/deliveryProviderFactory.js` | Apply the shared traffic policy to production ABEX clients and cache workflow reference data. |
 | `client/src/pages/DeliveryWebhookEvents.jsx` | Configuration/reception/processing overview, filters, pagination, details and eligible retry. |
 | `client/src/pages/delivery-webhooks.css` | Scoped wrapping of long identifiers and explanations on mobile. |
 | `client/src/pages/DeliverySyncLogs.jsx` | Integrates webhooks into Delivery Synchronization while retaining polling controls/history. |

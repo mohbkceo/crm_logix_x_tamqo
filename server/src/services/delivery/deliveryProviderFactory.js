@@ -3,6 +3,7 @@ import { decryptCredentials } from "./credentials.js";
 import { DeliveryClient } from "./deliveryClient.js";
 import { AbexClient } from "./abexClient.js";
 import { abexWritesEnabled } from "./abexMapper.js";
+import { abexTrafficPolicy } from "./abexApiTraffic.js";
 import { AppError, assert } from "../../errors.js";
 
 export const abexCapabilities = {
@@ -51,7 +52,7 @@ function readCredentials(encrypted) {
   }
 }
 
-export async function providerFor(id, capability, shipment) {
+export async function providerFor(id, capability, shipment, options = {}) {
   const agency = await DeliveryAgency.findById(id).select(
     "+encryptedCredentials +encryptedLegacyCredentials +legacyBaseUrl",
   );
@@ -77,12 +78,15 @@ export async function providerFor(id, capability, shipment) {
         return true;
       },
     };
-  if (provider === "ABEX" && agency.apiProvider === "ABEX")
+  if (provider === "ABEX" && agency.apiProvider === "ABEX") {
+    const credentials = readCredentials(agency.encryptedCredentials);
     return new AbexClient({
-      credentials: readCredentials(agency.encryptedCredentials),
+      credentials,
       settings: agency.config?.abex,
       agencyVersion: `${agency._id}:${+agency.updatedAt}`,
+      traffic: abexTrafficPolicy(credentials, options),
     });
+  }
   assert(
     provider === "PROCOLIS" && (historical || agency.apiProvider === provider),
     "This shipment has no supported courier lookup contract.",

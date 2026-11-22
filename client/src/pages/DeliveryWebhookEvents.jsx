@@ -100,9 +100,9 @@ function WebhookDetails({ id, onClose, onRetry }) {
               </div>
               <p>
                 Customer payloads and signing credentials are not stored in
-                event history. Supported events refresh the linked parcel through
-                ABEX; unrecognized events are ignored and malformed notifications
-                require review.
+                event history. Supported events refresh the linked parcel
+                through ABEX; unrecognized events are ignored and malformed
+                notifications require review.
               </p>
               {event.retryEligible &&
                 ["ADMIN", "SUPER_ADMIN"].includes(user.role) &&
@@ -180,6 +180,14 @@ export function DeliveryWebhookEvents() {
                   <b>{status.processingEnabled ? "Enabled" : "Disabled"}</b>
                 </div>
                 <div>
+                  <span>Background API pacing</span>
+                  <b>
+                    One request per{" "}
+                    {status.backgroundRequestIntervalSeconds || 15}s · order
+                    intake has priority
+                  </b>
+                </div>
+                <div>
                   <span>Delivery updates</span>
                   <b>
                     {status.mutationsEnabled
@@ -227,17 +235,20 @@ export function DeliveryWebhookEvents() {
                 <p className="notice">
                   The ABEX event contract is unverified. Signed events are
                   recorded safely; automatic webhook delivery updates remain
-                  disabled. Keep scheduled polling on until live acceptance is
-                  complete.
+                  disabled. Verify the event contract before accepting automatic
+                  updates; review individual shipments manually in the meantime.
                 </p>
               )}
               {status.contractVerified && (
                 <p className="notice">
                   Supported topics:{" "}
                   {(status.supportedEventTypes || []).join(", ")}. Notifications
-                  refresh the linked parcel through ABEX. Keep scheduled polling
-                  on until a live event shows PROCESSED and the CRM status is
-                  verified.
+                  refresh only the matching CRM shipment through ABEX. Cron can
+                  stay disabled. Requests are paced, queued notifications for
+                  the same parcel are combined, and background reads yield to
+                  order intake and provider cooldowns. Events without a matching
+                  CRM shipment need their saved tracking and agency reviewed.
+                  Verify a live PROCESSED event and the resulting CRM status.
                 </p>
               )}
               {!status.lastReceivedAt && (

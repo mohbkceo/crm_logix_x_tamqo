@@ -47,6 +47,7 @@ import { providerFor } from "../src/services/delivery/deliveryProviderFactory.js
 import { deliveryService } from "../src/services/delivery/deliveryService.js";
 import { DeliveryClient } from "../src/services/delivery/deliveryClient.js";
 import { clearAbexCatalogCache } from "../src/services/delivery/abexClient.js";
+import { AbexApiTraffic } from "../src/models/abexApiTraffic.js";
 let replica, plan, product, plaque15, stand, source, wilaya, apiAgent;
 const request = () => apiAgent;
 before(
@@ -127,6 +128,7 @@ beforeEach(async () => {
     DeliverySyncItem,
     DeliverySyncLock,
     DeliverySyncRun,
+    AbexApiTraffic,
   ])
     await Model.deleteMany({});
 });
@@ -4241,6 +4243,11 @@ test("ABEX rate-limited creation is released for retry instead of waiting for ve
   assert.equal(creates(), 1);
   // Once the quota resets the same shipment is created normally.
   f.onCreate = undefined;
+  // A new client must not bypass the shared provider cooldown.
+  const paused = await apiAgent.post(`/api/orders/${created._id}/shipment`);
+  assert.equal(paused.body.error.code, "ABEX_RATE_LIMIT");
+  assert.equal(creates(), 1);
+  await AbexApiTraffic.updateMany({}, { cooldownUntil: new Date(0) });
   const retried = expectOk(
     await apiAgent.post(`/api/orders/${created._id}/shipment`),
   );
@@ -4259,6 +4266,7 @@ test("ABEX rate-limited creation is released for retry instead of waiting for ve
   );
   f.onCreate = undefined;
   f.parcelAbsent = true;
+  await AbexApiTraffic.updateMany({}, { cooldownUntil: new Date(0) });
   await Shipment.updateOne(
     { orderId: stuckOrder._id },
     {

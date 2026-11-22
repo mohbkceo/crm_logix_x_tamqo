@@ -37,6 +37,12 @@ import {
 import { prepareWebhookRefresh } from "../src/services/delivery/webhooks/webhookReconciliationService.js";
 import { createAbexWebhookRouter } from "../src/routes/abexWebhookRoutes.js";
 import { AbexClient } from "../src/services/delivery/abexClient.js";
+import { clearAbexCatalogCache } from "../src/services/delivery/abexClient.js";
+import { AbexApiTraffic } from "../src/models/abexApiTraffic.js";
+import {
+  abexTrafficPolicy,
+  retryAfterDate,
+} from "../src/services/delivery/abexApiTraffic.js";
 import { DeliverySyncService } from "../src/services/delivery/deliverySyncService.js";
 import {
   startDeliverySyncScheduler,
@@ -70,7 +76,13 @@ const legacyAdapter = {
   }),
 };
 let replica, courier, courierUrl, agency, order, shipment, secret, config;
-let currentState, updatedAt, responseOverrides, requests, timeout;
+let currentState,
+  updatedAt,
+  responseOverrides,
+  requests,
+  timeout,
+  rateLimit,
+  intakeAfterWorkflow;
 
 before(
   async () => {
@@ -81,10 +93,19 @@ before(
     await Promise.all(Object.values(mongoose.models).map((m) => m.init()));
     await ensureWebhookIndexes();
     courier = createServer(async (req, res) => {
-      requests.push({ method: req.method, url: req.url });
+      requests.push({ method: req.method, url: req.url, at: Date.now() });
       assert.equal(req.headers["x-api-key"], "fixture-abex-key");
       assert.equal(req.headers["x-tenant"], "fixture-tenant");
       if (timeout) return; // Real HTTP timeout; no live provider calls.
+      if (rateLimit) {
+        res.writeHead(429, { "Retry-After": "120" });
+        res.end("{}");
+        return;
+      }
+      if (intakeAfterWorkflow && req.url === "/api/v1/workflows/search") {
+        intakeAfterWorkflow = false;
+        await abexTrafficPolicy(trafficCredentials).beforeRequest();
+      }
       const data =
         req.url === "/api/v1/workflows/search"
           ? {
@@ -133,6 +154,7 @@ after(async () => {
 
 beforeEach(async () => {
   mock.restoreAll();
+  clearAbexCatalogCache();
   await Promise.all(
     [
       DeliveryWebhookEvent,
@@ -147,6 +169,7 @@ beforeEach(async () => {
       User,
       Session,
       DeliverySyncSettings,
+      AbexApiTraffic,
     ].map((m) => m.deleteMany({})),
   );
   secret = `whsec_${randomBytes(32).toString("base64")}`;
@@ -218,6 +241,8 @@ beforeEach(async () => {
   responseOverrides = {};
   requests = [];
   timeout = false;
+  rateLimit = false;
+  intakeAfterWorkflow = false;
 });
 
 function signed(
@@ -258,8 +283,9 @@ async function notify(overrides = {}) {
     eventId: message.headers["webhook-id"],
   });
 }
-function client() {
+function client(options = {}) {
   const instance = new AbexClient({
+    ...options,
     credentials: { apiKey: "fixture-abex-key", tenantId: "fixture-tenant" },
     settings: {
       states: Object.entries(stateIds)
@@ -620,7 +646,9 @@ test("legacy reclassification cannot steal an active claim and becomes retryable
 });
 
 test("recognized notification without a local parcel remains durable for later linking", async () => {
-  const event = await notify({ data: { id: uuid(999) } });
+  const event = await notify({
+    data: { id: uuid(999), trackingNumber: undefined },
+  });
   await worker();
   const value = await stored(event);
   assert.equal(value.processingStatus, "RETRY_PENDING");
@@ -640,6 +668,274 @@ test("recognized notification without a local parcel remains durable for later l
   await worker();
   assert.equal((await stored(event)).processingStatus, "PROCESSED");
   assert.equal((await Order.findById(order._id)).status, "DELIVERED");
+});
+
+test("saved ABEX tracking repairs a missing parcel UUID after verifying the fetched identity", async () => {
+  await Shipment.updateOne(
+    { _id: shipment._id },
+    { $unset: { providerParcelId: 1 } },
+  );
+  const event = await notify();
+  await worker();
+  assert.equal((await stored(event)).processingStatus, "PROCESSED");
+  const linked = await Shipment.findById(shipment._id);
+  assert.equal(linked.providerParcelId, parcelId);
+  assert.equal((await Order.findById(order._id)).status, "DELIVERED");
+  assert.equal(await Shipment.countDocuments(), 1);
+  assert.deepEqual(
+    requests.map((r) => r.url),
+    ["/api/v1/parcels/FIXTURE-TRACKING", "/api/v1/workflows/search"],
+  );
+});
+
+for (const field of ["id", "trackingNumber", "externalId", "tenantId"]) {
+  test(`UUID repair rejects a mismatched fetched ${field}`, async () => {
+    await Shipment.updateOne(
+      { _id: shipment._id },
+      { $unset: { providerParcelId: 1 } },
+    );
+    responseOverrides[field] = field === "id" ? uuid(999) : "OTHER";
+    const event = await notify();
+    await worker();
+    assert.equal((await stored(event)).lastErrorCode, "ABEX_IDENTITY_MISMATCH");
+    assert.equal(
+      (await Shipment.findById(shipment._id)).providerParcelId,
+      undefined,
+    );
+    assert.equal((await Order.findById(order._id)).status, "SHIPPED");
+  });
+}
+
+for (const provider of ["PROCOLIS", "EXCEL_IMPORT", "MANUAL"]) {
+  test(`tracking recovery cannot relabel a ${provider} shipment`, async () => {
+    await Shipment.updateOne({ _id: shipment._id }, { provider });
+    const event = await notify();
+    await worker();
+    assert.equal(
+      (await stored(event)).lastErrorCode,
+      "WEBHOOK_SHIPMENT_NOT_LINKED",
+    );
+    assert.equal(requests.length, 0);
+    assert.equal((await Shipment.findById(shipment._id)).provider, provider);
+  });
+}
+
+test("a verified local parcel UUID can recover missing tracking without bypassing production rules", async () => {
+  await Shipment.updateOne({ _id: shipment._id }, { $unset: { tracking: 1 } });
+  const event = await notify();
+  await worker();
+  assert.equal((await stored(event)).processingStatus, "PROCESSED");
+  assert.equal(
+    (await Shipment.findById(shipment._id)).tracking,
+    shipment.tracking,
+  );
+  assert.equal((await stored(event)).trackingNumber, shipment.tracking);
+});
+
+test("a changed repair reservation retries rather than overwriting a concurrent parcel link", async () => {
+  await Shipment.updateOne(
+    { _id: shipment._id },
+    { $unset: { providerParcelId: 1 } },
+  );
+  const event = await notify();
+  await runWebhookBatch(config, {
+    prepare: async (evt, cfg) => {
+      const refresh = await prepare(evt, cfg);
+      await Shipment.updateOne(
+        { _id: shipment._id },
+        {
+          $set: { providerParcelId: uuid(999) },
+          $inc: { __v: 1 },
+        },
+      );
+      return refresh;
+    },
+  });
+  assert.equal((await stored(event)).processingStatus, "RETRY_PENDING");
+  assert.equal(
+    (await Shipment.findById(shipment._id)).providerParcelId,
+    uuid(999),
+  );
+  assert.equal((await Order.findById(order._id)).status, "SHIPPED");
+});
+
+test("queued parcel notifications share one authoritative refresh and one return expense", async () => {
+  currentState = "RETURNING";
+  const events = await Promise.all(Array.from({ length: 12 }, () => notify()));
+  await worker();
+  const rows = await DeliveryWebhookEvent.find({
+    _id: { $in: events.map((e) => e._id) },
+  });
+  assert.equal(
+    rows.filter((e) => e.processingStatus === "PROCESSED").length,
+    12,
+  );
+  assert.equal(
+    rows.filter((e) => e.resultCode === "WEBHOOK_COALESCED").length,
+    11,
+  );
+  assert.equal(requests.filter((r) => r.method === "GET").length, 1);
+  assert.equal(await Expense.countDocuments({ sourceOrderId: order._id }), 1);
+});
+
+test("notifications arriving after the authoritative refresh begins require another read", async () => {
+  await notify();
+  let later;
+  await runWebhookBatch(config, {
+    prepare: async (evt, cfg) => {
+      const refresh = await prepare(evt, cfg);
+      if (!later) later = await notify();
+      return refresh;
+    },
+  });
+  assert.equal(requests.filter((r) => r.method === "GET").length, 2);
+  assert.notEqual((await stored(later)).resultCode, "WEBHOOK_COALESCED");
+});
+
+const trafficCredentials = {
+  apiKey: "fixture-abex-key",
+  tenantId: "fixture-tenant",
+};
+const backgroundPrepare = (evt, cfg) =>
+  prepareWebhookRefresh(evt, cfg, async () =>
+    client({
+      agencyVersion: String(agency._id),
+      traffic: abexTrafficPolicy(trafficCredentials, { background: true }),
+    }),
+  );
+
+test("background reads yield to foreground intake across new client instances without exhausting retries", async () => {
+  await abexTrafficPolicy(trafficCredentials).beforeRequest();
+  const event = await notify();
+  for (let i = 0; i < 10; i++) {
+    await runWebhookBatch(config, { prepare: backgroundPrepare });
+    const row = await stored(event);
+    assert.equal(row.processingStatus, "RETRY_PENDING");
+    assert.equal(row.lastErrorCode, "ABEX_BACKGROUND_DEFERRED");
+    assert.equal(row.retryCount, 0);
+    await DeliveryWebhookEvent.updateOne(
+      { _id: event._id },
+      { nextRetryAt: new Date(0) },
+    );
+  }
+  assert.equal(requests.length, 0);
+  assert.equal((await stored(event)).attemptCount, 10);
+  assert.equal((await Order.findById(order._id)).status, "SHIPPED");
+});
+
+test("a real 429 is sent once and its cooldown survives new clients and worker attempts", async () => {
+  rateLimit = true;
+  const event = await notify();
+  await runWebhookBatch(config, { prepare: backgroundPrepare });
+  let row = await stored(event);
+  assert.equal(row.lastErrorCode, "ABEX_RATE_LIMIT");
+  assert.ok(+row.nextRetryAt > Date.now() + 115000);
+  assert.equal(requests.length, 1);
+  await DeliveryWebhookEvent.updateOne(
+    { _id: event._id },
+    { nextRetryAt: new Date(0) },
+  );
+  await runWebhookBatch(config, { prepare: backgroundPrepare });
+  row = await stored(event);
+  assert.equal(row.lastErrorCode, "ABEX_BACKGROUND_DEFERRED");
+  assert.equal(row.retryCount, 1);
+  assert.equal(requests.length, 1);
+  await assert.rejects(
+    client({ traffic: abexTrafficPolicy(trafficCredentials) }).getShipment(
+      shipment,
+    ),
+    { code: "ABEX_RATE_LIMIT" },
+  );
+  assert.equal(requests.length, 1);
+});
+
+test("a cold targeted refresh completes with actual HTTP requests spaced by the shared budget", async (t) => {
+  const previous = process.env.ABEX_WEBHOOK_REQUEST_INTERVAL_SECONDS;
+  process.env.ABEX_WEBHOOK_REQUEST_INTERVAL_SECONDS = "5";
+  t.after(() => {
+    if (previous === undefined)
+      delete process.env.ABEX_WEBHOOK_REQUEST_INTERVAL_SECONDS;
+    else process.env.ABEX_WEBHOOK_REQUEST_INTERVAL_SECONDS = previous;
+  });
+  const event = await notify();
+  await runWebhookBatch(config, { prepare: backgroundPrepare });
+  assert.equal((await stored(event)).processingStatus, "PROCESSED");
+  assert.equal(requests.length, 2);
+  assert.ok(requests[1].at - requests[0].at >= 4900);
+  assert.equal((await Order.findById(order._id)).status, "DELIVERED");
+});
+
+test("intake between catalog and parcel reads defers safely and the next refresh reuses the warm catalog", async () => {
+  intakeAfterWorkflow = true;
+  const event = await notify();
+  await runWebhookBatch(config, { prepare: backgroundPrepare });
+  assert.equal((await stored(event)).lastErrorCode, "ABEX_BACKGROUND_DEFERRED");
+  assert.equal((await stored(event)).retryCount, 0);
+  assert.deepEqual(
+    requests.map((r) => r.url),
+    ["/api/v1/workflows/search"],
+  );
+  // Simulate the intake quiet window and pacing interval elapsing.
+  await AbexApiTraffic.updateMany(
+    {},
+    {
+      foregroundUntil: new Date(0),
+      nextBackgroundAt: new Date(0),
+    },
+  );
+  await DeliveryWebhookEvent.updateOne(
+    { _id: event._id },
+    { nextRetryAt: new Date(0) },
+  );
+  await runWebhookBatch(config, { prepare: backgroundPrepare });
+  assert.equal((await stored(event)).processingStatus, "PROCESSED");
+  assert.deepEqual(
+    requests.map((r) => r.url),
+    ["/api/v1/workflows/search", "/api/v1/parcels/FIXTURE-TRACKING"],
+  );
+});
+
+test("background pacing never blocks a foreground request slot and is isolated between accounts", async () => {
+  const bg = abexTrafficPolicy(trafficCredentials, { background: true });
+  await bg.beforeRequest();
+  const row = await AbexApiTraffic.findOne().lean();
+  assert.ok(+row.nextBackgroundAt >= Date.now() + 14000);
+  await abexTrafficPolicy(trafficCredentials).beforeRequest();
+  await assert.rejects(bg.beforeRequest(), {
+    code: "ABEX_BACKGROUND_DEFERRED",
+  });
+  await abexTrafficPolicy(
+    { ...trafficCredentials, tenantId: "other" },
+    { background: true },
+  ).beforeRequest();
+  assert.equal(await AbexApiTraffic.countDocuments(), 2);
+  const serialized = JSON.stringify(await AbexApiTraffic.find().lean());
+  assert.equal(serialized.includes(trafficCredentials.apiKey), false);
+});
+
+test("workflow catalogs are reused across clients and invalidated when agency settings change", async () => {
+  await client({ agencyVersion: "same:1" }).getShipment(shipment);
+  await client({ agencyVersion: "same:1" }).getShipment(shipment);
+  assert.equal(
+    requests.filter((r) => r.url === "/api/v1/workflows/search").length,
+    1,
+  );
+  await client({ agencyVersion: "same:2" }).getShipment(shipment);
+  assert.equal(
+    requests.filter((r) => r.url === "/api/v1/workflows/search").length,
+    2,
+  );
+});
+
+test("Retry-After supports seconds and HTTP dates with a safe fallback", () => {
+  const now = Date.parse("2026-11-22T10:00:00Z");
+  assert.equal(+retryAfterDate("120", now), now + 120000);
+  assert.equal(
+    +retryAfterDate("Sun, 22 Nov 2026 10:02:00 GMT", now),
+    now + 120000,
+  );
+  assert.equal(+retryAfterDate(undefined, now), now + 60000);
+  assert.equal(+retryAfterDate("garbage", now), now + 60000);
 });
 
 for (const mismatch of [
