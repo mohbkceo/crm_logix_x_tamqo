@@ -19,6 +19,9 @@ const schema = new Schema(
     receivedAt: { type: Date, required: true },
     // Signed transport timestamp; not claimed to be the parcel's update time.
     providerTimestamp: { type: Date, required: true },
+    // Signed event occurrence time for inspection; parcel ordering still uses
+    // the freshly fetched providerUpdatedAt, never this notification timestamp.
+    eventOccurredAt: Date,
     processingStatus: {
       type: String,
       enum: WEBHOOK_STATUSES,

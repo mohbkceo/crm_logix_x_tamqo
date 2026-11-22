@@ -1,8 +1,8 @@
 # ABEX inbound webhooks
 
-Implementation status: secure receiver, durable inbox, worker, targeted-refresh integration, admin monitoring and recovery are implemented. **The live ABEX delivery event contract remains unverified. Automatic webhook status mutations are disabled in code. Keep polling enabled until the contract and live acceptance are complete.** No live destination, signing secret, production setting or shipment was changed during this implementation.
+Implementation status: secure receiver, durable inbox, worker, targeted-refresh integration, admin monitoring and recovery are implemented. **The two parcel notification topics below are verified from real ABEX portal deliveries and are supported by the adapter. Keep polling enabled until the deployed release processes an approved live event successfully.** No live destination, signing secret, production setting or shipment was changed during implementation or read-only contract inspection.
 
-## Contract evidence and remaining dependency
+## Verified contract and live acceptance
 
 The configured destination is `00c7191e-83b7-43dd-beda-9d5425cf51d3`, subscribed to All topics, at `https://crm.tamqo.com/api/webhooks/delivery/abex`. Reuse it; do not recreate it or change its URL. The destination ID comes from server configuration, not a presumed incoming header or payload field.
 
@@ -10,17 +10,27 @@ On 2026-11-21, the [ABEX public OpenAPI](https://app.abex.clawdyatms.app/swagger
 
 Signing follows the [official Standard Webhooks specification](https://github.com/standard-webhooks/standard-webhooks/blob/main/spec/standard-webhooks.md), using the maintained [`standardwebhooks` JavaScript implementation](https://github.com/standard-webhooks/standard-webhooks/tree/main/libraries/javascript), pinned to package version `1.3.0`. The signing standard does not establish ABEX's payload schema.
 
-`abexWebhookAdapter.js` deliberately has `contractVerified: false`. Every authenticated object is classified as `UNVERIFIED`; the worker marks it `IGNORED / ABEX_CONTRACT_UNVERIFIED`. It does not read guessed `type`, `data`, `status`, `orderId`, tenant, tracking or parcel fields. Authentication and reception can be validated now; webhook-driven status cutover cannot.
+On 2026-11-22 the user supplied a delivery link and the authenticated ABEX portal was inspected read-only. These actual delivery records establish the supported notification subset:
 
-To complete the provider adapter:
+| Topic | Provider evidence |
+| --- | --- |
+| `parcel.state.situation.created` | [Delivery f9179308](https://webhooks.abex.clawdyatms.app/destinations/00c7191e-83b7-43dd-beda-9d5425cf51d3/deliveries/f9179308-7e45-4c7a-990b-64567878e805) |
+| `parcel.state.updated` | [Delivery b100a51a](https://webhooks.abex.clawdyatms.app/destinations/00c7191e-83b7-43dd-beda-9d5425cf51d3/deliveries/b100a51a-40da-4cca-b714-7f6d3b60b6fc) |
 
-1. Obtain official ABEX topic/schema documentation or approved provider samples with verified provenance. Do not paste the signing secret or customer data into Git.
-2. Confirm exact topic names, envelope/version, parcel UUID field, optional tracking field, account scope, delivery/retry semantics and event ordering. Confirm which All-topic notifications are unrelated.
-3. Implement the provider parser in `abexWebhookAdapter.js`; pin a contract version and mark it verified only with that evidence. Translate supported events into the **internal** `notificationSchema` (`parcelId`, optional `trackingNumber`). This schema is a CRM interface, not a claimed ABEX payload.
-4. Store only these validated identifiers. Do not add payload-controlled URLs, agency IDs, order IDs, statuses or alternate lookup fallbacks. Add provider contract fixtures and targeted HTTP/database tests.
-5. Validate real signed notifications on an approved pilot, including their current authenticated parcel read and CRM effects, before accepting cutover.
+Both signed JSON bodies have `eventType`, ISO-offset `occurredAt`, and a `data` snapshot containing `id` (parcel UUID) and `trackingNumber`. The parser requires a valid UUID and occurrence timestamp for supported topics, validates tracking when present, and discards every other snapshot field. The stored contract version is `abex-parcel-notification-2026-11-22-v1` with `contractVerified: true`. Event names are read from the signed body; an unsigned topic header cannot select a shipment. This validation is based on observed ABEX integration evidence, not a claim that the public OpenAPI documents every event.
 
-There is no environment flag or administrative replay that overrides this contract gate. Synthetic `test.parcel` and `test-fixture-v1` values occur only in test fixtures and are not ABEX event names. Unknown bodies are not retained, so ignored unverified events cannot later be reparsed. After an adapter release, use manual reconciliation/polling or new provider delivery to recover the current parcel state.
+No customer values, live parcel IDs, tracking numbers, order references, signatures or signing secrets were copied into fixtures. The tests use the observed envelope with generated/redacted data. Body `data.state`, `situation`, amounts, `externalId`, tenant or agency fields never drive business changes; the existing authenticated parcel GET and workflow mappings remain authoritative. `eventOccurredAt` is retained only for inspection; observation ordering uses the freshly fetched parcel timestamps.
+
+The portal also lists `parcel.isReturn.updated`, `courier.state.updated` and `webhook.test`. Their business payload contracts are not established by these two deliveries; they and all other unsupported topics are acknowledged and recorded as `IGNORED / WEBHOOK_UNKNOWN_EVENT`. A malformed supported notification is retained as `FAILED / WEBHOOK_SCHEMA_INVALID`. The destination remains subscribed to All topics.
+
+To accept the deployed feature:
+
+1. Deploy/restart every backend and rebuild the client. Configure the correct existing CRM ABEX agency ObjectId, valid signing secret and processing enablement; retain polling.
+2. In Delivery Synchronization, verify the two supported topics and enablement, then observe an approved pilot notification reaching `PROCESSED` and the corresponding existing order matching its current authenticated ABEX state. HTTP 200 alone proves inbox acceptance, not business processing.
+3. Investigate `FAILED`, `RETRY_PENDING`, identity, production-readiness or unmapped-status outcomes through the existing review/reconciliation tools. Never force an order transition or infer cash collection from a notification.
+4. Disable polling only after that live acceptance. Unknown/new topics need their own verified contract before extending the allowlist.
+
+The original receiver stored unverified events only as hashes/metadata, so they cannot be reparsed from CRM history alone. After deployment, the ABEX delivery portal's **Retry** action can supply a fresh authenticated copy of a supported body. The receiver can atomically reclassify an old `unverified / ABEX_CONTRACT_UNVERIFIED` record in `IGNORED` or unclaimed `RECEIVED` state only when the event ID, raw body hash and original agency binding match. It preserves the unique record and total attempt count, clears only the old terminal metadata and queues the supported refresh. It never upgrades an event that already had delivery effects or redirects it to a different agency. An active old claim returns retryable `503 / WEBHOOK_UPGRADE_BUSY`; retry once that lease/processing has completed. Different bytes under the same ID still return 409. Otherwise recover via manual sync or new notifications.
 
 ## Existing delivery architecture audit
 
@@ -76,10 +86,10 @@ ABEX_WEBHOOK_MAX_ATTEMPTS=8
 
 ## Deploy to crm.tamqo.com
 
-1. Back up MongoDB and confirm it is a replica set with transaction support. Deploy the feature branch through the normal reviewed release process; no push/deploy is performed by this implementation.
+1. Back up MongoDB and confirm it is a replica set with transaction support. Deploy the reviewed release through the normal deployment process.
 2. Run `npm ci`, `npm run lint`, `npm test`, `npm run build`, and the browser checks listed below. Retain the existing session secret, credential encryption key, database URI, ABEX API credentials and frontend origin. Do not run the ABEX migration cutover again for webhook setup.
-3. Obtain/rotate the destination signing secret through the existing ABEX destination UI or authorized provider support. The public API documents authenticated `GET /api/v1/webhooks/endpoints/{endpointId}/secret` for supplier admins, but does not specify a rotation API; do not invent one. Keep the destination and URL unchanged. Coordinate rotation across all backend instances; use the provider's retry facility for deliveries during the switch.
-4. Set `ABEX_WEBHOOK_ENABLED=true`, the real signing secret, the destination UUID, and its CRM agency ID. Set `ABEX_WEBHOOK_PROCESSING_ENABLED=true` to classify unverified events and surface health. Keep saved `cronEnabled=true`. Restart every backend instance. The process waits for the unique index before accepting requests and starts the independent inbox worker.
+3. Obtain/rotate the destination signing secret through the existing ABEX destination UI or authorized provider support. The public API documents authenticated `GET /api/v1/webhooks/endpoints/{endpointId}/secret` for supplier admins. The inspected Settings page has a **Rotate** control and says the previous secret expires after 24 hours; no credential rotation was performed during inspection. Keep the destination and URL unchanged. Coordinate the environment update across all backend instances; use the provider's retry facility for deliveries during the switch.
+4. Set `ABEX_WEBHOOK_ENABLED=true`, the real signing secret, the destination UUID, and its CRM agency ID. Set `ABEX_WEBHOOK_PROCESSING_ENABLED=true` to process supported notifications and surface health. Keep saved `cronEnabled=true`. Restart every backend instance. The process waits for the unique index before accepting requests and starts the independent inbox worker.
 5. Route the exact HTTPS path through the existing reverse proxy to Express, preserving body bytes, content type and signature headers. Do not add browser login/CSRF interception, rewrite the body or transparently decompress it. For Nginx, preserve the existing `/api/` upstream behavior or use an exact location equivalent to:
 
    ```nginx
@@ -92,7 +102,7 @@ ABEX_WEBHOOK_MAX_ATTEMPTS=8
    ```
 
    Use the deployment's actual upstream/port and existing TLS configuration. Check intermediary/WAF rules and time synchronization on every worker. An unsigned POST must return `401`, not an HTML login screen, `404`, redirect or success. A GET must return `405`. Confirm other CRM APIs still require authentication.
-6. In **Settings → Delivery Synchronization**, check configuration, receiver enablement, last reception, last processed delivery, worker scan, pending/failed counts and the unverified-contract warning. Configuration alone is not evidence of delivery health. Compare destination delivery receipts with persisted event IDs and hashes. A synthetic signed object proves transport/storage only; real supported delivery behavior requires the adapter and pilot acceptance above.
+6. In **Settings → Delivery Synchronization**, check configuration, receiver enablement, supported topics, last reception, last processed delivery, worker scan and pending/failed counts. Configuration alone is not evidence of delivery health. Compare destination delivery receipts with persisted event IDs and hashes. A synthetic signed object proves transport/storage only; real supported delivery behavior requires the pilot acceptance above.
 
 The following synthetic smoke request runs from a backend environment where the secret is already securely injected. It prints only HTTP status. Use it against a local/test deployment first; do not put a real secret in command-line arguments or shell history. It does not claim an ABEX event topic or mutate a shipment.
 
@@ -146,20 +156,22 @@ The webhook tests use generated signing keys, real HTTP requests, isolated Mongo
 
 ## Validation results
 
-Final validation on 2026-11-21:
+Final validation on 2026-11-22 after adding the verified parcel adapter:
 
 | Command | Actual final result |
 | --- | --- |
 | `npm run lint` | Passed. |
-| `npm test` | 256 passed, 0 failed, 0 skipped; includes 49 webhook tests and 207 existing tests. |
+| `npm test` | 271 passed, 0 failed, 0 skipped; includes 64 webhook tests and 207 existing tests. |
 | `npm run build` | Passed. |
 | `npm run test:webhook-browser` | Passed: signed reception, monitoring, pagination, filters, sanitized details, audited recovery and desktop/390px mobile layout. Screenshots inspected; long mobile values wrap. |
 | `npm run test:delivery-browser` | Passed: ABEX parcel creation, edit confirmation, readiness, pending/rejected shipments and manual agency behavior. |
 | `npm run test:readiness-browser` | Passed: production readiness, historical Procolis status/deletion behavior, protected APIs and mobile labels. |
 | `git diff --check` | Passed. |
-| `npm audit --json` | Nonzero exit: one pre-existing high-severity Mongoose dependency entry; see release limitations. |
+| `npm audit --json` (2026-11-21) | Nonzero exit: one pre-existing high-severity Mongoose dependency entry; no dependencies changed in the verified-adapter update. See release limitations. |
 
 An intermediate future-timestamp fixture was moved from 301 to 360 seconds ahead to avoid entering the library's five-minute window while the test executed. Intermediate browser runs were rerun after the build completed and the responsive-navigation test waited for its collapsed state. The final results above use the corrected tests; no production rule was loosened.
+
+The 2026-11-22 adapter tests use the production parser for both observed topics and exercise malformed payloads, unsigned topic headers, authoritative refresh rather than snapshot application, and concurrent authenticated reclassification of legacy ignored events. The initial malformed-data fixtures were corrected to preserve explicit missing/null values rather than supplying defaults. The webhook browser test uses port 4028 so it can run independently from the readiness suite on 4026; the latter was rerun successfully after diagnosing the shared-port collision.
 
 ## Changed file inventory
 
@@ -173,7 +185,7 @@ An intermediate future-timestamp fixture was moved from 301 to 360 seconds ahead
 | `server/src/routes/deliverySyncRoutes.js` | Mounts the authenticated webhook monitoring routes. |
 | `server/src/services/delivery/webhooks/webhookConfig.js` | Backend-only settings, safe defaults and fail-closed validation. |
 | `server/src/services/delivery/webhooks/verifyAbexWebhook.js` | Official raw-byte signature verification, strict headers/timestamps and post-verification JSON decoding. |
-| `server/src/services/delivery/webhooks/abexWebhookAdapter.js` | Explicit unverified provider contract and internal notification validation. |
+| `server/src/services/delivery/webhooks/abexWebhookAdapter.js` | Verified two-topic provider adapter and internal notification validation. |
 | `server/src/services/delivery/webhooks/webhookInboxService.js` | Majority-confirmed persistence/deduplication, atomic claims, durable attempts and retention. |
 | `server/src/services/delivery/webhooks/webhookReconciliationService.js` | Resolves only a server-bound existing parcel and reads its authoritative state. |
 | `server/src/services/delivery/webhooks/webhookProcessor.js` | Fenced worker, atomic completion with business effects, bounded retries and health. |
@@ -183,6 +195,7 @@ An intermediate future-timestamp fixture was moved from 301 to 360 seconds ahead
 | `client/src/pages/DeliverySyncLogs.jsx` | Integrates webhooks into Delivery Synchronization while retaining polling controls/history. |
 | `client/src/main.jsx`, `client/src/pages/Settings.jsx` | Updates navigation labels for the unified page. |
 | `server/test/abexWebhooks.test.js` | Receiver, database, worker, delivery/finance, recovery and authorization tests. |
+| `server/test/fixtures/abexWebhooks.js` | Generated/redacted fixtures using the envelope observed in ABEX's authenticated delivery portal. |
 | `scripts/webhook-browser-check.js` | Isolated desktop/mobile monitoring and retry regression. |
 | `scripts/abex-webhook-smoke.js` | Explicit signed transport smoke command without printing credentials. |
 | `package.json` | Adds the webhook browser validation command. |
@@ -192,6 +205,6 @@ An intermediate future-timestamp fixture was moved from 301 to 360 seconds ahead
 
 ## Release limitations
 
-The ABEX topic/payload contract, real provider retries/rotation behavior, deployed HTTPS/reverse-proxy routing and live delivery acceptance remain unverified. No production deployment or polling cutover was performed. The per-process receiver limit is not a distributed rate limiter.
+Two parcel topic/payload shapes were verified read-only from the provider portal. Other topics, provider retry timing, credential-rotation behavior in practice and end-to-end live business processing remain unverified. The portal shows existing CRM HTTP 200 receipts, which confirms reception rather than delivery effects. No production polling cutover or live customer mutation was performed. The per-process receiver limit is not a distributed rate limiter.
 
 `npm audit --json` also reports one pre-existing high-severity dependency entry for Mongoose `8.24.4` (already pinned in the original lockfile), including [GHSA-gg4r-jv3p-qx3c](https://github.com/advisories/GHSA-gg4r-jv3p-qx3c), [GHSA-wr5m-5jph-8m96](https://github.com/advisories/GHSA-wr5m-5jph-8m96), [GHSA-8332-j7wj-wjw4](https://github.com/advisories/GHSA-8332-j7wj-wjw4), and [GHSA-6972-9mcm-vhwj](https://github.com/advisories/GHSA-6972-9mcm-vhwj). This feature validates/allowlists incoming fields and does not upgrade unrelated dependencies; dependency remediation remains a release consideration.

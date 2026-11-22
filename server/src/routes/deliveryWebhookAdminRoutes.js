@@ -55,6 +55,7 @@ function publicEvent(event) {
     "contractVersion",
     "receivedAt",
     "providerTimestamp",
+    "eventOccurredAt",
     "processingStatus",
     "processedAt",
     "lastAttemptAt",
@@ -125,6 +126,8 @@ routes.get("/status", async (req, res) => {
     processingEnabled: config.processingEnabled,
     agencyBound: Boolean(config.agencyId),
     contractVerified: abexWebhookAdapter.contractVerified,
+    contractVersion: abexWebhookAdapter.contractVersion,
+    supportedEventTypes: abexWebhookAdapter.supportedEventTypes,
     mutationsEnabled:
       config.configured &&
       config.processingEnabled &&

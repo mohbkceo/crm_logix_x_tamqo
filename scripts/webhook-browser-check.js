@@ -7,7 +7,7 @@ import { mkdir } from "node:fs/promises";
 import { Webhook } from "standardwebhooks";
 
 process.env.NODE_ENV = "test";
-process.env.CLIENT_URL = "http://127.0.0.1:4026";
+process.env.CLIENT_URL = "http://127.0.0.1:4028";
 process.env.BOOTSTRAP_SUPER_ADMIN_NAME = "Webhook QA";
 process.env.BOOTSTRAP_SUPER_ADMIN_EMAIL = "webhook-qa@example.test";
 process.env.BOOTSTRAP_SUPER_ADMIN_PASSWORD = "webhook-test-password";
@@ -41,12 +41,12 @@ try {
     Object.values(mongoose.models).map((model) => model.init()),
   );
   server = await new Promise((resolve) => {
-    const http = app.listen(4026, "127.0.0.1", () => resolve(http));
+    const http = app.listen(4028, "127.0.0.1", () => resolve(http));
   });
   for (let i = 0; i < 25; i++) {
     const id = randomUUID(),
       date = new Date(),
-      body = JSON.stringify({ fixture: i });
+      body = JSON.stringify({ eventType: "webhook.test", fixture: i });
     const response = await fetch(
       `${process.env.CLIENT_URL}/api/webhooks/delivery/abex`,
       {
@@ -76,7 +76,7 @@ try {
         eventType: "test.recovery",
         resultCode: "WEBHOOK_UNMAPPED_STATUS",
         notification: { parcelId: randomUUID() },
-        contractVersion: "test-fixture-v1",
+        contractVersion: "abex-parcel-notification-2026-11-22-v1",
         lastErrorCode: "WEBHOOK_UNMAPPED_STATUS",
         lastErrorMessage: "Synthetic mapping review fixture.",
       },
@@ -113,8 +113,11 @@ try {
     page.getByText("Configured · Enabled", { exact: true }),
   ).toBeVisible();
   await expect(
-    page.getByText("The ABEX event contract is unverified.", { exact: false }),
+    page.getByText("Enabled for supported events", { exact: true }),
   ).toBeVisible();
+  await expect(
+    page.getByText("Supported topics:", { exact: false }),
+  ).toContainText("parcel.state.situation.created");
   await expect(page.getByText("Page 1 of 2", { exact: true })).toBeVisible();
   await page
     .getByRole("button", { name: "Next page", exact: true })
@@ -142,7 +145,7 @@ try {
     .getByLabel("Processing status", { exact: true })
     .selectOption("IGNORED");
   await expect(page.getByText("1–20 of 24", { exact: true })).toBeVisible();
-  await page.getByLabel("Event type", { exact: true }).fill("UNVERIFIED");
+  await page.getByLabel("Event type", { exact: true }).fill("webhook.test");
   await page
     .getByLabel("Agency", { exact: true })
     .selectOption(String(agency._id));

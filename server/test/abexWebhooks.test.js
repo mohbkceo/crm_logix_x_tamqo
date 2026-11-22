@@ -43,6 +43,7 @@ import {
   stopDeliverySyncScheduler,
 } from "../src/services/delivery/deliveryScheduler.js";
 import { P } from "../../shared/permissions.js";
+import { abexParcelNotification } from "./fixtures/abexWebhooks.js";
 
 const path = "/api/webhooks/delivery/abex";
 const destination = "00c7191e-83b7-43dd-beda-9d5425cf51d3";
@@ -58,28 +59,15 @@ const stateIds = {
   OUT_FOR_DELIVERY: uuid(8),
   UNKNOWN: uuid(9),
 };
-// SYNTHETIC INTERNAL CONTRACT ONLY. This is never installed into the real app
-// and is not evidence of ABEX topic names, field paths or live behavior.
-const fixtureAdapter = {
-  contractVerified: true,
-  contractVersion: "test-fixture-v1",
-  parse(payload) {
-    if (payload.fixtureTopic !== "test.parcel")
-      return {
-        eventType: "test.unrelated",
-        notification: null,
-        resultCode: "WEBHOOK_UNKNOWN_EVENT",
-      };
-    return {
-      eventType: "test.parcel",
-      notification: {
-        parcelId: payload.fixtureParcelId,
-        ...(payload.fixtureTracking
-          ? { trackingNumber: payload.fixtureTracking }
-          : {}),
-      },
-    };
-  },
+// Used only to exercise upgrades from the initial receiver release.
+const legacyAdapter = {
+  contractVerified: false,
+  contractVersion: "unverified",
+  parse: () => ({
+    eventType: "UNVERIFIED",
+    notification: null,
+    resultCode: "ABEX_CONTRACT_UNVERIFIED",
+  }),
 };
 let replica, courier, courierUrl, agency, order, shipment, secret, config;
 let currentState, updatedAt, responseOverrides, requests, timeout;
@@ -248,12 +236,12 @@ function signed(
 }
 const send = (message, target = app) =>
   supertest(target).post(path).set(message.headers).send(message.body);
-function fixtureApp() {
+function fixtureApp(adapter = abexWebhookAdapter) {
   const target = express();
   target.use(
     path,
     createAbexWebhookRouter({
-      accept: (args) => acceptWebhook({ ...args, adapter: fixtureAdapter }),
+      accept: (args) => acceptWebhook({ ...args, adapter }),
     }),
   );
   target.use((error, _req, res, _next) =>
@@ -264,14 +252,8 @@ function fixtureApp() {
   return target;
 }
 async function notify(overrides = {}) {
-  const message = signed(
-    JSON.stringify({
-      fixtureTopic: "test.parcel",
-      fixtureParcelId: parcelId,
-      ...overrides,
-    }),
-  );
-  assert.equal((await send(message, fixtureApp())).status, 200);
+  const message = signed(JSON.stringify(abexParcelNotification(overrides)));
+  assert.equal((await send(message)).status, 200);
   return DeliveryWebhookEvent.findOne({
     eventId: message.headers["webhook-id"],
   });
@@ -285,7 +267,7 @@ function client() {
         .map(([status, stateId]) => ({ workflowId, stateId, status })),
     },
   });
-  instance.http.defaults.timeout = 50;
+  instance.http.defaults.timeout = timeout ? 50 : 2000;
   // Exercise the real HTTP client and mapper against a loopback courier only.
   instance.http.defaults.adapter = (args) =>
     axios({ ...args, baseURL: courierUrl, adapter: axios.getAdapter("http") });
@@ -293,8 +275,7 @@ function client() {
 }
 const prepare = (event, cfg) =>
   prepareWebhookRefresh(event, cfg, async () => client());
-const worker = () =>
-  runWebhookBatch(config, { adapter: fixtureAdapter, prepare });
+const worker = () => runWebhookBatch(config, { prepare });
 async function stored(event) {
   return DeliveryWebhookEvent.findById(event._id).lean();
 }
@@ -331,7 +312,7 @@ test("real app accepts an exact-byte signed JSON body without a browser session 
     createHash("sha256").update(body).digest("hex"),
   );
   assert.equal(event.payloadMetadata.byteLength, Buffer.byteLength(body));
-  assert.equal(event.eventType, "UNVERIFIED");
+  assert.equal(event.eventType, "UNKNOWN");
   assert.ok(!JSON.stringify(event).includes("DO-NOT-STORE-PII"));
   assert.equal(await OrderEvent.countDocuments(), 0);
 });
@@ -462,22 +443,22 @@ test("an actual disconnected MongoDB connection returns 503 without acknowledgin
   assert.equal(await DeliveryWebhookEvent.countDocuments(), 0);
 });
 
-test("unverified live topics remain observable and never invoke a provider", async () => {
+test("unrelated ABEX topics remain observable and never invoke a provider", async () => {
   await send(
     signed(
-      '{"type":"parcel.updated","parcelId":"ignored","status":"DELIVERED"}',
+      '{"eventType":"courier.state.updated","parcelId":"ignored","status":"DELIVERED"}',
     ),
   );
   await runWebhookBatch(config);
   const event = await DeliveryWebhookEvent.findOne().lean();
   assert.equal(event.processingStatus, "IGNORED");
-  assert.equal(event.resultCode, "ABEX_CONTRACT_UNVERIFIED");
+  assert.equal(event.resultCode, "WEBHOOK_UNKNOWN_EVENT");
   assert.equal((await Order.findById(order._id)).status, "SHIPPED");
   assert.deepEqual(requests, []);
   assert.ok(event.expiresAt);
 });
 
-test("synthetic supported notification fetches one authoritative parcel and applies a permitted delivery once", async () => {
+test("observed ABEX notification shape fetches one authoritative parcel and applies a permitted delivery once", async () => {
   const event = await notify();
   await worker();
   assert.equal((await stored(event)).processingStatus, "PROCESSED");
@@ -493,8 +474,153 @@ test("synthetic supported notification fetches one authoritative parcel and appl
   assert.equal(await OrderEvent.countDocuments({ type: "ORDER_DELIVERED" }), 1);
 });
 
+for (const eventType of abexWebhookAdapter.supportedEventTypes) {
+  test(`verified ${eventType} envelope uses signed data.id and drops snapshot PII`, async () => {
+    const event = await notify({
+      eventType,
+      data: {
+        externalId: "",
+        customer: {
+          name: "PRIVATE-CUSTOMER",
+          phone: { number1: "PRIVATE-PHONE" },
+        },
+        state: { name: "DO-NOT-APPLY" },
+      },
+    });
+    assert.equal(event.eventType, eventType);
+    assert.deepEqual(event.notification.toObject(), {
+      parcelId,
+      trackingNumber: shipment.tracking,
+    });
+    assert.equal(
+      event.eventOccurredAt.toISOString(),
+      "2026-11-22T09:04:01.650Z",
+    );
+    assert.ok(!JSON.stringify(event).includes("PRIVATE-"));
+    await worker();
+    assert.equal((await stored(event)).processingStatus, "PROCESSED");
+    assert.equal((await Order.findById(order._id)).status, "DELIVERED");
+  });
+}
+
+for (const [name, overrides] of [
+  ["missing data", { data: null }],
+  ["UUID object", { data: { id: { $ne: null } } }],
+  ["UUID missing", { data: { id: undefined } }],
+  ["UUID nil", { data: { id: "00000000-0000-0000-0000-000000000000" } }],
+  [
+    "tracking URL",
+    { data: { trackingNumber: "https://other.example/parcel" } },
+  ],
+  ["tracking object", { data: { trackingNumber: { $ne: null } } }],
+  ["timestamp missing", { occurredAt: undefined }],
+  ["timestamp invalid", { occurredAt: "not-a-date" }],
+]) {
+  test(`a supported event with ${name} is stored for review without provider requests`, async () => {
+    const event = await notify(overrides);
+    assert.equal(event.eventType, "parcel.state.updated");
+    assert.equal(event.resultCode, "WEBHOOK_SCHEMA_INVALID");
+    await worker();
+    assert.equal((await stored(event)).processingStatus, "FAILED");
+    assert.equal(requests.length, 0);
+    assert.equal(await OrderEvent.countDocuments(), 0);
+  });
+}
+
+test("an event snapshot cannot override the authoritative parcel state", async () => {
+  currentState = "SHIPPED";
+  const event = await notify({
+    data: {
+      state: { name: "DELIVERED" },
+      status: "DELIVERED",
+      agencyId: randomUUID(),
+      orderId: randomUUID(),
+    },
+  });
+  await worker();
+  assert.equal((await stored(event)).processingStatus, "PROCESSED");
+  assert.equal((await Order.findById(order._id)).status, "SHIPPED");
+  assert.equal(await OrderEvent.countDocuments(), 0);
+});
+
+test("an unsigned topic header cannot promote an unrelated signed event", async () => {
+  const message = signed(
+    JSON.stringify({
+      eventType: "courier.state.updated",
+      data: { id: parcelId },
+    }),
+  );
+  message.headers["webhook-event-type"] = "parcel.state.updated";
+  assert.equal((await send(message)).status, 200);
+  await worker();
+  assert.equal(
+    (await DeliveryWebhookEvent.findOne()).processingStatus,
+    "IGNORED",
+  );
+  assert.equal(requests.length, 0);
+});
+
+test("fresh authenticated redeliveries upgrade legacy ignored notifications once", async () => {
+  const message = signed(JSON.stringify(abexParcelNotification()));
+  assert.equal((await send(message, fixtureApp(legacyAdapter))).status, 200);
+  await runWebhookBatch(config);
+  assert.equal(
+    (await DeliveryWebhookEvent.findOne()).processingStatus,
+    "IGNORED",
+  );
+  const responses = await Promise.all(
+    Array.from({ length: 6 }, () => send(message)),
+  );
+  assert.ok(responses.every((r) => r.status === 200 && r.body.duplicate));
+  const event = await DeliveryWebhookEvent.findOne();
+  assert.equal(event.contractVersion, abexWebhookAdapter.contractVersion);
+  assert.equal(event.processingStatus, "RECEIVED");
+  assert.equal(event.expiresAt, undefined);
+  await worker();
+  assert.equal(await DeliveryWebhookEvent.countDocuments(), 1);
+  assert.equal((await Order.findById(order._id)).status, "DELIVERED");
+  assert.equal(await OrderEvent.countDocuments({ type: "ORDER_DELIVERED" }), 1);
+  assert.equal((await send(message)).status, 200);
+  await worker();
+  assert.equal(await OrderEvent.countDocuments({ type: "ORDER_DELIVERED" }), 1);
+});
+
+test("legacy reclassification requires the same signed body and original agency", async () => {
+  const message = signed(JSON.stringify(abexParcelNotification()));
+  await send(message, fixtureApp(legacyAdapter));
+  await runWebhookBatch(config);
+  const changed = signed(
+    JSON.stringify(abexParcelNotification({ data: { id: uuid(999) } })),
+    { id: message.headers["webhook-id"] },
+  );
+  assert.equal((await send(changed)).status, 409);
+  const unsigned = { body: message.body, headers: { ...message.headers } };
+  delete unsigned.headers["webhook-signature"];
+  assert.equal((await send(unsigned)).status, 401);
+  process.env.ABEX_WEBHOOK_AGENCY_ID = String(new mongoose.Types.ObjectId());
+  assert.equal((await send(message)).status, 200);
+  const event = await DeliveryWebhookEvent.findOne();
+  assert.equal(event.contractVersion, "unverified");
+  assert.equal(event.notification, undefined);
+  assert.equal(event.processingStatus, "IGNORED");
+});
+
+test("legacy reclassification cannot steal an active claim and becomes retryable", async () => {
+  const message = signed(JSON.stringify(abexParcelNotification()));
+  await send(message, fixtureApp(legacyAdapter));
+  const claimed = await claimWebhook(config);
+  const response = await send(message);
+  assert.equal(response.status, 503);
+  assert.equal(response.body.error.code, "WEBHOOK_UPGRADE_BUSY");
+  assert.equal(await OrderEvent.countDocuments(), 0);
+  await processWebhookClaim(claimed, config);
+  assert.equal((await send(message)).status, 200);
+  await worker();
+  assert.equal((await Order.findById(order._id)).status, "DELIVERED");
+});
+
 test("recognized notification without a local parcel remains durable for later linking", async () => {
-  const event = await notify({ fixtureParcelId: uuid(999) });
+  const event = await notify({ data: { id: uuid(999) } });
   await worker();
   const value = await stored(event);
   assert.equal(value.processingStatus, "RETRY_PENDING");
@@ -529,7 +655,7 @@ for (const mismatch of [
   test(`${mismatch} mismatch cannot mutate an order`, async () => {
     const event = await notify(
       mismatch === "event tracking"
-        ? { fixtureTracking: "OTHER-TRACKING" }
+        ? { data: { trackingNumber: "OTHER-TRACKING" } }
         : {},
     );
     if (mismatch === "provider tracking")
@@ -655,7 +781,6 @@ test("concurrent workers atomically claim a single event and commit consistent d
   );
   assert.equal(claims.filter(Boolean).length, 1);
   await processWebhookClaim(claims.find(Boolean), config, {
-    adapter: fixtureAdapter,
     prepare,
   });
   assert.equal((await stored(event)).attemptCount, 1);
@@ -693,12 +818,10 @@ test("crashed worker leases are recoverable and stale claim tokens cannot commit
   const recovered = await claimWebhook(config);
   assert.ok(recovered.lockToken !== abandoned.lockToken);
   await processWebhookClaim(abandoned, config, {
-    adapter: fixtureAdapter,
     prepare,
   });
   assert.equal((await Order.findById(order._id)).status, "SHIPPED");
   await processWebhookClaim(recovered, config, {
-    adapter: fixtureAdapter,
     prepare,
   });
   assert.equal((await stored(event)).processingStatus, "PROCESSED");
@@ -807,10 +930,7 @@ test("disabled cron makes no scheduled bulk calls while webhook processing and m
 
 test("processing can be paused without losing authenticated events", async () => {
   const event = await notify();
-  await runWebhookBatch(
-    { ...config, processingEnabled: false },
-    { adapter: fixtureAdapter, prepare },
-  );
+  await runWebhookBatch({ ...config, processingEnabled: false }, { prepare });
   assert.equal((await stored(event)).processingStatus, "RECEIVED");
   assert.equal(requests.length, 0);
   await worker();
@@ -869,9 +989,9 @@ test("an administrator retry rechecks current transition rules instead of forcin
   assert.equal(await OrderEvent.countDocuments(), 0);
 });
 
-test("unknown synthetic topics and invalid notification identifiers are stored without dispatch", async () => {
-  const ignored = await notify({ fixtureTopic: "unrelated" });
-  const invalid = await notify({ fixtureParcelId: { $ne: null } });
+test("unrelated topics and invalid notification identifiers are stored without dispatch", async () => {
+  const ignored = await notify({ eventType: "courier.state.updated" });
+  const invalid = await notify({ data: { id: { $ne: null } } });
   await worker();
   assert.equal((await stored(ignored)).processingStatus, "IGNORED");
   assert.equal((await stored(invalid)).processingStatus, "FAILED");
@@ -955,7 +1075,7 @@ test("agency reassignment cannot broaden access to previously received parcel id
   assert.equal(list.body.total, 0);
 });
 
-test("event health, filters and details expose sanitized operational facts without claiming live support", async () => {
+test("event health, filters and details expose supported topics and sanitized operational facts", async () => {
   const event = await notify();
   await worker();
   const cookie = await adminCookie();
@@ -963,15 +1083,19 @@ test("event health, filters and details expose sanitized operational facts witho
     .get("/api/delivery-sync/webhooks/status")
     .set("Cookie", cookie);
   assert.equal(health.status, 200);
-  assert.equal(health.body.contractVerified, false);
-  assert.equal(health.body.mutationsEnabled, false);
+  assert.equal(health.body.contractVerified, true);
+  assert.equal(health.body.mutationsEnabled, true);
+  assert.deepEqual(
+    health.body.supportedEventTypes,
+    abexWebhookAdapter.supportedEventTypes,
+  );
   assert.ok(health.body.lastReceivedAt);
   assert.ok(!JSON.stringify(health.body).includes(secret));
   const list = await supertest(app)
     .get("/api/delivery-sync/webhooks/events")
     .query({
       status: "PROCESSED",
-      eventType: "test.parcel",
+      eventType: "parcel.state.updated",
       agencyId: String(agency._id),
       search: shipment.tracking,
       from: new Date(Date.now() - 60000).toISOString(),
@@ -1005,7 +1129,7 @@ test("event health, filters and details expose sanitized operational facts witho
     ).status,
     400,
   );
-  assert.equal(abexWebhookAdapter.contractVerified, false);
+  assert.equal(abexWebhookAdapter.contractVerified, true);
 });
 
 test("public webhook mount leaves browser-origin checks and every other CRM operation protected", async () => {

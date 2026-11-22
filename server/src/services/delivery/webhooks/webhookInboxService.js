@@ -51,6 +51,7 @@ export async function acceptWebhook({
           contractVersion: adapter.contractVersion,
           receivedAt: new Date(),
           providerTimestamp: verified.providerTimestamp,
+          eventOccurredAt: parsed.eventOccurredAt,
           agencyId: config.agencyId,
           agencyBusinesses: agency?.businesses || [],
           notification: parsed.notification || undefined,
@@ -78,6 +79,67 @@ export async function acceptWebhook({
         409,
         "WEBHOOK_REPLAY_CONFLICT",
       );
+    // An authenticated redelivery supplies the body we deliberately did not
+    // retain in the old release. Upgrade only unprocessed, unverified records
+    // for the identical ID/hash and original agency. They had no business effects.
+    if (
+      parsed.notification &&
+      event.contractVersion === "unverified" &&
+      event.resultCode === "ABEX_CONTRACT_UNVERIFIED" &&
+      !event.notification &&
+      config.agencyId &&
+      String(event.agencyId) === config.agencyId
+    ) {
+      const upgraded = await DeliveryWebhookEvent.findOneAndUpdate(
+        {
+          ...key,
+          payloadHash,
+          contractVersion: "unverified",
+          resultCode: "ABEX_CONTRACT_UNVERIFIED",
+          notification: { $exists: false },
+          agencyId: event.agencyId,
+          processingStatus: { $in: ["IGNORED", "RECEIVED"] },
+        },
+        {
+          $set: {
+            eventType: parsed.eventType,
+            contractVersion: adapter.contractVersion,
+            notification: parsed.notification,
+            eventOccurredAt: parsed.eventOccurredAt,
+            processingStatus: "RECEIVED",
+            retryCount: 0,
+          },
+          $unset: {
+            resultCode: 1,
+            processedAt: 1,
+            expiresAt: 1,
+            lastErrorCode: 1,
+            lastErrorMessage: 1,
+            nextRetryAt: 1,
+            lockedUntil: 1,
+            lockToken: 1,
+          },
+        },
+        { new: true, writeConcern: { w: "majority", wtimeout: 5000 } },
+      );
+      if (upgraded) return { event: upgraded, duplicate: true };
+      const current = await DeliveryWebhookEvent.findOne(key)
+        .read("primary")
+        .readConcern("majority")
+        .maxTimeMS(5000);
+      if (!current)
+        throw new AppError(
+          "Webhook storage changed; retry delivery.",
+          503,
+          "WEBHOOK_DEPENDENCY_UNAVAILABLE",
+        );
+      if (current?.contractVersion === "unverified")
+        throw new AppError(
+          "Webhook migration is in progress; retry delivery.",
+          503,
+          "WEBHOOK_UPGRADE_BUSY",
+        );
+    }
     return { event, duplicate: true };
   }
 }

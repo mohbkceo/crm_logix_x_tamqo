@@ -57,7 +57,7 @@ The browser test uses installed Microsoft Edge on Windows and Playwright Chromiu
 
 ## Configuration and authentication
 
-For inbound ABEX signing, the durable event inbox, monitoring and explicit polling cutover, see [ABEX webhooks](docs/abex-webhooks.md). The delivery event contract is currently unverified, so webhook mutations remain disabled and scheduled polling should stay enabled.
+For inbound ABEX signing, the durable event inbox, monitoring and explicit polling cutover, see [ABEX webhooks](docs/abex-webhooks.md). Verified `parcel.state.updated` and `parcel.state.situation.created` notifications refresh the linked parcel through the existing delivery service. Keep scheduled polling enabled until live acceptance succeeds.
 
 All environment configuration is server-side. There are no `VITE_DELIVERY_*` secrets.
 

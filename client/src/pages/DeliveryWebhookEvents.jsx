@@ -75,6 +75,7 @@ function WebhookDetails({ id, onClose, onRetry }) {
                   ["Contract", event.contractVersion],
                   ["Received", dateTime(event.receivedAt)],
                   ["Signed transport time", dateTime(event.providerTimestamp)],
+                  ["Provider event time", dateTime(event.eventOccurredAt)],
                   ["Status", event.processingStatus],
                   [
                     "Attempts (total / current budget)",
@@ -99,8 +100,9 @@ function WebhookDetails({ id, onClose, onRetry }) {
               </div>
               <p>
                 Customer payloads and signing credentials are not stored in
-                event history. An unverified contract requires a provider sample
-                before parcel updates can be enabled.
+                event history. Supported events refresh the linked parcel through
+                ABEX; unrecognized events are ignored and malformed notifications
+                require review.
               </p>
               {event.retryEligible &&
                 ["ADMIN", "SUPER_ADMIN"].includes(user.role) &&
@@ -181,8 +183,14 @@ export function DeliveryWebhookEvents() {
                   <span>Delivery updates</span>
                   <b>
                     {status.mutationsEnabled
-                      ? "Enabled"
-                      : "Awaiting verified contract / agency configuration"}
+                      ? "Enabled for supported events"
+                      : !status.contractVerified
+                        ? "Awaiting verified contract"
+                        : !status.agencyBound
+                          ? "Set the CRM agency ID"
+                          : !status.receiverConfigured
+                            ? "Configure receiver signing"
+                            : "Enable inbox processing"}
                   </b>
                 </div>
                 <div>
@@ -221,6 +229,15 @@ export function DeliveryWebhookEvents() {
                   recorded safely; automatic webhook delivery updates remain
                   disabled. Keep scheduled polling on until live acceptance is
                   complete.
+                </p>
+              )}
+              {status.contractVerified && (
+                <p className="notice">
+                  Supported topics:{" "}
+                  {(status.supportedEventTypes || []).join(", ")}. Notifications
+                  refresh the linked parcel through ABEX. Keep scheduled polling
+                  on until a live event shows PROCESSED and the CRM status is
+                  verified.
                 </p>
               )}
               {!status.lastReceivedAt && (
