@@ -49,7 +49,10 @@ import {
   stopDeliverySyncScheduler,
 } from "../src/services/delivery/deliveryScheduler.js";
 import { P } from "../../shared/permissions.js";
-import { abexParcelNotification } from "./fixtures/abexWebhooks.js";
+import {
+  abexParcelNotification,
+  abexSituationObservation,
+} from "./fixtures/abexWebhooks.js";
 
 const path = "/api/webhooks/delivery/abex";
 const destination = "00c7191e-83b7-43dd-beda-9d5425cf51d3";
@@ -498,6 +501,71 @@ test("observed ABEX notification shape fetches one authoritative parcel and appl
   );
   await worker();
   assert.equal(await OrderEvent.countDocuments({ type: "ORDER_DELIVERED" }), 1);
+});
+
+test("a situation notification with different snapshot and workflow UUIDs applies the authenticated parcel state", async () => {
+  currentState = "OUT_FOR_DELIVERY";
+  responseOverrides = abexSituationObservation();
+  const event = await notify({
+    eventType: "parcel.state.situation.created",
+    data: {
+      state: { name: "DELIVERED" },
+      situation: { name: "Untrusted snapshot" },
+    },
+  });
+  await worker();
+  const row = await stored(event);
+  assert.equal(row.processingStatus, "PROCESSED");
+  assert.equal(row.lastErrorCode, "");
+  const linked = await Shipment.findById(shipment._id);
+  assert.equal(
+    linked.providerSituationId,
+    responseOverrides.lastStateSituationId,
+  );
+  assert.equal(linked.providerStatus, responseOverrides.situation.name);
+  assert.equal(
+    linked.providerUpdatedAt.toISOString(),
+    "2026-01-03T00:00:00.123Z",
+  );
+  assert.equal((await Order.findById(order._id)).status, "OUT_FOR_DELIVERY");
+  assert.equal(await Expense.countDocuments(), 0);
+  assert.equal(await OrderEvent.countDocuments({ type: "ORDER_DELIVERED" }), 0);
+  assert.equal(requests.filter((r) => r.method === "GET").length, 1);
+});
+
+test("an event previously failed as ABEX_INVALID_RESPONSE can recover through the audited retry path", async () => {
+  const event = await notify({ eventType: "parcel.state.situation.created" });
+  await DeliveryWebhookEvent.updateOne(
+    { _id: event._id },
+    {
+      processingStatus: "FAILED",
+      lastErrorCode: "ABEX_INVALID_RESPONSE",
+      lastErrorMessage: "Provider response could not be validated.",
+      attemptCount: 1,
+      retryCount: 1,
+    },
+  );
+  currentState = "OUT_FOR_DELIVERY";
+  responseOverrides = abexSituationObservation();
+  const cookie = await adminCookie();
+  assert.equal(
+    (
+      await supertest(app)
+        .post(`/api/delivery-sync/webhooks/events/${event._id}/retry`)
+        .set("Cookie", cookie)
+    ).status,
+    200,
+  );
+  await worker();
+  const row = await stored(event);
+  assert.equal(row.processingStatus, "PROCESSED");
+  assert.equal(row.attemptCount, 2);
+  assert.equal(row.recoveryCount, 1);
+  assert.equal(
+    await AuditLog.countDocuments({ action: "DELIVERY_WEBHOOK_RETRY" }),
+    1,
+  );
+  assert.equal((await Order.findById(order._id)).status, "OUT_FOR_DELIVERY");
 });
 
 for (const eventType of abexWebhookAdapter.supportedEventTypes) {

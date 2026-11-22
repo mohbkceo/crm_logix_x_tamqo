@@ -314,12 +314,10 @@ export function abexParcel(data, sanitize) {
     ].some((id) => id && sanitize(id) !== id)
   )
     throw abexResponseError();
-  if (
-    data.situation?.id &&
-    data.lastStateSituationId &&
-    data.situation.id.toLowerCase() !== data.lastStateSituationId.toLowerCase()
-  )
-    throw abexResponseError();
+  // ABEX's embedded situation snapshot can have a different UUID from the
+  // workflow situation in lastStateSituationId. Both are validated above;
+  // their equality is not part of the API contract. Prefer the explicit
+  // workflow reference below, independently of the parcel identity checks.
 
   const times = [
     data.lastStateUpdateAt,

@@ -23,6 +23,14 @@ No customer values, live parcel IDs, tracking numbers, order references, signatu
 
 The portal also lists `parcel.isReturn.updated`, `courier.state.updated` and `webhook.test`. Their business payload contracts are not established by these two deliveries; they and all other unsupported topics are acknowledged and recorded as `IGNORED / WEBHOOK_UNKNOWN_EVENT`. A malformed supported notification is retained as `FAILED / WEBHOOK_SCHEMA_INVALID`. The destination remains subscribed to All topics.
 
+### Situation response validation correction
+
+On 2026-11-22 the reported failed event was matched read-only to [its ABEX delivery record](https://webhooks.abex.clawdyatms.app/destinations/00c7191e-83b7-43dd-beda-9d5425cf51d3/deliveries/1bf66776-6efd-4ef6-9826-0628966701d6). Its embedded `situation.id` and `lastStateSituationId` are different valid UUIDs, as in an earlier event for the same parcel. The public [ABEX OpenAPI schema](https://app.abex.clawdyatms.app/swagger/public-v1/swagger.json) independently defines `GetSupplierParcelResponse.lastStateSituationId` and `GetSupplierParcelResponse.situation` (`SituationDto`); it declares no equality constraint between their IDs. The shared parcel mapper incorrectly required equality and rejected this response shape as `ABEX_INVALID_RESPONSE`.
+
+The mapper now validates each supplied UUID independently and keeps `lastStateSituationId` as the preferred workflow mapping reference. The embedded situation name remains display metadata; neither its name nor its metadata determines a CRM transition. Existing parcel UUID, tracking, order reference, tenant, date, workflow and production/finance checks remain in place. This does not make webhook snapshots authoritative: processing still fetches the current authenticated parcel and applies the shared delivery service. No production parcel GET or business mutation was performed during the read-only diagnosis, so a deployment plus an audited event retry is still required to verify live recovery. Cron can remain disabled.
+
+After deploying this correction to every backend, open a failed supported event in Delivery Synchronization and use **Retry event**. The existing scoped recovery path fetches current state, preserves the event ID, increments the recovery count, and never forces a saved snapshot. HTTP 200 from the destination portal proves inbox receipt only. Confirm `PROCESSED` and the corresponding CRM shipment after the worker finishes; other identity, mapping, production or provider failures still require their own review.
+
 To accept the deployed feature:
 
 1. Deploy/restart every backend and rebuild the client. Configure the correct existing CRM ABEX agency ObjectId, valid signing secret and processing enablement. Keep Cron disabled when provider-wide polling affects order intake.
@@ -163,12 +171,12 @@ The webhook tests use generated signing keys, real HTTP requests, isolated Mongo
 
 ## Validation results
 
-Final validation on 2026-11-22 after adding targeted link recovery and intake-priority traffic protection:
+Final validation on 2026-11-22 after adding targeted link recovery, intake-priority traffic protection and the situation response correction:
 
 | Command | Actual final result |
 | --- | --- |
 | `npm run lint` | Passed. |
-| `npm test` | 290 passed, 0 failed, 0 skipped; includes 83 webhook tests and 207 existing tests. |
+| `npm test` | 293 passed, 0 failed, 0 skipped; includes 85 webhook tests and 208 other tests. |
 | `npm run build` | Passed. |
 | `npm run test:webhook-browser` | Passed: signed reception, monitoring, pagination, filters, sanitized details, audited recovery and desktop/390px mobile layout. Screenshots inspected; long mobile values wrap. |
 | `npm run test:delivery-browser` | Passed: ABEX parcel creation, edit confirmation, readiness, pending/rejected shipments and manual agency behavior. |
@@ -181,6 +189,8 @@ An intermediate future-timestamp fixture was moved from 301 to 360 seconds ahead
 The 2026-11-22 adapter tests use the production parser for both observed topics and exercise malformed payloads, unsigned topic headers, authoritative refresh rather than snapshot application, and concurrent authenticated reclassification of legacy ignored events. The initial malformed-data fixtures were corrected to preserve explicit missing/null values rather than supplying defaults. The webhook browser test uses port 4028 so it can run independently from the readiness suite on 4026; the latter was rerun successfully after diagnosing the shared-port collision.
 
 The traffic-protection tests additionally verify shared cooldowns across new clients, numeric/HTTP-date Retry-After parsing, actual paced loopback HTTP reads, foreground interruption and warm-catalog recovery, retry-budget preservation under repeated deferrals, account isolation, catalog-version invalidation, concurrent link reservations, zero provider calls for unmanaged shipments, and twelve queued parcel notifications sharing one refresh and one return expense. The legacy rate-limit creation test now explicitly simulates quota recovery and checks that a fresh client cannot bypass a live cooldown. Initial failures exposed the old immediate-retry assumption and a stale repair reservation during concurrent polling; both were corrected before the final run.
+
+The situation correction adds API-client coverage for distinct IDs, explicit workflow-situation precedence and continued malformed-ID/date rejection. Real loopback HTTP plus MongoDB tests cover a signed situation notification and audited recovery of an event previously failed as `ABEX_INVALID_RESPONSE`. The generated fixture reproduces only the structural distinction and optional scheduled-date metadata; no live customer or parcel values are stored in it.
 
 ## Changed file inventory
 

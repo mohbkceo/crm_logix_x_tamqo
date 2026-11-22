@@ -20,6 +20,7 @@ import {
   shipmentErrorInfo,
 } from "../src/services/delivery/abexErrors.js";
 import { choosePickupHub, pickupHub } from "../src/services/delivery/abexHubs.js";
+import { abexSituationObservation } from "./fixtures/abexWebhooks.js";
 
 const uuid = (n) => `a0000000-0000-4000-8000-${String(n).padStart(12, "0")}`;
 const ids = {
@@ -767,6 +768,83 @@ test("unexpected response payloads are rejected instead of being trusted", async
       client.prepareShipment(desk("Alger Centre")),
       "ABEX_INVALID_RESPONSE",
     );
+  }
+});
+
+test("parcel snapshots with distinct situation UUIDs use the explicit workflow situation and still validate each identifier", async (t) => {
+  const situation = abexSituationObservation();
+  const workflowId = uuid(701),
+    stateId = uuid(702);
+  const { abex, client } = fakeAbex(t, {
+    settings: {
+      states: [
+        { workflowId, stateId, status: "OUT_FOR_DELIVERY" },
+        {
+          workflowId,
+          stateId,
+          situationId: situation.lastStateSituationId,
+          status: "FAILED_DELIVERY",
+        },
+        {
+          workflowId,
+          stateId,
+          situationId: situation.situation.id,
+          status: "RETURNED",
+        },
+      ],
+    },
+  });
+  let data = {
+    id: ids.parcel,
+    trackingNumber: "ABX-UNIT-1",
+    externalId: "ORD-FIXTURE",
+    state: { id: stateId, name: "Fixture out for delivery" },
+    lastStateUpdateAt: "2026-01-02T00:00:00Z",
+    ...situation,
+  };
+  abex.handlers["GET /api/v1/parcels/ABX-UNIT-1"] = () => ({
+    status: 200,
+    data,
+  });
+  abex.handlers["POST /api/v1/workflows/search"] = (req) =>
+    page(
+      [
+        {
+          id: workflowId,
+          states: [
+            {
+              id: stateId,
+              situations: [
+                { id: situation.lastStateSituationId },
+                { id: situation.situation.id },
+              ],
+            },
+          ],
+        },
+      ],
+      req.data,
+    );
+  const reference = {
+    tracking: "ABX-UNIT-1",
+    externalId: "ORD-FIXTURE",
+    providerParcelId: ids.parcel,
+  };
+  const parcel = await client.getShipment(reference);
+  assert.equal(parcel.providerSituationId, situation.lastStateSituationId);
+  assert.equal(parcel.normalizedStatus, "FAILED_DELIVERY");
+  assert.equal(
+    parcel.providerUpdatedAt.toISOString(),
+    "2026-01-03T00:00:00.123Z",
+  );
+  const original = data;
+  for (const invalid of [
+    { situation: { id: "invalid" } },
+    { lastStateSituationId: "invalid" },
+    { situation: { id: { $ne: null } } },
+    { lastSituationUpdateAt: "invalid" },
+  ]) {
+    data = { ...original, ...invalid };
+    await rejection(client.getShipment(reference), "ABEX_INVALID_RESPONSE");
   }
 });
 
