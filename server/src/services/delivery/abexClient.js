@@ -12,6 +12,7 @@ import {
   abexParcel,
   abexResponseError,
   abexState,
+  abexDefaultState,
   isAbexId,
   mapAbexOrder,
   parseAbexBulkResult,
@@ -812,6 +813,16 @@ export class AbexClient {
       );
       parcel.workflowId = workflow?.id;
       parcel.normalizedStatus = normalizedStatus;
+    }
+    // Explicit agency UUID mappings win; otherwise fall back to ABEX's
+    // standard state system name so tracking and webhooks are not stalled
+    // when no per-agency workflow mapping has been configured.
+    if (parcel.stateId && !parcel.normalizedStatus) {
+      const fallback = abexDefaultState(parcel.stateName);
+      if (fallback) {
+        parcel.normalizedStatus = fallback.status || undefined;
+        parcel.statusAcknowledged = true;
+      }
     }
     return parcel;
   }

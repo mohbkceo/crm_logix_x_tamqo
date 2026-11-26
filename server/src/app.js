@@ -247,7 +247,7 @@ app.get(
       configured: Boolean(agency?.credentialsConfigured ||
         (agency?.apiProvider === "PROCOLIS" && process.env.DELIVERY_API_TOKEN && process.env.DELIVERY_API_KEY)),
       writesEnabled: abex && abexWritesEnabled(),
-      statusMappingConfigured: abex ? Boolean(agency.config?.abex?.states?.length) : Boolean(agency && mapping.configured),
+      statusMappingConfigured: abex ? true : Boolean(agency && mapping.configured),
       statusMappingError: abex ? null : mapping.error,
       invalidStatusMappings: abex ? 0 : mapping.invalidEntries || 0,
     });

@@ -350,6 +350,7 @@ export function abexParcel(data, sanitize) {
     stateLocked:
       data.state?.isLocked === true || data.state?.isBlocking === true,
     providerSituationId,
+    stateName,
     providerStatus: situationName || stateName || stateId,
     providerUpdatedAt,
     providerCreatedAt: data.createdAt ? new Date(data.createdAt) : undefined,
@@ -382,6 +383,35 @@ export function requireAbexIdentity(
     409,
     "ABEX_IDENTITY_MISMATCH",
   );
+}
+
+// Built-in mapping for ABEX's standard workflow state system names. Used only
+// when the agency has no explicit workflow/state UUID mapping for the parcel's
+// state. `null` marks a known pre-courier state that intentionally leaves the
+// CRM order unchanged. Unlisted names remain unmapped and require review.
+// Readiness writes still require an explicit READY_TO_SHIP UUID mapping.
+export const ABEX_DEFAULT_STATE_STATUSES = Object.freeze({
+  commande_recue: null,
+  en_preparation: null,
+  pret_a_expedier: "READY_TO_SHIP",
+  dispatch: "SHIPPED",
+  confirme_au_bureau: "SHIPPED",
+  en_livraison: "SHIPPED",
+  sortie_en_livraison: "OUT_FOR_DELIVERY",
+  livre: "DELIVERED",
+  encaisse: "DELIVERED",
+  recupere_par_fournisseur: "RETURNED",
+});
+
+export function abexDefaultState(stateName) {
+  const key = String(stateName || "")
+    .normalize("NFD")
+    .replace(/[̀-ͯ]/g, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, "_");
+  if (!key || !Object.hasOwn(ABEX_DEFAULT_STATE_STATUSES, key)) return null;
+  return { status: ABEX_DEFAULT_STATE_STATUSES[key] };
 }
 
 export function abexState(settings, workflows, parcel) {

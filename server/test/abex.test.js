@@ -848,6 +848,62 @@ test("parcel snapshots with distinct situation UUIDs use the explicit workflow s
   }
 });
 
+test("standard ABEX state names map without per-agency UUID mappings and explicit mappings still win", async (t) => {
+  const stateId = uuid(711);
+  const reference = {
+    tracking: "ABX-UNIT-2",
+    externalId: "ORD-FIXTURE",
+    providerParcelId: ids.parcel,
+  };
+  const parcelWith = (name) => ({
+    id: ids.parcel,
+    trackingNumber: "ABX-UNIT-2",
+    externalId: "ORD-FIXTURE",
+    state: { id: stateId, name },
+    lastStateUpdateAt: "2026-01-02T00:00:00Z",
+  });
+  const { abex, client, urls } = fakeAbex(t);
+  let data;
+  abex.handlers["GET /api/v1/parcels/ABX-UNIT-2"] = () => ({ status: 200, data });
+  for (const [name, status] of [
+    ["sortie_en_livraison", "OUT_FOR_DELIVERY"],
+    ["en_livraison", "SHIPPED"],
+    ["dispatch", "SHIPPED"],
+    ["livre", "DELIVERED"],
+    ["encaisse", "DELIVERED"],
+    ["recupere_par_fournisseur", "RETURNED"],
+  ]) {
+    data = parcelWith(name);
+    const parcel = await client.getShipment(reference);
+    assert.equal(parcel.normalizedStatus, status, name);
+    assert.equal(parcel.statusAcknowledged, true);
+  }
+  data = parcelWith("commande_recue");
+  const received = await client.getShipment(reference);
+  assert.equal(received.normalizedStatus, undefined);
+  assert.equal(received.statusAcknowledged, true);
+  data = parcelWith("unlisted_state");
+  const unknown = await client.getShipment(reference);
+  assert.equal(unknown.normalizedStatus, undefined);
+  assert.equal(unknown.statusAcknowledged, undefined);
+  // No workflow catalog read is needed for the built-in fallback.
+  assert.ok(urls().every((url) => !url.includes("workflows")));
+
+  const workflowId = uuid(712);
+  const explicit = fakeAbex(t, {
+    settings: { states: [{ workflowId, stateId, status: "FAILED_DELIVERY" }] },
+  });
+  explicit.abex.handlers["GET /api/v1/parcels/ABX-UNIT-2"] = () => ({
+    status: 200,
+    data: parcelWith("livre"),
+  });
+  explicit.abex.handlers["POST /api/v1/workflows/search"] = (req) =>
+    page([{ id: workflowId, states: [{ id: stateId }] }], req.data);
+  const mapped = await explicit.client.getShipment(reference);
+  assert.equal(mapped.normalizedStatus, "FAILED_DELIVERY");
+  assert.equal(mapped.statusAcknowledged, undefined);
+});
+
 test("authentication and tenant configuration problems stop before or at the first request", async (t) => {
   const missing = fakeAbex(t, { creds: {} });
   const notConfigured = await rejection(

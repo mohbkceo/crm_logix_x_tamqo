@@ -753,7 +753,9 @@ export class DeliverySyncService {
         s.providerParcelId = parcel.parcelId;
         s.providerWorkflowId = parcel.workflowId;
         s.providerStateId = parcel.stateId;
-        s.providerStatusMapped = Boolean(parcel.normalizedStatus);
+        s.providerStatusMapped = Boolean(
+          parcel.normalizedStatus || parcel.statusAcknowledged,
+        );
         if (parcel.providerCreatedAt)
           s.providerCreatedAt = parcel.providerCreatedAt;
       }
@@ -865,6 +867,7 @@ export class DeliverySyncService {
       } else if (
         !status &&
         !pendingReady &&
+        !(abex && parcel.statusAcknowledged) &&
         (options.requireStatus || parcel.providerStatus)
       ) {
         result = "UNKNOWN_STATUS";
