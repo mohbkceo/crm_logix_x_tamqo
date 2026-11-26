@@ -524,6 +524,8 @@ function OrderEditor({ original }) {
           })),
           deliveryCharged: Number(deliveryCost),
           payment: { method: payment.method, amountPaidOnline: paid },
+          // Lets the Telegram notification wait for the images uploaded below.
+          ...(id ? {} : { notificationImageCount: optionalImages.length }),
         },
       });
       let imageWarning = "";

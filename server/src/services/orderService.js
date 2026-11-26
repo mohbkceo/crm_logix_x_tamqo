@@ -26,6 +26,7 @@ import { ensureReturnExpense, reverseReturnExpense } from "./delivery/deliveryFi
 import { providerFor } from "./delivery/deliveryProviderFactory.js";
 import { abexOrderSnapshot } from "./delivery/abexMapper.js";
 import { mapOrderToPackage, sanitizeProviderData } from "./delivery/deliveryMapper.js";
+import { enqueueOrderCreated } from "./notifications/notificationOutboxService.js";
 export const transaction = (fn) => mongoose.connection.transaction(fn);
 export async function allocateOrderNumber() {
   // Allocate outside order transactions so rolled-back numbers are never reused.
@@ -162,7 +163,7 @@ export async function materialize(input, session, existing, { persistCustomer = 
     ...calculateFinancials(items, deliveryCharged, p.payment),
   };
 }
-export async function createOrder(input, actor = "admin") {
+export async function createOrder(input, actor = "admin", { notify = false, expectedImages = 0 } = {}) {
   const orderNumber = await allocateOrderNumber();
   return transaction(async (session) => {
     const data = await materialize(input, session);
@@ -204,6 +205,42 @@ export async function createOrder(input, actor = "admin") {
       {},
       session,
     );
+    // Manual CRM creation only (imports never pass notify). Committed atomically
+    // with the order; delivery happens later in the notification worker.
+    if (notify) await enqueueOrderCreated(order, session, { expectedImages });
+    return order;
+  });
+}
+// Shared by the CRM cancel route and Telegram actions: courier locks and
+// provider-cancellation confirmation are always enforced.
+export async function cancelOrder(id, actor, { providerCancellationConfirmed = false } = {}) {
+  return transaction(async (session) => {
+    const shipment = await Shipment.findOne({ orderId: id }).session(session);
+    assert(
+      !shipment?.lockUntil || shipment.lockUntil < new Date(),
+      "A courier request is in progress. Wait and reconcile before cancelling.",
+      409,
+    );
+    assert(
+      !shipment?.creationAttemptedAt || providerCancellationConfirmed,
+      "Resolve cancellation with the provider and confirm it before cancelling this order.",
+      409,
+    );
+    const order = await transition(id, "CANCELLED", actor, session);
+    if (shipment?.creationAttemptedAt)
+      await OrderEvent.create(
+        [
+          {
+            orderId: order._id,
+            kind: "SHIPMENT",
+            type: "SHIPMENT_CANCELLATION_CONFIRMED",
+            actor,
+            message:
+              "Admin confirmed the courier parcel was cancelled outside this workspace.",
+          },
+        ],
+        { session },
+      );
     return order;
   });
 }

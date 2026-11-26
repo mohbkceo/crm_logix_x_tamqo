@@ -22,6 +22,7 @@ import {
   Modal,
   Badge,
 } from "../components";
+import { TelegramSettings } from "./TelegramSettings";
 const resources = [
   ["plans", "Tamqo plans"],
   ["products", "Logix products"],
@@ -29,6 +30,7 @@ const resources = [
   ["wilayas", "Wilayas & shipping"],
   ["expense-categories", "Expense categories"],
   ["delivery", "Delivery integration"],
+  ["telegram", "Telegram"],
 ];
 export function Settings() {
   const user = useUser();
@@ -39,6 +41,7 @@ export function Settings() {
     wilayas: P.wilayas.manage,
     "expense-categories": P.settings.manage,
     delivery: P.deliveryAgencies.view,
+    telegram: P.settings.view,
   };
   const config = useConfig(),
     delivery = useApi("/delivery/status"),
@@ -175,7 +178,9 @@ export function Settings() {
           {message}
         </div>
       )}
-      {tab !== "delivery" ? (
+      {tab === "telegram" ? (
+        <TelegramSettings />
+      ) : tab !== "delivery" ? (
         <Panel
           title={label}
           subtitle={

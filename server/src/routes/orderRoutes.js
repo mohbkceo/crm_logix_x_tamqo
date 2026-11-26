@@ -8,7 +8,11 @@ import {
   refundOrder,
   transition,
   transaction,
+  cancelOrder,
 } from "../services/orderService.js";
+import {
+  releaseOrderCreated,
+} from "../services/notifications/notificationOutboxService.js";
 import {
   orderFilter,
   pagination,
@@ -94,8 +98,14 @@ router.use(async (req, _res, next) => {
   next();
 });
 router.post("/", async (req, res) => {
-  const order = await createOrder(req.body, req.actor);
+  // Images upload in follow-up requests; the Telegram job waits for them.
+  const expectedImages = z.coerce.number().int().min(0).max(6).catch(0)
+    .parse(req.body?.notificationImageCount ?? 0);
+  const order = await createOrder(req.body, req.actor, { notify: true, expectedImages });
   const delivery = await deliveryService.createAutomatically(order, req.actor);
+  // Release only after courier synchronization so the notification carries
+  // the latest Shipment tracking. Never fails the response.
+  await releaseOrderCreated(order._id);
   // Reload revision/status changed by shipment synchronization, with the committed
   // order as fallback if the database becomes unavailable after creation.
   const current = await Order.findById(order._id)
@@ -207,44 +217,7 @@ router.post("/:id/cancel", async (req, res) => {
     .boolean()
     .optional()
     .parse(req.body.providerCancellationConfirmed);
-  res.json(
-    await transaction(async (session) => {
-      const shipment = await Shipment.findOne({
-        orderId: req.params.id,
-      }).session(session);
-      assert(
-        !shipment?.lockUntil || shipment.lockUntil < new Date(),
-        "A courier request is in progress. Wait and reconcile before cancelling.",
-        409,
-      );
-      assert(
-        !shipment?.creationAttemptedAt || confirmed,
-        "Resolve cancellation with the provider and confirm it before cancelling this order.",
-        409,
-      );
-      const order = await transition(
-        req.params.id,
-        "CANCELLED",
-        req.actor,
-        session,
-      );
-      if (shipment?.creationAttemptedAt)
-        await OrderEvent.create(
-          [
-            {
-              orderId: order._id,
-              kind: "SHIPMENT",
-              type: "SHIPMENT_CANCELLATION_CONFIRMED",
-              actor: req.actor,
-              message:
-                "Admin confirmed the courier parcel was cancelled outside this workspace.",
-            },
-          ],
-          { session },
-        );
-      return order;
-    }),
-  );
+  res.json(await cancelOrder(req.params.id, req.actor, { providerCancellationConfirmed: confirmed }));
 });
 router.post("/:id/status", async (req, res) => {
   const status = z.enum(STATUSES).parse(req.body.status);

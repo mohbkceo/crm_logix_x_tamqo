@@ -28,6 +28,8 @@ import { agencyRoutes, verifyAgencyConnection } from "./routes/agencyRoutes.js";
 import { teamRoutes, employeeOptions } from "./routes/teamRoutes.js";
 import { deliverySyncRoutes } from "./routes/deliverySyncRoutes.js";
 import { abexWebhookRoutes } from "./routes/abexWebhookRoutes.js";
+import { telegramRoutes } from "./routes/telegramRoutes.js";
+import { createTelegramWebhookRouter, webhookHooks } from "./services/notifications/telegram/telegramWebhook.js";
 import { P, can, requirePermission, orderScope } from "./authorization.js";
 import { deliveryService } from "./services/delivery/deliveryService.js";
 import { normalizePhone } from "./domain/order.js";
@@ -53,6 +55,9 @@ app.use(
 // Signed server-to-server requests need the original bytes. Only this exact
 // route precedes JSON parsing, browser-origin checks, and CRM authentication.
 app.use("/api/webhooks/delivery/abex", abexWebhookRoutes);
+// Telegram server-to-server updates: verified by the webhook secret header,
+// never by CRM sessions/CORS, and never treated as an authenticated user.
+app.use("/api/webhooks/telegram", createTelegramWebhookRouter({ onAccepted: () => webhookHooks.wake() }));
 app.use(cors({ origin: config.clientUrl, credentials: true }));
 app.use(express.json({ limit: "150kb" }), cookieParser());
 app.use(
@@ -87,6 +92,7 @@ app.use("/api/delivery-sync", deliverySyncRoutes);
 app.use("/api/analytics", teamRoutes);
 app.get("/api/employees", employeeOptions);
 app.use("/api/config", configRoutes);
+app.use("/api/settings/telegram", telegramRoutes);
 app.use("/api/orders", orderRoutes);
 app.use('/api/tracking', trackingRoutes);
 app.use('/api/order-media', mediaRoutes);

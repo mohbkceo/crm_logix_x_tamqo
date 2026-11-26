@@ -1,0 +1,136 @@
+.telegram-settings {
+  display: grid;
+  gap: 16px;
+}
+.telegram-settings code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+.telegram-token {
+  display: grid;
+  gap: 10px;
+  max-width: 520px;
+}
+.telegram-warning {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  color: var(--muted);
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 4px 0;
+}
+.telegram-destinations {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 12px;
+}
+.telegram-destinations > li {
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 12px 14px;
+  display: grid;
+  gap: 10px;
+  min-width: 0;
+}
+.telegram-destination-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+.telegram-destinations dl {
+  margin: 0;
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px 16px;
+}
+.telegram-destinations dt {
+  color: var(--muted);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.telegram-destinations dd {
+  margin: 2px 0 0;
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.telegram-steps {
+  margin-top: 14px;
+  padding: 12px 14px;
+  background: var(--soft);
+  border-radius: 8px;
+  color: var(--muted);
+}
+.telegram-steps ol {
+  margin: 6px 0 0;
+  padding-left: 20px;
+  line-height: 1.8;
+}
+.telegram-advanced > summary {
+  cursor: pointer;
+  padding: 4px 0 12px;
+  font-weight: 600;
+}
+.telegram-advanced h3 {
+  margin: 12px 0 4px;
+  font-size: 13px;
+}
+.telegram-failures {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 6px;
+}
+.telegram-failures li {
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  align-items: center;
+  border-bottom: 1px solid var(--line);
+  padding: 6px 0;
+}
+.telegram-business {
+  border: 0;
+  margin: 0 0 12px;
+  padding: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 18px;
+}
+.telegram-business legend {
+  font-weight: 600;
+  margin-bottom: 6px;
+}
+.telegram-business small {
+  flex-basis: 100%;
+}
+.telegram-code {
+  display: grid;
+  gap: 10px;
+}
+.telegram-code-value {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  background: var(--soft);
+  border: 1px solid var(--line);
+  border-radius: 6px;
+  padding: 8px 10px;
+  width: fit-content;
+  max-width: 100%;
+}
+.telegram-code-value code {
+  font-size: 15px;
+  letter-spacing: 0.06em;
+}
+.telegram-settings .danger-text {
+  color: #b91c1c;
+}

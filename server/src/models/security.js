@@ -29,12 +29,21 @@ const userSchema = new Schema(
     operationalRoles: [{ type: String, enum: OPERATIONAL_ROLES }],
     requestedOperationalRole: { type: String, enum: OPERATIONAL_ROLES },
     whatsappPhone: { type: String, default: '', select: false },
+    // Numeric Telegram user ID (as a string) linked through a single-use code.
+    // Usernames are display-only and never used to authenticate.
+    telegramUserId: String,
+    telegramUsername: String,
+    telegramLinkedAt: Date,
     lastLoginAt: Date,
     createdBy: actorSchema,
   },
   { timestamps: true, optimisticConcurrency: true },
 );
 userSchema.index({ businessAccess: 1 });
+userSchema.index(
+  { telegramUserId: 1 },
+  { unique: true, partialFilterExpression: { telegramUserId: { $type: "string" } } },
+);
 export const User = mongoose.model("User", userSchema);
 const sessionSchema = new Schema(
   {

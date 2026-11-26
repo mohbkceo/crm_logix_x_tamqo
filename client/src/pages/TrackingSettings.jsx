@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { api, useApi, human } from "../api";
 import { P, can, useUser } from "../access";
+import { TelegramLinkCard } from "./TelegramSettings";
 import {
   PageHeader,
   Panel,
@@ -374,6 +375,7 @@ export function MyProfile() {
           required={policy.data?.requireWhatsApp}
         />
       )}
+      <TelegramLinkCard />
     </>
   );
 }

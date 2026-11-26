@@ -19,6 +19,7 @@ import {
 } from "../services/cloudinaryStorage.js";
 import { queueMediaCleanup } from "../services/mediaCleanup.js";
 import { canManageIssueMedia } from "../services/mediaAccess.js";
+import { orderImagesChanged } from "../services/notifications/notificationOutboxService.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -229,6 +230,9 @@ function mediaRouter({ access, base, folder, route }) {
           );
           return present(current, base);
         });
+        // A waiting Telegram ORDER_CREATED job is released once its expected
+        // post-creation uploads have committed. Best effort; never throws.
+        if (creating && folder === "orders") await orderImagesChanged(req.params.orderId);
         res.status(creating ? 201 : 200).json(result);
       },
     );
