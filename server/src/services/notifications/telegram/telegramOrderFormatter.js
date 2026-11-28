@@ -55,6 +55,10 @@ export function orderSummary(order, shipment, { title = "🆕 ORDER" } = {}) {
   return [
     `<b>${title} · #${escapeHtml(order.orderNumber)}</b>`,
     "",
+    // Employee who submitted the order (historical name stored on the order).
+    ...(order.createdBy?.name
+      ? [`👤 By: ${escapeHtml(order.createdBy.name)}`, ""]
+      : []),
     `<b>${statusLine(order.status)}</b>`,
     "",
     `📦 Tracking: ${tracking ? `<code>${escapeHtml(tracking)}</code>` : "Pending"}`,
@@ -75,21 +79,22 @@ export const cb = {
   page: (command, page) => `p:${command}:${page}`,
 };
 
-export function summaryKeyboard(order, shipment) {
+// Telegram only accepts http(s)/tg URL buttons; anything else is dropped so a
+// malformed contact never breaks the whole keyboard.
+const contactButton = (contact) =>
+  contact?.name && /^https:\/\/wa\.me\/[1-9]\d{7,14}$/.test(contact.url || "")
+    ? [{ text: `Contact ${String(contact.name).slice(0, 40)}`, url: contact.url }]
+    : [];
+
+// `contact` is the order creator's WhatsApp link from loadCreatorContact().
+export function summaryKeyboard(order, shipment, contact = null) {
   const url = orderUrl(order);
   const first = [
     ...(url ? [{ text: "Open Order", url }] : []),
     { text: "Update Status", callback_data: cb.statusMenu(order) },
   ];
   const second = [
-    ...(shipment?.tracking
-      ? [
-          {
-            text: "Copy Tracking",
-            copy_text: { text: String(shipment.tracking).slice(0, 256) },
-          },
-        ]
-      : []),
+    ...contactButton(contact),
     ...(order.customer?.phoneA
       ? [
           {

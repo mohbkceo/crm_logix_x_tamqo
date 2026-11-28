@@ -92,9 +92,40 @@ export async function orderImagesChanged(orderId) {
       status: "WAITING",
       creationSettledAt: { $exists: true },
     }).lean();
-    if (!job || (await imageCount(orderId)) < job.expectedImages) return;
+    if (!job) return;
+    if ((await imageCount(orderId)) < job.expectedImages) {
+      // Uploads are still arriving: keep waiting while progress is made so a
+      // slow connection does not send a partial album.
+      await NotificationOutbox.updateOne(
+        { _id: job._id, status: "WAITING" },
+        { $set: { waitUntil: new Date(Date.now() + IMAGE_GRACE_MS) } },
+      );
+      return;
+    }
     await NotificationOutbox.updateOne(
       { _id: job._id, status: "WAITING" },
+      {
+        $set: { status: "PENDING", nextAttemptAt: new Date() },
+        $unset: { waitUntil: 1 },
+      },
+    );
+  } catch {
+    /* Grace expiry releases the job. */
+  }
+}
+
+// Called when the client finished its post-creation upload sequence with some
+// failures: the announced count will never be reached, so the job is sent now
+// with every image that was saved instead of waiting for the grace period.
+// Only releases after creation settled (courier synchronization finished).
+export async function orderUploadsComplete(orderId) {
+  try {
+    await NotificationOutbox.updateOne(
+      {
+        eventKey: orderCreatedKey(orderId),
+        status: "WAITING",
+        creationSettledAt: { $exists: true },
+      },
       {
         $set: { status: "PENDING", nextAttemptAt: new Date() },
         $unset: { waitUntil: 1 },

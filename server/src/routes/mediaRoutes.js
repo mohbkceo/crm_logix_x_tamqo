@@ -19,7 +19,10 @@ import {
 } from "../services/cloudinaryStorage.js";
 import { queueMediaCleanup } from "../services/mediaCleanup.js";
 import { canManageIssueMedia } from "../services/mediaAccess.js";
-import { orderImagesChanged } from "../services/notifications/notificationOutboxService.js";
+import {
+  orderImagesChanged,
+  orderUploadsComplete,
+} from "../services/notifications/notificationOutboxService.js";
 
 const upload = multer({
   storage: multer.memoryStorage(),
@@ -245,9 +248,19 @@ export const issueMediaRouter = mediaRouter({
   folder: "issues",
   route: "/:orderId/:issueId",
 });
-export default mediaRouter({
+const orderMediaRouter = mediaRouter({
   access: orderAccess,
   base: "order-media",
   folder: "orders",
   route: "/:orderId",
 });
+// The order form announces how many images it will upload after creation
+// (notificationImageCount). When some of them fail, it reports the end of the
+// sequence so the Telegram notification is sent with the saved images now.
+// Same write access as adding an image; changes no order data.
+orderMediaRouter.post("/:orderId/uploads-complete", async (req, res) => {
+  await orderAccess(req, true, null, true);
+  await orderUploadsComplete(req.params.orderId);
+  res.status(204).end();
+});
+export default orderMediaRouter;

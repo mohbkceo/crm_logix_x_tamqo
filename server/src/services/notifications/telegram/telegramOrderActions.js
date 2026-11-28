@@ -19,6 +19,7 @@ import {
 import { supportsReadiness } from "../../delivery/deliveryProviderFactory.js";
 import { AppError } from "../../../errors.js";
 import { cb, orderSummary, summaryKeyboard } from "./telegramOrderFormatter.js";
+import { loadCreatorContact } from "./telegramOrderCreator.js";
 
 // Every Telegram action maps onto an existing CRM workflow. Statuses with
 // dedicated, provider-facing flows (READY_TO_SHIP for non-production orders,
@@ -114,7 +115,7 @@ export async function loadOrder(orderId) {
       )
       .lean(),
   ]);
-  return { order, shipment };
+  return { order, shipment, contact: await loadCreatorContact(order) };
 }
 
 export class StaleActionError extends AppError {
@@ -192,7 +193,11 @@ export async function refreshOrderMessages(
     .select("deliveries.chatId deliveries.summaryMessageId")
     .lean();
   const text = orderSummary(order, shipment);
-  const keyboard = summaryKeyboard(order, shipment);
+  const keyboard = summaryKeyboard(
+    order,
+    shipment,
+    await loadCreatorContact(order),
+  );
   for (const job of jobs)
     for (const d of job.deliveries) {
       if (!d.summaryMessageId) continue;

@@ -16,6 +16,40 @@ import { findAbexCommune } from "../../../shared/abexTerritories.js";
 const businesses = ["TAMQO", "LOGIX"];
 const currentRequest = { keepPreviousData: false };
 const imageTypes = ["image/jpeg", "image/png", "image/webp"];
+// Same limits as the server (cloudinaryStorage MAX_IMAGE_BYTES, six per order).
+const MAX_ORDER_IMAGES = 6;
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024;
+
+// Uploads staged images one at a time: each successful upload increments the
+// order revision, which the next request must present. A failed upload does
+// not stop the remaining files; the current revision is re-read so the
+// sequence can continue even if the failure was ambiguous.
+async function uploadStagedImages(orderId, revision, staged) {
+  const failed = [];
+  let uploaded = 0;
+  let current = revision;
+  for (const { file } of staged) {
+    try {
+      const upload = new FormData();
+      upload.append("image", file);
+      upload.append("expectedRevision", current);
+      const saved = await api(`/order-media/${orderId}`, {
+        method: "POST",
+        body: upload,
+      });
+      current = saved.revision;
+      uploaded++;
+    } catch (error) {
+      failed.push({ name: file.name, message: error.message });
+      try {
+        current = (await api(`/order-media/${orderId}`)).revision;
+      } catch {
+        /* Keep the last known revision. */
+      }
+    }
+  }
+  return { uploaded, failed };
+}
 
 function initialForm(original, config) {
   const defaultSource =
@@ -170,7 +204,9 @@ function OrderEditor({ original }) {
   const [form, setForm] = useState(() => initialForm(original, config));
   const [communeWilaya, setCommuneWilaya] = useState(form.location.wilayaId);
   const [keepSavedRate, setKeepSavedRate] = useState(Boolean(original));
+  // Staged files: [{ key, file }], uploaded after the order is saved.
   const [optionalImages, setOptionalImages] = useState([]);
+  const stagedKey = useRef(0);
   const [imageError, setImageError] = useState("");
   const [itemError, setItemError] = useState("");
   const [saveError, setSaveError] = useState("");
@@ -292,7 +328,9 @@ function OrderEditor({ original }) {
   const balance = Math.round((total - paid) * 100) / 100;
   const totalLabel =
     deliveryCost === "" && items.length ? "Total so far" : "Total";
-  const imageSlots = 6 - (original?.images?.length || 0);
+  const existingImages = original?.images?.length || 0;
+  const imageSlots = Math.max(0, MAX_ORDER_IMAGES - existingImages);
+  const remainingSlots = Math.max(0, imageSlots - optionalImages.length);
 
   function set(key, value) {
     setForm((current) => ({ ...current, [key]: value }));
@@ -438,22 +476,44 @@ function OrderEditor({ original }) {
 
   function chooseImages(event) {
     const files = Array.from(event.target.files);
+    // Reset so the same file can be picked again after it was removed.
     event.target.value = "";
     if (!files.length) return;
-    if (
-      files.length > imageSlots ||
-      files.some(
-        (file) =>
-          !imageTypes.includes(file.type) || file.size > 5 * 1024 * 1024,
+    const problems = [];
+    const accepted = [];
+    let free = remainingSlots;
+    for (const file of files) {
+      if (!imageTypes.includes(file.type))
+        problems.push(`${file.name}: only JPEG, PNG or WebP images are supported.`);
+      else if (file.size > MAX_IMAGE_BYTES)
+        problems.push(`${file.name}: larger than 5 MB.`);
+      else if (
+        optionalImages.some(
+          (staged) =>
+            staged.file.name === file.name &&
+            staged.file.size === file.size &&
+            staged.file.lastModified === file.lastModified,
+        )
       )
-    ) {
-      setImageError(
-        `Select up to ${imageSlots} JPEG, PNG or WebP images, 5 MB each.`,
-      );
-      return;
+        problems.push(`${file.name}: already selected.`);
+      else if (free <= 0)
+        problems.push(
+          `${file.name}: not added, an order can have up to ${MAX_ORDER_IMAGES} images.`,
+        );
+      else {
+        accepted.push({ key: `${Date.now()}-${stagedKey.current++}`, file });
+        free--;
+      }
     }
+    setImageError(problems.join(" "));
+    // Append to the staged selection; earlier picks are kept.
+    if (accepted.length)
+      setOptionalImages((current) => [...current, ...accepted]);
+  }
+
+  function removeStagedImage(key) {
+    setOptionalImages((current) => current.filter((item) => item.key !== key));
     setImageError("");
-    setOptionalImages(files);
   }
 
   function courierFields(value, current = false) {
@@ -529,20 +589,24 @@ function OrderEditor({ original }) {
         },
       });
       let imageWarning = "";
-      let imageRevision = order.revision;
-      for (const image of optionalImages) {
-        try {
-          const upload = new FormData();
-          upload.append("image", image);
-          upload.append("expectedRevision", imageRevision);
-          const saved = await api(`/order-media/${order._id}`, {
-            method: "POST",
-            body: upload,
-          });
-          imageRevision = saved.revision;
-        } catch (error) {
-          imageWarning = `Order saved. Optional image upload failed: ${error.message} You can attach it from Edit order.`;
-          break;
+      if (optionalImages.length) {
+        const { uploaded, failed } = await uploadStagedImages(
+          order._id,
+          order.revision,
+          optionalImages,
+        );
+        if (failed.length) {
+          imageWarning =
+            `Order saved. ${uploaded} of ${optionalImages.length} images uploaded; ` +
+            `${failed.length} failed: ` +
+            failed.map((f) => `${f.name} (${f.message})`).join("; ") +
+            ". You can attach them from Edit order.";
+          // The Telegram notification waits for the announced images; tell it
+          // the upload sequence is over so it is sent with the saved ones.
+          if (!id)
+            await api(`/order-media/${order._id}/uploads-complete`, {
+              method: "POST",
+            }).catch(() => {});
         }
       }
       navigate("/orders/" + order._id, {
@@ -1224,20 +1288,29 @@ function OrderEditor({ original }) {
               label="Reference images (optional)"
               initiallyOpen={Boolean(original?.images?.length)}
             >
-              {imageSlots > 0 && (
-                <Field
-                  label="Order images"
-                  hint={`Up to ${imageSlots} JPEG, PNG or WebP images, 5 MB each. Images upload after the order is saved.`}
-                  error={imageError}
-                >
-                  <input
-                    type="file"
-                    multiple={imageSlots > 1}
-                    accept={imageTypes.join(",")}
-                    onChange={chooseImages}
-                  />
-                </Field>
-              )}
+              <Field
+                label="Order images"
+                hint={`JPEG, PNG or WebP, 5 MB each, up to ${MAX_ORDER_IMAGES} per order. You can add more in several selections; images upload after the order is saved.`}
+                error={imageError}
+              >
+                <input
+                  type="file"
+                  multiple
+                  accept={imageTypes.join(",")}
+                  disabled={remainingSlots === 0}
+                  onChange={chooseImages}
+                />
+              </Field>
+              <p className="note" aria-live="polite" data-testid="image-count">
+                {existingImages + optionalImages.length} of {MAX_ORDER_IMAGES}{" "}
+                images
+                {existingImages > 0 &&
+                  ` (${existingImages} saved, ${optionalImages.length} new)`}
+                {" · "}
+                {remainingSlots === 0
+                  ? "no slots remaining"
+                  : `${remainingSlots} ${remainingSlots === 1 ? "slot" : "slots"} remaining`}
+              </p>
               <div className="tracking-image-strip">
                 {original?.images?.map((image, index) => (
                   <img
@@ -1246,8 +1319,19 @@ function OrderEditor({ original }) {
                     alt={`Reference image ${index + 1}`}
                   />
                 ))}
-                {optionalImages.map((file, index) => (
-                  <OptionalImagePreview key={index} file={file} />
+                {optionalImages.map(({ key, file }) => (
+                  <span className="staged-image" key={key}>
+                    <OptionalImagePreview file={file} />
+                    <button
+                      type="button"
+                      className="staged-image-remove"
+                      aria-label={`Remove ${file.name}`}
+                      title={`Remove ${file.name}`}
+                      onClick={() => removeStagedImage(key)}
+                    >
+                      <Trash2 size={14} aria-hidden="true" />
+                    </button>
+                  </span>
                 ))}
               </div>
               {optionalImages.length > 0 && (

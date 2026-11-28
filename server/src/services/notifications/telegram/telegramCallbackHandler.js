@@ -4,6 +4,7 @@ import {
   summaryKeyboard,
   humanStatus,
 } from "./telegramOrderFormatter.js";
+import { loadCreatorContact } from "./telegramOrderCreator.js";
 import { LISTS, renderList } from "./telegramQueries.js";
 import {
   availableActions,
@@ -74,13 +75,13 @@ export async function handleCallback(query, { client }) {
       await edit(page.text, page.keyboard);
       return answer();
     }
-    const { order, shipment } = await loadOrder(parsed.id);
+    const { order, shipment, contact } = await loadOrder(parsed.id);
     if (!order || order.deletedAt)
       return answer("This order is no longer available.", true);
     if (parsed.kind === "back") {
       await edit(
         orderSummary(order, shipment),
-        summaryKeyboard(order, shipment),
+        summaryKeyboard(order, shipment, contact),
       );
       return answer();
     }
@@ -117,7 +118,11 @@ export async function handleCallback(query, { client }) {
     );
     await edit(
       orderSummary(updated.order, updated.shipment),
-      summaryKeyboard(updated.order, updated.shipment),
+      summaryKeyboard(
+        updated.order,
+        updated.shipment,
+        await loadCreatorContact(updated.order),
+      ),
     );
     await refreshOrderMessages(client, updated.order, updated.shipment, {
       except: { chatId: message.chat.id, messageId: message.message_id },
@@ -132,7 +137,7 @@ export async function handleCallback(query, { client }) {
       if (latest?.order)
         await edit(
           orderSummary(latest.order, latest.shipment),
-          summaryKeyboard(latest.order, latest.shipment),
+          summaryKeyboard(latest.order, latest.shipment, latest.contact),
         ).catch(() => {});
       return answer(new StaleActionError().message, true);
     }

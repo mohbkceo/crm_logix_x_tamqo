@@ -5,6 +5,7 @@ import {
 import { Order, Shipment } from "../../../models/index.js";
 import { orderSummary, summaryKeyboard } from "./telegramOrderFormatter.js";
 import { loadOrderPhotos } from "./telegramOrderMedia.js";
+import { loadCreatorContact } from "./telegramOrderCreator.js";
 import { classifyTelegramFailure } from "./telegramClient.js";
 import { activeClient } from "./telegramSettings.js";
 import {
@@ -78,7 +79,11 @@ async function sendPhotos(client, delivery, photos) {
 
 export async function processOrderCreatedJob(
   job,
-  { getClient = activeClient, loadPhotos = loadOrderPhotos } = {},
+  {
+    getClient = activeClient,
+    loadPhotos = loadOrderPhotos,
+    loadContact = loadCreatorContact,
+  } = {},
 ) {
   const { setting, client } = await getClient();
   if (!setting.enabled || !client)
@@ -117,6 +122,8 @@ export async function processOrderCreatedJob(
   const shipment = await Shipment.findOne({ orderId: order._id })
     .select("tracking syncStatus")
     .lean();
+  // Current WhatsApp number of the employee who created the order.
+  const contact = await loadContact(order);
   let photos = null;
   let retryAfter = 0;
   let lastError = "";
@@ -129,12 +136,22 @@ export async function processOrderCreatedJob(
       if (!delivery.photosDone) {
         if ((order.images || []).length) {
           photos ??= await loadPhotos(order);
+          // Images that could not be read/converted are skipped; the rest are
+          // still sent and the gap is reported in the diagnostics.
+          const unreadable = photos.failed
+            ? `${photos.failed} of ${photos.total} images could not be prepared for Telegram.`
+            : "";
+          if (unreadable && index === 0)
+            await recordAdminError(unreadable, delivery, job);
           if (photos.photos.length) {
             try {
               const ids = await sendPhotos(client, delivery, photos.photos);
+              // Recorded before the summary is sent: a retry after this point
+              // never resends the album.
               await saveDelivery(job, index, {
                 photosDone: true,
                 photoMessageIds: ids,
+                ...(unreadable ? { lastError: unreadable } : {}),
               });
             } catch (error) {
               const failure = classifyTelegramFailure(error);
@@ -145,15 +162,24 @@ export async function processOrderCreatedJob(
                 photosDone: true,
                 lastError: "Images could not be delivered to Telegram.",
               });
+              await recordAdminError(
+                `Images could not be delivered to Telegram: ${failure.message}`,
+                delivery,
+                job,
+              );
             }
-          } else await saveDelivery(job, index, { photosDone: true });
+          } else
+            await saveDelivery(job, index, {
+              photosDone: true,
+              ...(unreadable ? { lastError: unreadable } : {}),
+            });
         } else await saveDelivery(job, index, { photosDone: true });
       }
       const message = await client.sendMessage({
         chatId: delivery.chatId,
         threadId: delivery.messageThreadId || undefined,
         text: orderSummary(order, shipment),
-        keyboard: summaryKeyboard(order, shipment),
+        keyboard: summaryKeyboard(order, shipment, contact),
       });
       await saveDelivery(job, index, {
         status: "SENT",

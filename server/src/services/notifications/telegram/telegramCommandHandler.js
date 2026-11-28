@@ -198,10 +198,10 @@ export async function handleCommand(
         return reply(
           `No accessible order matches <code>${escapeHtml(args.slice(0, 80))}</code>.`,
         );
-      const { order, shipment } = await loadOrder(id);
+      const { order, shipment, contact } = await loadOrder(id);
       return reply(
         orderSummary(order, shipment, { title: "📦 ORDER" }),
-        summaryKeyboard(order, shipment),
+        summaryKeyboard(order, shipment, contact),
       );
     }
     const code = LIST_BY_COMMAND[name];

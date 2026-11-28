@@ -645,7 +645,7 @@ test("destinations can be added, validated, edited, tested and deleted", async (
 
 // ------------------------------------------------------------ notifications
 
-test("formatter renders the compact summary, status emoji and copy buttons", () => {
+test("formatter renders the compact summary, creator, status emoji and buttons", () => {
   const order = {
     _id: new mongoose.Types.ObjectId(),
     revision: 3,
@@ -655,12 +655,15 @@ test("formatter renders the compact summary, status emoji and copy buttons", () 
     items: [{ quantity: 2 }, { quantity: 1 }],
     customer: { name: "Mo <b>hamed</b> & Co", phoneA: "0550000000" },
     location: { wilayaName: "Alger" },
+    createdBy: { userId: new mongoose.Types.ObjectId(), name: "Hi<chem> & Co" },
   };
   const text = formatter.orderSummary(order, { tracking: "ABEX-123456" });
   assert.equal(
     text,
     [
       "<b>🆕 ORDER · #ORD-2026-000123</b>",
+      "",
+      "👤 By: Hi&lt;chem&gt; &amp; Co",
       "",
       "<b>🟡 NEW</b>",
       "",
@@ -673,27 +676,55 @@ test("formatter renders the compact summary, status emoji and copy buttons", () 
     ].join("\n"),
   );
   assert.match(formatter.orderSummary(order, null), /Tracking: Pending/);
+  // Legacy orders without a creator keep the previous layout.
+  const legacy = formatter.orderSummary({ ...order, createdBy: undefined });
+  assert.ok(!/By:/.test(legacy));
+  assert.match(legacy, /ORD-2026-000123<\/b>\n\n<b>🟡 NEW/);
   assert.equal(formatter.STATUS_EMOJI.FAILED_DELIVERY, "⚠️");
   assert.equal(formatter.STATUS_EMOJI.RETURNED, "❌");
   assert.match(
     formatter.orderSummary({ ...order, status: "OUT_FOR_DELIVERY" }),
     /🚛 OUT FOR DELIVERY/,
   );
-  const keyboard = formatter.summaryKeyboard(order, {
-    tracking: "ABEX-123456",
-  });
+  const contact = { name: "Hichem", url: "https://wa.me/213550123456" };
+  const keyboard = formatter.summaryKeyboard(
+    order,
+    { tracking: "ABEX-123456" },
+    contact,
+  );
   assert.deepEqual(
     keyboard[0].map((b) => b.text),
     ["Update Status"],
   ); // CLIENT_URL is not HTTPS in tests
   assert.equal(keyboard[0][0].callback_data, `s:${order._id}:3`);
   assert.deepEqual(keyboard[1], [
-    { text: "Copy Tracking", copy_text: { text: "ABEX-123456" } },
+    { text: "Contact Hichem", url: "https://wa.me/213550123456" },
     { text: "Copy Phone", copy_text: { text: "0550000000" } },
   ]);
-  assert.deepEqual(
-    formatter.summaryKeyboard(order, null)[1].map((b) => b.text),
-    ["Copy Phone"],
+  assert.ok(
+    !JSON.stringify(keyboard).includes("Copy Tracking"),
+    "Copy Tracking was replaced by Contact",
+  );
+  // No (or an invalid) contact: the button is omitted, Copy Phone stays.
+  for (const bad of [
+    null,
+    { name: "Hichem", url: "" },
+    { name: "Hichem", url: "https://wa.me/+213 55" },
+    { name: "Hichem", url: "javascript:alert(1)" },
+    { name: "", url: "https://wa.me/213550123456" },
+  ])
+    assert.deepEqual(
+      formatter.summaryKeyboard(order, null, bad)[1].map((b) => b.text),
+      ["Copy Phone"],
+    );
+  assert.equal(
+    formatter.summaryKeyboard(
+      { ...order, customer: { name: "x" } },
+      null,
+      null,
+    ).length,
+    1,
+    "no empty second row",
   );
   assert.ok(Buffer.byteLength(formatter.cb.action(order, "GR")) <= 64);
   assert.deepEqual(
@@ -796,10 +827,12 @@ test("partnership orders reach only destinations that include partnership; track
   );
   assert.match(message.text, /<code>ABEX-778899<\/code>/);
   assert.match(message.text, /💰 4,400 DA \| 1 Unit\b/);
-  assert.deepEqual(message.reply_markup.inline_keyboard[1][0], {
-    text: "Copy Tracking",
-    copy_text: { text: "ABEX-778899" },
-  });
+  // Tracking stays copyable from the <code> text; the creator has no
+  // WhatsApp number, so the second row only holds Copy Phone.
+  assert.deepEqual(
+    message.reply_markup.inline_keyboard[1].map((button) => button.text),
+    ["Copy Phone"],
+  );
 });
 
 test("outbox rows roll back with the order transaction; imports and disabled integrations never queue", async () => {
@@ -1083,6 +1116,219 @@ test("authenticated Cloudinary uploads release the job and are sent as bytes, ne
     !/cloudinary|s--|authenticated/.test(everything),
     "private media URLs never reach Telegram",
   );
+});
+
+test("multi-image orders: partial upload failures release the album with every saved image", async (t) => {
+  fakeCloudinary(t.mock);
+  await connect();
+  await standardDestinations();
+  const order = await createViaApi("LOGIX_ONLY", { notificationImageCount: 4 });
+  const job = await NotificationOutbox.findOne({ orderId: order._id }).lean();
+  let revision = order.revision;
+  for (const name of ["a.png", "b.png"]) {
+    const upload = await admin.api
+      .post(`/api/order-media/${order._id}`)
+      .field("expectedRevision", String(revision))
+      .attach("image", png, { filename: name, contentType: "image/png" });
+    assert.equal(upload.status, 201, JSON.stringify(upload.body));
+    revision = upload.body.revision;
+  }
+  // The third file is rejected (unsupported format); the revision is unchanged.
+  const invalid = await admin.api
+    .post(`/api/order-media/${order._id}`)
+    .field("expectedRevision", String(revision))
+    .attach("image", Buffer.from("GIF89a"), {
+      filename: "c.gif",
+      contentType: "image/gif",
+    });
+  assert.equal(invalid.status, 400);
+  assert.equal(
+    (await Order.findById(order._id).lean()).revision,
+    revision,
+    "a failed upload does not change the revision",
+  );
+  assert.equal(
+    (await NotificationOutbox.findById(job._id).lean()).status,
+    "WAITING",
+    "still waiting for the announced images",
+  );
+  // Only users who may add images can end the sequence.
+  assert.equal(
+    (await viewer.api.post(`/api/order-media/${order._id}/uploads-complete`))
+      .status,
+    403,
+  );
+  const done = await admin.api.post(
+    `/api/order-media/${order._id}/uploads-complete`,
+  );
+  assert.equal(done.status, 204);
+  assert.equal(
+    (await NotificationOutbox.findById(job._id).lean()).status,
+    "PENDING",
+  );
+  calls = [];
+  await runNotificationBatch();
+  assert.deepEqual(
+    calls.map((c) => c.name),
+    ["sendMediaGroup", "sendMessage"],
+  );
+  assert.equal(
+    JSON.parse(formValue(calls[0].body, "media")).length,
+    2,
+    "every successfully saved image is in the album",
+  );
+});
+
+test("each upload extends the wait; a seventh image is rejected", async () => {
+  await connect();
+  await standardDestinations();
+  const order = await createViaApi("LOGIX_ONLY", { notificationImageCount: 3 });
+  const job = await NotificationOutbox.findOne({ orderId: order._id }).lean();
+  await NotificationOutbox.updateOne(
+    { _id: job._id },
+    { waitUntil: new Date(Date.now() + 1000) },
+  );
+  await Order.updateOne(
+    { _id: order._id },
+    { $push: { images: await localImage() } },
+  );
+  await outbox.orderImagesChanged(order._id);
+  const waiting = await NotificationOutbox.findById(job._id).lean();
+  assert.equal(waiting.status, "WAITING");
+  assert.ok(
+    waiting.waitUntil - Date.now() > outbox.IMAGE_GRACE_MS - 5000,
+    "progress keeps the job waiting for the remaining uploads",
+  );
+
+  const full = await createViaApi();
+  const images = [];
+  for (let i = 0; i < 6; i++) images.push(await localImage());
+  await Order.updateOne({ _id: full._id }, { $set: { images } });
+  const current = await Order.findById(full._id).lean();
+  const seventh = await admin.api
+    .post(`/api/order-media/${full._id}`)
+    .field("expectedRevision", String(current.revision))
+    .attach("image", png, { filename: "g.png", contentType: "image/png" });
+  assert.equal(seventh.status, 400);
+  assert.match(JSON.stringify(seventh.body), /six images/i);
+});
+
+test("a retry after the album was delivered sends only the summary", async () => {
+  await connect();
+  await standardDestinations();
+  const order = await createViaApi();
+  await Order.updateOne(
+    { _id: order._id },
+    {
+      $set: {
+        images: [await localImage(), await localImage(), await localImage()],
+      },
+    },
+  );
+  handlers.sendMessage = () => {
+    throw Object.assign(new Error("socket hang up"), { code: "ECONNRESET" });
+  };
+  calls = [];
+  await runNotificationBatch();
+  assert.deepEqual(
+    calls.map((c) => c.name),
+    ["sendMediaGroup", "sendMessage"],
+  );
+  let job = await NotificationOutbox.findOne({ orderId: order._id }).lean();
+  assert.equal(job.deliveries[0].photosDone, true);
+  assert.equal(job.deliveries[0].photoMessageIds.length, 3);
+  handlers = {};
+  calls = [];
+  await NotificationOutbox.updateOne(
+    { _id: job._id },
+    { nextAttemptAt: new Date() },
+  );
+  await runNotificationBatch();
+  assert.deepEqual(
+    calls.map((c) => c.name),
+    ["sendMessage"],
+    "the album is not sent twice",
+  );
+  job = await NotificationOutbox.findById(job._id).lean();
+  assert.equal(job.status, "SENT");
+});
+
+test("the summary names the order creator and Contact follows their current WhatsApp number", async () => {
+  await connect();
+  await standardDestinations();
+  const hichem = await employee("Hichem", [], {
+    role: "SUPER_ADMIN",
+    whatsappPhone: "+213550123456",
+  });
+  const create = async () => {
+    const r = await hichem.api.post("/api/orders").send(orderInput());
+    assert.equal(r.status, 201, JSON.stringify(r.body));
+    calls = [];
+    await runNotificationBatch();
+    const [message] = sent("sendMessage");
+    return {
+      text: message.body.text,
+      rows: message.body.reply_markup.inline_keyboard,
+    };
+  };
+  let { text, rows } = await create();
+  assert.match(text, /ORD-[\d-]+<\/b>\n\n👤 By: Hichem\n\n<b>🟡 NEW/);
+  assert.ok(
+    !/550123456/.test(text),
+    "the employee number never appears in the message text",
+  );
+  assert.deepEqual(rows[1], [
+    { text: "Contact Hichem", url: "https://wa.me/213550123456" },
+    { text: "Copy Phone", copy_text: { text: "0550000000" } },
+  ]);
+  assert.deepEqual(
+    rows[0].map((b) => b.text),
+    ["Update Status"],
+  );
+
+  // Administration → Users → Edit user → WhatsApp phone.
+  const before = await User.findById(hichem.user._id).lean();
+  const patch = await admin.api
+    .patch(`/api/users/${hichem.user._id}`)
+    .send({ whatsappPhone: "0661 22 33 44", expectedRevision: before.__v });
+  assert.equal(patch.status, 200, JSON.stringify(patch.body));
+  assert.ok(
+    !JSON.stringify(patch.body).includes("661223344"),
+    "the update response does not echo the private number",
+  );
+  ({ rows } = await create());
+  assert.deepEqual(rows[1][0], {
+    text: "Contact Hichem",
+    url: "https://wa.me/213661223344",
+  });
+
+  // Invalid or missing numbers omit the button; Copy Phone stays.
+  for (const whatsappPhone of ["not-a-number", ""]) {
+    await User.updateOne({ _id: hichem.user._id }, { whatsappPhone });
+    ({ rows } = await create());
+    assert.deepEqual(
+      rows[1].map((b) => b.text),
+      ["Copy Phone"],
+    );
+  }
+
+  // Orders keep the historical creator name after the employee is renamed.
+  await User.updateOne(
+    { _id: hichem.user._id },
+    { name: "Hichem B.", whatsappPhone: "+213550123456" },
+  );
+  const first = await Order.findOne({ "createdBy.userId": hichem.user._id })
+    .sort({ createdAt: 1 })
+    .lean();
+  assert.equal(first.createdBy.name, "Hichem");
+  const { loadCreatorContact } = await import(
+    "../src/services/notifications/telegram/telegramOrderCreator.js"
+  );
+  assert.deepEqual(await loadCreatorContact(first), {
+    name: "Hichem",
+    url: "https://wa.me/213550123456",
+  });
+  assert.equal(await loadCreatorContact({ createdBy: undefined }), null);
 });
 
 test("stale WAITING jobs are recovered", async () => {
